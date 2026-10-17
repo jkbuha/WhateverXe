@@ -207,6 +207,12 @@ static uint32_t tglResolveInitReady[4] {};
 struct TGLResolveCodeRecord {uint64_t q[16];};
 static TGLResolveCodeRecord tglResolveCodeRecords[12] {};
 static uint32_t tglResolveCodeCount;
+static mach_vm_address_t tglResolveResourceOriginal;
+static uint32_t tglResolveResourceCount;
+struct TGLResolveResourceRecord {uint64_t q[16];uint8_t resource[512],params[160];};
+static TGLResolveResourceRecord tglResolveResources[4] {};
+static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task);
+
 static bool tglBlitDeferredSerialize(void *,void *,OSSerialize *serializer) {
  const uint32_t q[]={310,__atomic_load_n(&tglBlitDeferredInitCount,__ATOMIC_RELAXED)};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
@@ -8652,6 +8658,18 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(resolveCodeOK){KernelPatcher::RouteRequest route[] {{resolveEmit,wrapTGLResolveCode,orgTGLResolveCode}};
              resolveCodeOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveCodeReady",resolveCodeOK);
+            const char *resourceSubmit="__ZN16IntelAccelerator16submitCCSResolveEP15IGAccelResourceP22color_resolve_params_tRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyEP11IGAccelTask";
+            const uint8_t resourceHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x48};
+            bool resourceCaptureOK=resolveCodeOK && drawLengthOK && tglVM.enabled && tglVM.nofault &&
+             xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing") && checkKernelArgument("-wex-edp-probe") &&
+             patcher.solveSymbol<mach_vm_address_t>(index,resourceSubmit,address,size)==address+0x2C84C &&
+             !memcmp(reinterpret_cast<void *>(address+0x2C84C),resourceHead,sizeof(resourceHead));
+            patcher.clearError();
+            if(resourceCaptureOK){KernelPatcher::RouteRequest route[] {{resourceSubmit,tglResolveResourceCapture,tglResolveResourceOriginal}};
+             resourceCaptureOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveResourceReady",resourceCaptureOK);
+            patcher.clearError();
+
             patcher.clearError();
 
 			// Exact donor's post-relocation aux-state writer, before GPU submission.
@@ -11283,6 +11301,27 @@ bool XE::wrapTGLResolveCode(void *pool,void *mapped,void *params,bool mode,const
  const bool result=FunctionCast(wrapTGLResolveCode,callbackXE->orgTGLResolveCode)(pool,mapped,params,mode,rects);
  if(qualified)tglResolveCodeSnapshot(2,context,pool,mapped,params,result);
  return result;
+}
+
+// Observe caller-owned CPU objects before native submission. No pointer
+// chasing, virtual calls, GPU reads, memory maps or argument modifications.
+// Raw resource fields remain uninterpreted until checked against donor code.
+static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task) {
+ const auto slot=__atomic_fetch_add(&tglResolveResourceCount,1U,__ATOMIC_RELAXED);
+ if(slot<4 && tglVM.nofault){
+  auto &r=tglResolveResources[slot];auto q=r.q;q[0]=1;tglHostClock(q+1);
+  q[2]=reinterpret_cast<uint64_t>(owner);q[3]=reinterpret_cast<uint64_t>(resource);
+  q[4]=reinterpret_cast<uint64_t>(params);q[5]=reinterpret_cast<uint64_t>(rects);q[6]=reinterpret_cast<uint64_t>(task);
+  auto read=[](uint64_t a,void *dest,size_t n)->uint64_t {
+   if((a>>47)!=0x1FFFF || a>UINT64_MAX-n)return 0;
+   return tglVM.nofault(a,reinterpret_cast<uint64_t>(dest),n);
+  };
+  q[7]=read(q[3],r.resource,sizeof(r.resource));q[8]=read(q[4],r.params,sizeof(r.params));
+  q[9]=1; // pre-submission snapshot; native result is not inferred
+  char key[48];snprintf(key,sizeof(key),"WXEdpResolveResource%u",slot);
+  IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));
+ }
+ FunctionCast(tglResolveResourceCapture,tglResolveResourceOriginal)(owner,resource,params,rects,task);
 }
 
 bool XE::wrapTGLResolveInit(void *context) {
