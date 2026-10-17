@@ -2675,6 +2675,42 @@ extern "C" __attribute__((naked, used)) void tglResolveScratchBridge() {
   "jmpq *_tglResolveScratchResume(%rip)\n");
 }
 
+// Replicated-data colour-resolve helper, assembled for Xe-LP/12p1. The
+// output data is irrelevant for FULL_RESOLVE; the render-control message
+// must use the replicated-data form. Install inside native scratch ownership.
+static const uint8_t tglResolveReplicatedCode[32] {0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x70,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x32,0x01,0x04,0x00,0x04,0x00,0x00,0x00,0x0C,0x70,0x00,0x52,0x00,0x00,0xC4,0x00};
+extern "C" {
+ uint32_t tglResolveReplicatedEnabled {};
+ uint32_t tglResolveReplicatedCopies {};
+ uint32_t tglResolveReplicatedSelects {};
+ uintptr_t tglResolveReplicatedSource {};
+ uintptr_t tglResolveReplicatedCopyResume {};
+}
+extern "C" void *tglResolveReplicatedCopy(void *last,const void *source,size_t bytes) {
+ // Preserve the last native copy unconditionally. The extra32bytes lie at
+ // 4D00, after native initialized state and before the5000 completion slot.
+ memcpy(last,source,bytes);
+ if(__atomic_load_n(&tglResolveReplicatedEnabled,__ATOMIC_ACQUIRE) && bytes==0x380){
+  memcpy(static_cast<uint8_t *>(last)+0x600,tglResolveReplicatedCode,sizeof(tglResolveReplicatedCode));
+  __atomic_add_fetch(&tglResolveReplicatedCopies,1U,__ATOMIC_RELEASE);
+ }
+ return last;
+}
+extern "C" __attribute__((naked, used)) void tglResolveReplicatedCopyBridge() {
+ asm volatile(
+  "addq $0x4700, %rbx\n movq %rbx, %rdi\n"
+  "movq _tglResolveReplicatedSource(%rip), %rsi\n movl $0x380, %edx\n"
+  "callq _tglResolveReplicatedCopy\n"
+  "jmpq *_tglResolveReplicatedCopyResume(%rip)\n");
+}
+static bool tglResolveReplicatedSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t q[]={1,__atomic_load_n(&tglResolveReplicatedEnabled,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglResolveReplicatedCopies,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglResolveReplicatedSelects,__ATOMIC_RELAXED),0x4D00,32,0x5100,0x5000};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 // r125: donor 8D056..8D06D. FAST_CLEAR_0 (resolve type2) initializes CCS
 // metadata and requires PS bit8 (TGL PRM vol2d p64; Mesa BLORP AMBIGUATE).
 // This is independent of the userland color-clear optimization. Preserve the
@@ -2684,7 +2720,18 @@ extern "C" __attribute__((naked, used)) void tglCCSPSBridge() {
   "shll $6, %eax\n orl $2, %eax\n"
   "pushfq\n pushq %rax\n cmpl $0x82, %eax\n jne 1f\n orl $0x100, %eax\n"
   "1:\n movw %ax, 0xa0(%r15)\n popq %rax\n popfq\n"
-  "movw $0x1f80, 0xa2(%r15)\n jmpq *_tglCCSPSResume(%rip)\n");
+  "movw $0x1f80, 0xa2(%r15)\n"
+  "movq %r9, 0xac(%r15)\n movq %r9, 0xa4(%r15)\n movl %r9d, 0xb4(%r15)\n"
+  "pushfq\n cmpl $1, _tglResolveReplicatedEnabled(%rip)\n jne 2f\n"
+  "cmpl $0, _tglResolveReplicatedCopies(%rip)\n je 2f\n"
+  "cmpl $0x1f8000c2, 0xa0(%r15)\n jne 2f\n"
+  "cmpl $1920, 0x0c(%rdx)\n jne 2f\n cmpl $1200, 0x10(%rdx)\n jne 2f\n"
+  "cmpl $7680, 0x18(%rdx)\n jne 2f\n cmpl $0xd1, 0x40(%rdx)\n jne 2f\n"
+  "cmpl $0x2345f000, (%r14)\n jne 2f\n cmpl $2, 0x10(%r14)\n jne 2f\n"
+  "cmpl $0, 0x14(%r14)\n jne 2f\n"
+  "movq $0x4d00, 0x8c(%r15)\n movq $0x4d00, 0xa8(%r15)\n movq $0x4d00, 0xb0(%r15)\n"
+  "lock incl _tglResolveReplicatedSelects(%rip)\n"
+  "2:\n popfq\n jmpq *_tglCCSPSResume(%rip)\n");
 }
 
 // Donor 3AA02..3AA46. Keep the four native stores and their loop order.
@@ -8193,12 +8240,14 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// forbidden pairing. Only this exact emitter's type2 gains bit8.
 			const uint8_t ccsPSBlock[] {0xC1,0xE0,0x06,0x83,0xC8,0x02,0x66,0x41,0x89,0x87,0xA0,0,0,0,0x66,0x41,0xC7,0x87,0xA2,0,0,0,0x80,0x1F};
 			const uint8_t ccsPSType[] {0x8B,0x42,0x64,0x83,0xE0,0x03};
+            const uint8_t ccsPSTail[] {0x4D,0x89,0x8F,0xAC,0,0,0,0x4D,0x89,0x8F,0xA4,0,0,0,0x45,0x89,0x8F,0xB4,0,0,0};
 			auto ccsPSSite=reinterpret_cast<uint8_t *>(address+0x8D056);
 			bool ccsPSReady=ccsReady &&
 				!memcmp(ccsPSSite,ccsPSBlock,sizeof(ccsPSBlock)) &&
+                !memcmp(reinterpret_cast<void *>(address+0x8D06E),ccsPSTail,sizeof(ccsPSTail)) &&
 				!memcmp(reinterpret_cast<void *>(address+0x8D02B),ccsPSType,sizeof(ccsPSType));
 			if (ccsPSReady) {
-				tglCCSPSResume=address+0x8D06E;
+				tglCCSPSResume=address+0x8D083;
 				uint8_t jump[14] {0xFF,0x25,0,0,0,0};
 				const auto target=reinterpret_cast<uintptr_t>(tglCCSPSBridge);
 				memcpy(jump+6,&target,sizeof(target));
@@ -8206,6 +8255,23 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				ccsPSReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsPSSite,jump,sizeof(jump));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSFastClearZeroReady",ccsPSReady);
+            const uint8_t lastCopyBlock[] {0x48,0x81,0xC3,0x00,0x47,0,0,0x48,0x8D,0x35,0x22,0x14,0x04,0,0xBA,0x80,0x03,0,0,0x48,0x89,0xDF,0xE8};
+            bool replicatedOK=ccsPSReady && scratchTrialOK && size>0xC7200 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__Z35resolve_initialize_scratch_space_g7P16IGAccelSysMemory",address,size)==address+0x85704 &&
+             !memcmp(reinterpret_cast<void *>(address+0x85A50),lastCopyBlock,sizeof(lastCopyBlock));
+            if(replicatedOK){
+             tglResolveReplicatedSource=address+0xC6E80;tglResolveReplicatedCopyResume=address+0x85A6B;
+             uint8_t jump[27];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(tglResolveReplicatedCopyBridge);memcpy(jump+6,&target,8);
+             patcher.clearError();patcher.routeBlock(address+0x85A50,jump,sizeof(jump));
+             replicatedOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x85A50),jump,sizeof(jump));
+            }
+            __atomic_store_n(&tglResolveReplicatedEnabled,replicatedOK?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveReplicatedReady",replicatedOK);
+            if(replicatedOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveReplicatedSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveReplicatedLive",live);live->release();}
+            patcher.clearError();
+
 			patcher.clearError();
 			bool ggttOK=size>0x10730 &&
 				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN25IGHardwareGlobalPageTable8mapRangeERK14IGAddressRangeyy",address,size)==address+0x10324 &&
