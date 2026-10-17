@@ -204,6 +204,9 @@ static uint32_t tglBlitDeferredInitCount;
 static EdpResolveInit::Capture tglResolveInitCopies[4] {};
 static uint32_t tglResolveInitCount;
 static uint32_t tglResolveInitReady[4] {};
+struct TGLResolveCodeRecord {uint64_t q[16];};
+static TGLResolveCodeRecord tglResolveCodeRecords[12] {};
+static uint32_t tglResolveCodeCount;
 static bool tglBlitDeferredSerialize(void *,void *,OSSerialize *serializer) {
  const uint32_t q[]={310,__atomic_load_n(&tglBlitDeferredInitCount,__ATOMIC_RELAXED)};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
@@ -8511,6 +8514,16 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveInitReady",resolveCaptureOK);
             patcher.clearError();
 
+            const char *resolveEmit="__Z11resolve_ccsP25IOAccelCommandBufferPool2P14IGMappedBufferP22color_resolve_params_tbRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyE";
+            const uint8_t resolveEmitHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0x58,0x01,0,0};
+            bool resolveCodeOK=skuReady && xeProfile.identity==0x9A498086U &&
+             patcher.solveSymbol<mach_vm_address_t>(index,resolveEmit,address,size)==address+0x8CB2A &&
+             !memcmp(reinterpret_cast<void *>(address+0x8CB2A),resolveEmitHead,sizeof(resolveEmitHead));
+            if(resolveCodeOK){KernelPatcher::RouteRequest route[] {{resolveEmit,wrapTGLResolveCode,orgTGLResolveCode}};
+             resolveCodeOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveCodeReady",resolveCodeOK);
+            patcher.clearError();
+
 			// Exact donor's post-relocation aux-state writer, before GPU submission.
 			const char *auxState="__ZN15IGAccelResource23fillSurfaceStateAuxInfoEPNS_17ResourceInfoEntryER22SGfxRenderSurfaceState6Intent";
 			const uint8_t auxHead[] {0x55,0x48,0x89,0xE5,0xF6,0x86,0x91,0,0,0,0x02,0x8B,0x42,0x18};
@@ -11107,6 +11120,34 @@ void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t
  if (tglCorrectCCSAlignment(surface)) __atomic_fetch_add(&tglCCSAlignmentCounts[2],1,__ATOMIC_RELAXED);
 }
 
+static void tglResolveCodeSnapshot(unsigned phase,void *context,void *pool,void *mapped,bool result) {
+ if(!pool || !mapped || !tglVM.nofault)return;
+ const auto slot=__atomic_fetch_add(&tglResolveCodeCount,1U,__ATOMIC_RELAXED);if(slot>=12)return;
+ auto &q=tglResolveCodeRecords[slot].q;q[0]=1;q[1]=phase;q[2]=reinterpret_cast<uintptr_t>(context);
+ q[3]=reinterpret_cast<uintptr_t>(mapped);q[4]=reinterpret_cast<uintptr_t>(pool);q[7]=result;
+ // Exact IGSharedMappedBuffer factory used by native ExtendedContext init:
+ // +38 is its already-existing kernel CPU mapping. Do not map or touch MMIO.
+ if(tglVM.nofault(q[3]+0x38,reinterpret_cast<uint64_t>(q+5),8)==8 && q[5])
+  q[6]=tglVM.nofault(q[5],reinterpret_cast<uint64_t>(q+8),32);
+ tglHostClock(q+12);q[15]=0x434F4445;
+ char key[48];snprintf(key,sizeof(key),"WXEdpResolveCode%u",slot);
+ IORegistryEntry::getRegistryRoot()->setProperty(key,&tglResolveCodeRecords[slot],sizeof(tglResolveCodeRecords[slot]));
+}
+
+bool XE::wrapTGLResolveCode(void *pool,void *mapped,void *params,bool mode,const void *rects) {
+ const bool qualified=callbackXE->tglEdpRoutingReady && callbackXE->xeProfile.identity==0x9A498086U;
+ void *context=nullptr;
+ if(qualified)for(unsigned i=0;i<4;++i){
+  if(__atomic_load_n(&tglResolveInitReady[i],__ATOMIC_ACQUIRE) && tglResolveInitCopies[i].q[2]==reinterpret_cast<uintptr_t>(pool)){
+   context=reinterpret_cast<void *>(tglResolveInitCopies[i].q[1]);break;
+  }
+ }
+ if(qualified)tglResolveCodeSnapshot(1,context,pool,mapped,false);
+ const bool result=FunctionCast(wrapTGLResolveCode,callbackXE->orgTGLResolveCode)(pool,mapped,params,mode,rects);
+ if(qualified)tglResolveCodeSnapshot(2,context,pool,mapped,result);
+ return result;
+}
+
 bool XE::wrapTGLResolveInit(void *context) {
  const bool result=FunctionCast(wrapTGLResolveInit,callbackXE->orgTGLResolveInit)(context);
  if(callbackXE->tglEdpRoutingReady && callbackXE->xeProfile.identity==0x9A498086U){
@@ -11120,6 +11161,8 @@ bool XE::wrapTGLResolveInit(void *context) {
     auto limit=*reinterpret_cast<uint8_t **>(pool+0x1850);
     if(EdpResolveInit::copy(captures[slot],true,context,pool,start,current,limit,result)){
      __atomic_store_n(&tglResolveInitReady[slot],1U,__ATOMIC_RELEASE);
+     auto mapped=*reinterpret_cast<void **>(static_cast<uint8_t *>(context)+0xD8);
+     tglResolveCodeSnapshot(0,context,pool,mapped,result);
      char key[48];snprintf(key,sizeof(key),"WXEdpResolveInit%u",slot);
      IORegistryEntry::getRegistryRoot()->setProperty(key,&captures[slot],sizeof(captures[slot]));
     }
