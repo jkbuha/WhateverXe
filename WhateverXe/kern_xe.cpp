@@ -226,6 +226,11 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
  if(ok)ok=data->serialize(serializer);data->release();return ok;
 }
 
+static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
+static uint32_t tglEntryCount;
+static void tglEntryEnable(void *,void *,uint64_t,void *,void *,uint8_t,uint8_t,bool);
+static bool tglEntryResolve(void *,void *,void *,void *,uint32_t,uint8_t,uint8_t);
+
 static uint32_t tglResolveRectangleEnabled,tglResolveRectangleCount;
 static bool tglResolveRectangleSerialize(void *,void *,OSSerialize *serializer){
  const uint32_t q[]={1,__atomic_load_n(&tglResolveRectangleEnabled,__ATOMIC_ACQUIRE),
@@ -8729,6 +8734,23 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxRanges",live);live->release();}
             patcher.clearError();
 
+            const char *entryEnable="__ZN15IGAccelResource36enableRenderCompressionWithAccelTaskEPNS_17ResourceInfoEntryEyR16IntelAcceleratorP11IGAccelTaskhhb";
+            const char *entryResolve="__ZN15IGAccelResource16submitCCSResolveEPNS_17ResourceInfoEntryER16IntelAcceleratorP11IGAccelTask20EIntelCCSResolveTypehh";
+            const uint8_t enableHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0x88,0,0,0};
+            const uint8_t entryResolveHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0x48,0x01,0,0};
+            const uint8_t entryFreeSize[] {0xBE,0xA0,0,0,0};
+            bool entriesOK=rangesOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,entryEnable,address,size)==address+0x73774 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,entryResolve,address,size)==address+0x73A20 &&
+             !memcmp(reinterpret_cast<void *>(address+0x73774),enableHead,sizeof(enableHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x73A20),entryResolveHead,sizeof(entryResolveHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x6F69C),entryFreeSize,sizeof(entryFreeSize));
+            patcher.clearError();
+            if(entriesOK){KernelPatcher::RouteRequest route[] {{entryEnable,tglEntryEnable,tglEntryEnableOriginal},{entryResolve,tglEntryResolve,tglEntryResolveOriginal}};
+             entriesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEntriesReady",entriesOK);
+            patcher.clearError();
+
             __atomic_store_n(&tglResolveRectangleEnabled,resourceCaptureOK?1U:0U,__ATOMIC_RELEASE);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRectangleReady",resourceCaptureOK);
             if(resourceCaptureOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveRectangleSerialize)){
@@ -11485,6 +11507,34 @@ static void tglAuxUnmapRange(void *table,const void *range){
   tglAuxTableVtable,tglResolveMapVtable,tglAuxTraceRead,tglHostClock);
  FunctionCast(tglAuxUnmapRange,tglAuxUnmapOriginal)(table,range);
  tglAuxRanges.finish(slot,r,UINT64_MAX,tglHostClock);
+}
+
+// First32 calls only: caller-owned ResourceInfoEntry, captured before and after
+// native execution. Immutable separate properties keep pre-call evidence available
+// even if execution never returns. No list walking or graphics-state mutation.
+struct TGLEntryRecord {uint64_t q[16];uint8_t entry[0xA0];};
+static void tglEntrySnapshot(unsigned slot,unsigned phase,unsigned op,void *resource,void *entry,
+ uint64_t gpu,void *accel,void *task,uint32_t type,uint8_t level,uint8_t face,bool skip,uint64_t result){
+ if(slot>=32)return;
+ TGLEntryRecord r {};r.q[0]=1;r.q[1]=slot;r.q[2]=phase;r.q[3]=op;
+ r.q[4]=reinterpret_cast<uint64_t>(resource);r.q[5]=reinterpret_cast<uint64_t>(entry);r.q[6]=gpu;
+ r.q[7]=reinterpret_cast<uint64_t>(accel);r.q[8]=reinterpret_cast<uint64_t>(task);
+ r.q[9]=type;r.q[10]=level;r.q[11]=face;r.q[12]=skip;r.q[13]=result;
+ tglHostClock(r.q+14);r.q[15]=tglAuxTraceRead(r.q[5],r.entry,sizeof(r.entry));
+ char key[48];snprintf(key,sizeof(key),"WXEdpEntry%u%c",slot,phase?'B':'A');
+ IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));
+}
+static void tglEntryEnable(void *resource,void *entry,uint64_t gpu,void *accel,void *task,uint8_t level,uint8_t face,bool skip){
+ const auto slot=__atomic_fetch_add(&tglEntryCount,1U,__ATOMIC_RELAXED);
+ tglEntrySnapshot(slot,0,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX);
+ FunctionCast(tglEntryEnable,tglEntryEnableOriginal)(resource,entry,gpu,accel,task,level,face,skip);
+ tglEntrySnapshot(slot,1,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX);
+}
+static bool tglEntryResolve(void *resource,void *entry,void *accel,void *task,uint32_t type,uint8_t level,uint8_t face){
+ const auto slot=__atomic_fetch_add(&tglEntryCount,1U,__ATOMIC_RELAXED);
+ tglEntrySnapshot(slot,0,2,resource,entry,0,accel,task,type,level,face,false,UINT64_MAX);
+ const bool result=FunctionCast(tglEntryResolve,tglEntryResolveOriginal)(resource,entry,accel,task,type,level,face);
+ tglEntrySnapshot(slot,1,2,resource,entry,0,accel,task,type,level,face,false,result?1:0);return result;
 }
 
 bool XE::wrapTGLResolveInit(void *context) {
