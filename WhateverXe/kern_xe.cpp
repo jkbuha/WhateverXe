@@ -129,6 +129,7 @@ static void rightPortPublish() {
 #include "kern_tgl_hang_refs.hpp"
 #include "kern_edp_compression_capture.hpp"
 #include "kern_edp_auxmap_capture.hpp"
+#include "kern_edp_auxrange_trace.hpp"
 #include "kern_tgl_recovery.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -212,6 +213,19 @@ static TGLResolveCodeRecord tglResolveCodeRecords[12] {};
 static uint32_t tglResolveCodeCount;
 static mach_vm_address_t tglResolveResourceOriginal;
 static uint32_t tglResolveResourceCount;
+static EdpAuxRanges::Trace tglAuxRanges;
+static mach_vm_address_t tglAuxMapOriginal,tglAuxUnmapOriginal;
+static uint64_t tglAuxTableVtable,tglAuxDonorBegin,tglAuxDonorEnd;
+static bool tglAuxMapRange(void *,const void *,uint64_t);
+static void tglAuxUnmapRange(void *,const void *);
+static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
+ const uint64_t h[]={1,__atomic_load_n(&tglAuxRanges.count,__ATOMIC_ACQUIRE),EdpAuxRanges::MaxRecords,16};
+ auto data=OSData::withCapacity(sizeof(h)+sizeof(tglAuxRanges.records));if(!data)return false;
+ bool ok=data->appendBytes(h,sizeof(h));const EdpAuxRanges::Record empty {};
+ for(unsigned i=0;i<EdpAuxRanges::MaxRecords;++i){const auto r=tglAuxRanges.published(i);ok=ok && data->appendBytes(r?r:&empty,sizeof(empty));}
+ if(ok)ok=data->serialize(serializer);data->release();return ok;
+}
+
 static uint32_t tglResolveRectangleEnabled,tglResolveRectangleCount;
 static bool tglResolveRectangleSerialize(void *,void *,OSSerialize *serializer){
  const uint32_t q[]={1,__atomic_load_n(&tglResolveRectangleEnabled,__ATOMIC_ACQUIRE),
@@ -8692,6 +8706,29 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveBackingReady",resourceCaptureOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpCompressionReady",resourceCaptureOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxMapReady",resourceCaptureOK);
+            const char *mapRange="__ZN14IGAuxPageTable8mapRangeERK14IGAddressRange17AuxPageTableEntry";
+            const char *unmapRange="__ZN14IGAuxPageTable10unmapRangeERK14IGAddressRange";
+            const uint8_t mapHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x68};
+            const uint8_t unmapHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28};
+            const uint8_t auxSize[] {0xB9,0x50,0,0,0};
+            bool rangesOK=resourceCaptureOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,mapRange,address,size)==address+0x14F72 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,unmapRange,address,size)==address+0x15564 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV14IGAuxPageTable",address,size)==address+0xCE7D0 &&
+             !memcmp(reinterpret_cast<void *>(address+0x14F72),mapHead,sizeof(mapHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x15564),unmapHead,sizeof(unmapHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x149AB),auxSize,sizeof(auxSize));
+            patcher.clearError();
+            if(rangesOK){
+             tglAuxTableVtable=address+0xCE7E0;tglAuxDonorBegin=address;tglAuxDonorEnd=address+size;
+             KernelPatcher::RouteRequest route[] {{mapRange,tglAuxMapRange,tglAuxMapOriginal},{unmapRange,tglAuxUnmapRange,tglAuxUnmapOriginal}};
+             rangesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxRangesReady",rangesOK);
+            if(rangesOK)if(auto live=OSSerializer::forTarget(nullptr,tglAuxRangesSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxRanges",live);live->release();}
+            patcher.clearError();
+
             __atomic_store_n(&tglResolveRectangleEnabled,resourceCaptureOK?1U:0U,__ATOMIC_RELEASE);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRectangleReady",resourceCaptureOK);
             if(resourceCaptureOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveRectangleSerialize)){
@@ -11412,11 +11449,42 @@ static void tglResolveResourceCapture(void *owner,void *resource,void *params,co
    submitRects=trialVector;q[9]|=2;
    __atomic_add_fetch(&tglResolveRectangleCount,1U,__ATOMIC_RELEASE);
   }
+  if(slot<4 && q[7]==512){
+   struct Info {uint64_t q[8];uint8_t bytes[0xA0];} info {};
+   info.q[0]=1;info.q[1]=slot;info.q[2]=q[3];info.q[3]=q[6];
+   if(q[3]<=UINT64_MAX-0x238)info.q[5]=read(q[3]+0x230,info.q+4,8);
+   if(info.q[5]==8)info.q[6]=read(info.q[4],info.bytes,sizeof(info.bytes));
+   if(info.q[6]==sizeof(info.bytes))info.q[7]=info.bytes[0x91];
+   char key[48];snprintf(key,sizeof(key),"WXEdpAuxResource%u",slot);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,&info,sizeof(info));
+  }
   if(slot<4){char key[48];snprintf(key,sizeof(key),"WXEdpResolveResource%u",slot);
    IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));}
 
  }
  FunctionCast(tglResolveResourceCapture,tglResolveResourceOriginal)(owner,resource,params,submitRects,task);
+}
+
+static uint64_t tglAuxTraceRead(uint64_t a,void *to,size_t n){
+ if(!tglVM.nofault || (a>>47)!=0x1FFFF || a>UINT64_MAX-n)return 0;
+ return tglVM.nofault(a,reinterpret_cast<uint64_t>(to),n);
+}
+static uint64_t tglAuxTraceCaller(uint64_t caller){return caller>=tglAuxDonorBegin && caller<tglAuxDonorEnd?caller-tglAuxDonorBegin:0;}
+static bool tglAuxMapRange(void *table,const void *range,uint64_t entry){
+ EdpAuxRanges::Record r {};
+ const auto slot=tglAuxRanges.begin(r,1,reinterpret_cast<uint64_t>(table),reinterpret_cast<uint64_t>(range),entry,
+  tglAuxTraceCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0))),reinterpret_cast<uint64_t>(current_thread()),
+  tglAuxTableVtable,tglResolveMapVtable,tglAuxTraceRead,tglHostClock);
+ const bool result=FunctionCast(tglAuxMapRange,tglAuxMapOriginal)(table,range,entry);
+ tglAuxRanges.finish(slot,r,result?1:0,tglHostClock);return result;
+}
+static void tglAuxUnmapRange(void *table,const void *range){
+ EdpAuxRanges::Record r {};
+ const auto slot=tglAuxRanges.begin(r,2,reinterpret_cast<uint64_t>(table),reinterpret_cast<uint64_t>(range),0,
+  tglAuxTraceCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0))),reinterpret_cast<uint64_t>(current_thread()),
+  tglAuxTableVtable,tglResolveMapVtable,tglAuxTraceRead,tglHostClock);
+ FunctionCast(tglAuxUnmapRange,tglAuxUnmapOriginal)(table,range);
+ tglAuxRanges.finish(slot,r,UINT64_MAX,tglHostClock);
 }
 
 bool XE::wrapTGLResolveInit(void *context) {
