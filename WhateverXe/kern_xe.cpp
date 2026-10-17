@@ -27,6 +27,7 @@ namespace { uint32_t wxEdpEnableCycleOnce=0; }
 #include "kern_edp_handoff.hpp"
 #include "kern_edp_aux_lease.hpp"
 #include "kern_edp_blit_init_capture.hpp"
+#include "kern_edp_resolve_init_capture.hpp"
 namespace { EdpHandoff::Evidence wxEdpHandoff {}; }
 static void tglPublishEdpHandoff();
 
@@ -8386,6 +8387,19 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             }
 			patcher.clearError();
 
+            // Observe the distinct resolve context after native initialization.
+            // Exact donor and physical SKU gates remain prerequisites.
+            const char *resolveInit="__ZN24IGHardwareResolveContext10initializeEv";
+            const uint8_t resolveHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xFB};
+            bool resolveCaptureOK=skuReady && size>0x8CB2A &&
+             patcher.solveSymbol<mach_vm_address_t>(index,resolveInit,address,size)==address+0x7D85A &&
+             !memcmp(reinterpret_cast<void *>(address+0x7D85A),resolveHead,sizeof(resolveHead)) &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__Z19resolve_init_ctx_g7P25IOAccelCommandBufferPool2P14IGMappedBufferyb",address,size)==address+0x8C1B8;
+            if(resolveCaptureOK){KernelPatcher::RouteRequest route[] {{resolveInit,wrapTGLResolveInit,orgTGLResolveInit}};
+             resolveCaptureOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveInitReady",resolveCaptureOK);
+            patcher.clearError();
+
 			// Exact donor's post-relocation aux-state writer, before GPU submission.
 			const char *auxState="__ZN15IGAccelResource23fillSurfaceStateAuxInfoEPNS_17ResourceInfoEntryER22SGfxRenderSurfaceState6Intent";
 			const uint8_t auxHead[] {0x55,0x48,0x89,0xE5,0xF6,0x86,0x91,0,0,0,0x02,0x8B,0x42,0x18};
@@ -10968,6 +10982,27 @@ void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t
  __atomic_fetch_add(&tglCCSAlignmentCounts[0],1,__ATOMIC_RELAXED);
  if ((surface[6]&7U)==5) __atomic_fetch_add(&tglCCSAlignmentCounts[1],1,__ATOMIC_RELAXED);
  if (tglCorrectCCSAlignment(surface)) __atomic_fetch_add(&tglCCSAlignmentCounts[2],1,__ATOMIC_RELAXED);
+}
+
+bool XE::wrapTGLResolveInit(void *context) {
+ const bool result=FunctionCast(wrapTGLResolveInit,callbackXE->orgTGLResolveInit)(context);
+ if(callbackXE->tglEdpRoutingReady && callbackXE->xeProfile.identity==0x9A498086U){
+  static EdpResolveInit::Capture captures[4] {};static uint32_t count=0;
+  const auto slot=__atomic_fetch_add(&count,1U,__ATOMIC_RELAXED);
+  if(slot<4){
+   auto pool=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(context)+0xE0);
+   if(pool){
+    auto start=*reinterpret_cast<uint8_t **>(pool+0x1848);
+    auto current=*reinterpret_cast<uint8_t **>(pool+0x1858);
+    auto limit=*reinterpret_cast<uint8_t **>(pool+0x1850);
+    if(EdpResolveInit::copy(captures[slot],true,context,pool,start,current,limit,result)){
+     char key[48];snprintf(key,sizeof(key),"WXEdpResolveInit%u",slot);
+     IORegistryEntry::getRegistryRoot()->setProperty(key,&captures[slot],sizeof(captures[slot]));
+    }
+   }
+  }
+ }
+ return result;
 }
 
 void XE::wrapTGLBlitDeferredInit(void *context,void *params,const void *rects) {
