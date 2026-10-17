@@ -26,6 +26,7 @@ namespace { uint32_t wxEdpEnableCycleOnce=0; }
 #include "kern_edp_aux_status.hpp"
 #include "kern_edp_handoff.hpp"
 #include "kern_edp_aux_lease.hpp"
+#include "kern_edp_blit_init_capture.hpp"
 namespace { EdpHandoff::Evidence wxEdpHandoff {}; }
 static void tglPublishEdpHandoff();
 
@@ -10981,12 +10982,19 @@ void XE::wrapTGLBlitDeferredInit(void *context,void *params,const void *rects) {
      reinterpret_cast<uintptr_t>(current)-reinterpret_cast<uintptr_t>(start)==0xA00 && reinterpret_cast<uintptr_t>(limit)>=reinterpret_cast<uintptr_t>(current)) {
   uint32_t end;memcpy(&end,start+0x860,4);
   if(end!=0x05000000) PANIC("igfx","r310 unexpected pending blit initialization");
+  // CPU evidence only; capture before the native submit can recycle storage.
+  static EdpBlitInit::Capture initCopies[4] {};static uint32_t initCount=0;
+  const auto initSlot=__atomic_fetch_add(&initCount,1U,__ATOMIC_RELAXED);
+  const bool initCaptured=initSlot<4 && EdpBlitInit::copy(initCopies[initSlot],
+   callbackXE->tglEdpRoutingReady && callbackXE->xeProfile.identity==0x9A498086U,context,pool,start,current,limit);
   auto channel=*reinterpret_cast<void **>(pool+0x20);
   auto vtable=*reinterpret_cast<uintptr_t **>(channel);
   reinterpret_cast<void (*)(void *)>(vtable[0x148/sizeof(uintptr_t)])(channel);
   reinterpret_cast<void (*)(void *)>(tglBlitPoolSubmit)(pool);
   const auto n=__atomic_add_fetch(&tglBlitDeferredInitCount,1U,__ATOMIC_RELAXED);
   if(n==1) IORegistryEntry::getRegistryRoot()->setProperty("TGLBlitDeferredInitTrial",310,32);
+  if(initCaptured){char key[48];snprintf(key,sizeof(key),"WXEdpBlitInit%u",initSlot);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,&initCopies[initSlot],sizeof(initCopies[initSlot]));}
  }
  FunctionCast(wrapTGLBlitDeferredInit,callbackXE->orgTGLBlitDeferredInit)(context,params,rects);
 }
