@@ -1,3 +1,6 @@
+// Private observer hooks have no bearing on the fixture hardware model.
+template<class... Args> static void rightPortRecord(Args...) {}
+static void rightPortPublish() {}
 #include <cassert>
 #include <cstdint>
 #include <cstdio>

@@ -78,6 +78,9 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wexoff` | WhateverXeを無効にする。 |
 | `-wexbeta` | プラグインのOSバージョンチェックを回避する。kernel／driverの一致条件は維持する。 |
 | `-wex-tgl-off` | Tiger Lakeの処理を無効にする。 |
+| `-wex-tc-bootstrap` | 開発用試験。起動中はTC-cold電源を保持する。このソースツリーでは、物理Tiger Lake `9A49`のDDI5に限定した2レーン・pin-DのDP Alt Mode処理も、画面電源を保持して有効にする。実験段階であり、システムスリープや一般的なUSB-C対応は未検証。 |
+| `-wex-edp-probe` | 物理Tiger Lake `9A49`用の診断試験。フレームバッファ起動後、既存ドライバのVDD/AUX電源を一時保持して内蔵パネルのDPCDとEDIDを読む。診断プロパティのみ公開し、内蔵画面出力は有効にしない。 |
+| `-wex-edp-routing` | 物理Tiger Lake `9A49`の内蔵画面用実験。`-wex-edp-probe`が必要。検証済みのeDP処理で実際のパイプを選び、AUX転送中のVDDを管理し、未確定の起動モードを拒否する。実機検証は未完了。 |
 
 ## ロードマップ
 

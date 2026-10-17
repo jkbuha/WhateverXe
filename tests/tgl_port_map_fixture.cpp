@@ -1,3 +1,6 @@
+// Private observer hooks have no bearing on the fixture hardware model.
+template<class... Args> static void rightPortRecord(Args...) {}
+static void rightPortPublish() {}
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -122,6 +125,26 @@ int main() {
   assert(nativeReads==r+1&&nativeWrites==w+1);
   object.tglTCWiring.legacy|=1u<<ddi;
  }
+ // Actual corrected wrappers execute in the admitted right-port mode3.
+ object.tglRightAltReady=true;object.tglTCWiring.legacy&=~(1u<<5);
+ {
+  PortFixture alt(5);*reinterpret_cast<uint32_t *>(alt.port+0x550)=3;
+  auto r=nativeReads,w=nativeWrites;
+  assert(XE::wrapTGLReadDekel(alt.port,0x38)==0xA5FABCDF);
+  XE::wrapTGLWriteDekel(alt.port,0x38,0xcc000000);
+  assert(alt.mmio[0x46038/4]==0xcc000000);
+  assert(nativeReads==r && nativeWrites==w);
+  // TC1's PLL, all unrelated slots and unsupported mode0 remain untouched.
+  assert(alt.mmio[0x46030/4]==0xA5FABCDF);
+  auto before=alt.mmio;*reinterpret_cast<uint32_t *>(alt.port+0x550)=0;
+  assert(XE::wrapTGLReadDekel(alt.port,0x38)==0);
+  XE::wrapTGLWriteDekel(alt.port,0x38,7);assert(alt.mmio==before);
+  *reinterpret_cast<uint32_t *>(alt.port+0x550)=3;
+  object.tglRightAltFault=true;
+  XE::wrapTGLWriteDekel(alt.port,0x38,7);assert(alt.mmio==before);
+  object.tglRightAltFault=false;
+ }
+ object.tglRightAltReady=false;object.tglTCWiring.legacy|=1u<<5;
  PortFixture p(4);uint32_t value=7;auto before=p.mmio;
  assert(!XE::tglDekelAccess(nullptr,0x34,true,value));
  for(unsigned ddi:{0u,1u,2u,9u,~0u}) {TGLTypeCPort m;assert(!TGLTypeCPort::resolve(ddi,m));}

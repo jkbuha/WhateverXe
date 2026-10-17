@@ -1,6 +1,12 @@
 #include <cassert>
 #include <initializer_list>
 #include <cstdint>
+#include "kern_edp_combo_profile.hpp"
+#include "kern_edp_enable_cycle.hpp"
+uint32_t wxEdpEnableCycleOnce=0;
+EdpPLLFrac::Scope wxEdpPLLFracScope;
+void *current_thread(){return (void *)42;}
+
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
@@ -17,6 +23,10 @@ struct XE {
  // FIELDS
  bool tglPhyClockPreserveReady=true,tglDekelReady=true;
  uintptr_t orgTGLSignalLevels,orgTGLPhyClockGating,orgTGLSetDklDPMode,orgTGLPortWriteReg,orgTGLEnablePort;
+ static uint32_t wrapTGLReadAUX(void*,uint32_t,void*,uint32_t){__builtin_trap();}
+ static uint32_t wrapTGLRegisterRead(void*,unsigned long){__builtin_trap();}
+ static void wrapTGLRegisterWrite(void*,unsigned long,uint32_t){__builtin_trap();}
+ static void tglEdpBoundaryProbe(void*,uint32_t,uint32_t){assert(wxEdpPLLFracScope.thread==0);}
  static uint32_t wrapTGLSignalLevels(void*,uint32_t,uint32_t,void*);
  static void wrapTGLPhyClockGating(void*,bool);
  static void wrapTGLSetDklDPMode(void*);

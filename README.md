@@ -99,6 +99,9 @@ Alder Lake-N / Twin Lake.
 | `-wexoff` | Disable WhateverXe. |
 | `-wexbeta` | Bypass the plugin's OS-version check. Exact kernel/driver checks still apply. |
 | `-wex-tgl-off` | Disable the Tiger Lake path. |
+| `-wex-tc-bootstrap` | Development trial: retain TC-cold power for the boot. This source tree also gates a two-lane pin-D DP Alt Mode backend on physical Tiger Lake `9A49`, DDI5, with retained display power. Experimental; system sleep and general USB-C support remain unqualified. |
+| `-wex-edp-probe` | Diagnostic trial for physical Tiger Lake `9A49`: read internal-panel DPCD and EDID after framebuffer startup using scoped native VDD/AUX power. Publishes diagnostic properties only; does not enable internal display output. |
+| `-wex-edp-routing` | Experimental physical Tiger Lake `9A49` internal-display trial. Requires `-wex-edp-probe`; selects the actual pipe in qualified native eDP paths, supplies scoped VDD for AUX, and rejects unresolved boot modes. Hardware validation is incomplete. |
 
 ## Roadmap
 

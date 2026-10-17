@@ -57,6 +57,7 @@ public:
 	bool processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 
 private:
+ static void tglCaptureEdpHandoff(void *,unsigned,uint32_t,uint32_t,uint64_t);
 	// Do not inline either helper into the small kext-load dispatcher.
 	__attribute__((noinline)) bool processAlderLakeNLoadOnly(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	__attribute__((noinline)) bool processAlderLakeNRejectedAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
@@ -318,6 +319,7 @@ private:
 	bool tglDekelReady {false};
 	bool tglPhyClockPreserveReady {false};
 	mach_vm_address_t orgTGLEnablePort {};
+	static void tglEdpBoundaryProbe(void *port,uint32_t phase,uint32_t nativeResult);
 	mach_vm_address_t orgTGLSignalLevels {};
 	static uint32_t wrapTGLSignalLevels(void *port, uint32_t swing, uint32_t emphasis, void *overrideConfig);
 	mach_vm_address_t orgTGLPhyClockGating {};
@@ -360,8 +362,15 @@ private:
 	static uint32_t wrapTGLMailboxReadData(void *controller, uint32_t command, uint32_t data);
 	static void wrapTGLMailboxWrite(void *controller, uint32_t command, uint32_t data, bool microWait);
 	mach_vm_address_t orgTGLRunAUX {};
+ mach_vm_address_t tglEdpVddGet {},tglEdpVddPut {};
+ bool tglEdpVddReady {},tglEdpRoutingReady {};
+ mach_vm_address_t orgTGLEdpCurrentMode {},orgTGLLightUpEdp {};
+ static uint32_t wrapTGLEdpCurrentMode(void *,int32_t *,int32_t *);
+ static uint32_t wrapTGLLightUpEdp(void *,void *,void *,const void *);
+ static void tglIdentifyEdp(void *controller);
 	mach_vm_address_t tglEnablePG {}, tglDisablePG {}, tglPortByDDI {};
 	mach_vm_address_t orgTGLEnableAUXPower {}, orgTGLDisableAUXPower {};
+ mach_vm_address_t orgTGLSetFIALanes {};
 	bool tglAUXParentReady {false};
 	void *tglAUXParentOwner {};
 	// Qualified PHY backends only; immutable while AUX references are live.
@@ -369,6 +378,13 @@ private:
 	uint32_t tglAUXParentMask {TGLTCWiring::Mask};
  TGLTCWiring tglTCWiring {TGLTCWiring::fromMasks(0,0,0)};
  bool tglTCWiringLoaded {}, tglTCWiringExplicit {};
+ bool tglRightAltRequested {},tglRightAltReady {},tglRightAltRoutingReady {},tglRightAltFault {};
+ bool tglRightAltEligible(uint32_t ddi) const {return ddi==5 && __atomic_load_n(&tglRightAltReady,__ATOMIC_ACQUIRE);}
+ bool tglDPTransportEligible(uint32_t ddi) const {return tglLegacyTCEligible(ddi)||tglRightAltEligible(ddi);}
+ bool tglDPMode(uint32_t ddi,uint32_t mode) const {return mode==4 || (mode==3&&tglRightAltEligible(ddi));}
+ static uint32_t tglRightAltProbe(void *port);
+ static void wrapTGLSetFIALanes(void *port,uint32_t lanes);
+
  // Native mode setter owns FIA1 bits 0/1 correctly on modular TGL. Later
  // instances need the new mode backend, regardless of available PHY math.
  uint32_t tglTCAutoCandidates {},tglTCAutoRegistered {};
@@ -385,6 +401,7 @@ private:
  uint32_t tglTCProbeMask() const {return tglTCWiring.valid ?
   (tglTCWiring.legacy|tglTCAutoCandidates)&tglAUXParentMask : 0;}
  bool tglTCModeAllowed(uint32_t ddi,uint32_t mode) const {
+  if(tglRightAltEligible(ddi))return mode==0 || mode==3;
   if(ddi>=9 || !(tglTCAutoCandidates&(1U<<ddi)))return true;
   return mode==0 || (mode==4 && (__atomic_load_n(&tglTCAutoRegistered,__ATOMIC_ACQUIRE)&(1U<<ddi)));
  }
@@ -395,7 +412,7 @@ private:
  }
 	uint32_t tglAUXParentRefs[9] {};
 	bool tglAUXParentEligible(uint32_t ddi) const {
-		return tglAUXParentReady && tglLegacyTCEligible(ddi);
+		return tglAUXParentReady && tglDPTransportEligible(ddi);
 	}
 	static void wrapTGLEnableAUXPower(void *power, uint32_t ddi);
 	static void wrapTGLDisableAUXPower(void *power, uint32_t ddi);
