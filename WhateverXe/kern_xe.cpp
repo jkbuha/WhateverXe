@@ -28,6 +28,7 @@ namespace { uint32_t wxEdpEnableCycleOnce=0; }
 #include "kern_edp_aux_lease.hpp"
 #include "kern_edp_blit_init_capture.hpp"
 #include "kern_edp_resolve_init_capture.hpp"
+#include "kern_edp_resolve_rectangle.hpp"
 namespace { EdpHandoff::Evidence wxEdpHandoff {}; }
 static void tglPublishEdpHandoff();
 
@@ -209,6 +210,14 @@ static TGLResolveCodeRecord tglResolveCodeRecords[12] {};
 static uint32_t tglResolveCodeCount;
 static mach_vm_address_t tglResolveResourceOriginal;
 static uint32_t tglResolveResourceCount;
+static uint32_t tglResolveRectangleEnabled,tglResolveRectangleCount;
+static bool tglResolveRectangleSerialize(void *,void *,OSSerialize *serializer){
+ const uint32_t q[]={1,__atomic_load_n(&tglResolveRectangleEnabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&tglResolveRectangleCount,__ATOMIC_ACQUIRE),30,75,76};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 static uint64_t tglResolveMapVtable,tglResolveMemoryVtable;
 struct TGLResolveResourceRecord {uint64_t q[16];uint8_t resource[512],params[160],map[0x128],memory[0x198];};
 static TGLResolveResourceRecord tglResolveResources[4] {};
@@ -8677,6 +8686,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              resourceCaptureOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveResourceReady",resourceCaptureOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveBackingReady",resourceCaptureOK);
+            __atomic_store_n(&tglResolveRectangleEnabled,resourceCaptureOK?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRectangleReady",resourceCaptureOK);
+            if(resourceCaptureOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveRectangleSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRectangleLive",live);live->release();}
+
             patcher.clearError();
 
             patcher.clearError();
@@ -11314,12 +11328,15 @@ bool XE::wrapTGLResolveCode(void *pool,void *mapped,void *params,bool mode,const
 
 // Observe caller-owned CPU objects before native submission. Follow only the
 // exact native retained map/memory classes. No virtual calls, GPU reads,
-// memory maps or argument modifications.
+// memory maps. The scoped rectangle trial passes a temporary copy only after
+// validating current backing bounds; caller objects remain unchanged.
 // Raw resource fields remain uninterpreted until checked against donor code.
 static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task) {
  const auto slot=__atomic_fetch_add(&tglResolveResourceCount,1U,__ATOMIC_RELAXED);
- if(slot<4 && tglVM.nofault){
-  auto &r=tglResolveResources[slot];auto q=r.q;q[0]=2;tglHostClock(q+1);
+ TGLResolveResourceRecord local {};
+ uint64_t trialVector[3] {};uint32_t trialRect[4] {};const void *submitRects=rects;
+ if((slot<4 || __atomic_load_n(&tglResolveRectangleEnabled,__ATOMIC_ACQUIRE)) && tglVM.nofault){
+  auto &r=slot<4 ? tglResolveResources[slot] : local;auto q=r.q;q[0]=2;tglHostClock(q+1);
   q[2]=reinterpret_cast<uint64_t>(owner);q[3]=reinterpret_cast<uint64_t>(resource);
   q[4]=reinterpret_cast<uint64_t>(params);q[5]=reinterpret_cast<uint64_t>(rects);q[6]=reinterpret_cast<uint64_t>(task);
   auto read=[](uint64_t a,void *dest,size_t n)->uint64_t {
@@ -11343,10 +11360,20 @@ static void tglResolveResourceCapture(void *owner,void *resource,void *params,co
    }
   }
 
-  char key[48];snprintf(key,sizeof(key),"WXEdpResolveResource%u",slot);
-  IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));
+  uint64_t vector[3] {};uint32_t rect[4] {};
+  if(__atomic_load_n(&tglResolveRectangleEnabled,__ATOMIC_ACQUIRE) &&
+   read(q[5],vector,sizeof(vector))==sizeof(vector) && vector[0]==1 &&
+   read(vector[2],rect,sizeof(rect))==sizeof(rect) &&
+   EdpResolveRectangle::prepare(q,r.params,r.map,r.memory,vector,rect,trialRect)){
+   trialVector[0]=vector[0];trialVector[1]=vector[1];trialVector[2]=reinterpret_cast<uint64_t>(trialRect);
+   submitRects=trialVector;q[9]|=2;
+   __atomic_add_fetch(&tglResolveRectangleCount,1U,__ATOMIC_RELEASE);
+  }
+  if(slot<4){char key[48];snprintf(key,sizeof(key),"WXEdpResolveResource%u",slot);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));}
+
  }
- FunctionCast(tglResolveResourceCapture,tglResolveResourceOriginal)(owner,resource,params,rects,task);
+ FunctionCast(tglResolveResourceCapture,tglResolveResourceOriginal)(owner,resource,params,submitRects,task);
 }
 
 bool XE::wrapTGLResolveInit(void *context) {
