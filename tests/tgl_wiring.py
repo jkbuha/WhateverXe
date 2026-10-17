@@ -8,7 +8,7 @@ header=(repo/'WhateverXe/kern_xe.hpp').read_text()
 fields=header[header.index('\tbool tglAUXParentReady'):header.index('\tstatic void wrapTGLEnableAUXPower')]
 body='\n'.join(re.search(p,cpp,re.S).group() for p in
  [r'bool XE::tglLoadTCWiring\(.*?\n\}',r'uint32_t XE::wrapTGLLaneMask\(.*?\n\}'])
-fixture=(repo/'tests/tgl_wiring_fixture.cpp').read_text().replace('// FIELDS',fields).replace('// FUNCTIONS',body)
+fixture=(repo/'tests/tgl_wiring_fixture.cpp').read_text().replace('// FIELDS',fields).replace('// FUNCTIONS',body).replace('static uint32_t tglRightAltProbe(void *port);','static uint32_t tglRightAltProbe(void *) {return 0;}')
 with tempfile.TemporaryDirectory(prefix='tgl-wiring-') as directory:
     path=Path(directory);(path/'check.cpp').write_text(fixture)
     subprocess.run(['clang++','-std=c++14','-O1','-g','-fsanitize=address,undefined',

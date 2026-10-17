@@ -8,6 +8,11 @@
 #include <sys/mman.h>
 #include "kern_tgl_tc_cold.hpp"
 #include "kern_tgl_pcode_gate.hpp"
+#include "kern_edp_pll_fraction.hpp"
+// The extracted AUX write wrapper now references the internal modeset scope.
+// Keep it inactive for these existing Type-C bootstrap tests.
+EdpPLLFrac::Scope wxEdpPLLFracScope;
+struct IORegistryEntry {static IORegistryEntry *getRegistryRoot(){static IORegistryEntry r;return &r;}void setProperty(const char *,uint32_t,unsigned){assert(false);}};
 struct IOService {};struct IOMemoryMap {};using IOLock=std::mutex;
 thread_local unsigned held;thread_local char threadIdentity;
 void IOLockLock(IOLock *p){assert(!held);p->lock();++held;}

@@ -16,6 +16,10 @@ header=(r/'repos/WhateverXe/WhateverXe/kern_xe.hpp').read_text()
 fields=header[header.index('\tbool tglAUXParentReady'):header.index('\tstatic void wrapTGLEnableAUXPower')]
 code=r'''
 #include <cstdint>
+#include "kern_edp_combo_profile.hpp"
+EdpPLLFrac::Scope wxEdpPLLFracScope;
+void *current_thread(){return (void *)42;}
+
 #include "kern_tgl_tc_boot.hpp"
 struct IOService;
 #include <cstdlib>
@@ -34,6 +38,9 @@ struct XE {
 FIELDS
  bool tglDekelReady=true;
  uintptr_t orgTGLSignalLevels;
+ static uint32_t wrapTGLRegisterRead(void*,unsigned long){__builtin_trap();}
+ static void wrapTGLRegisterWrite(void*,unsigned long,uint32_t){__builtin_trap();}
+ static void tglEdpBoundaryProbe(void*,uint32_t,uint32_t){assert(wxEdpPLLFracScope.thread==0);}
  static uint32_t wrapTGLSignalLevels(void*,uint32_t,uint32_t,void*);
 };
 XE object;XE* callbackXE=&object;

@@ -136,5 +136,7 @@
   ],
   "-wexbeta": [
     "-wxebeta"
-  ]
+  ],
+  "-wex-edp-probe": [],
+  "-wex-edp-routing": []
 }

@@ -11,7 +11,7 @@ body="\n".join(re.search(p,source,re.S).group() for p in patterns)
 fixture=(repo/"tests/tgl_probe_fixture.cpp").read_text().replace("// PRODUCTION_FUNCTIONS",body)
 header=(repo/"WhateverXe/kern_xe.hpp").read_text()
 wiring=header[header.index("\tbool tglAUXParentReady"):header.index("\tstatic void wrapTGLEnableAUXPower")]
-fixture=fixture.replace("// TC_WIRING_FIELDS",wiring)
+fixture=fixture.replace("// TC_WIRING_FIELDS",wiring).replace("static uint32_t tglRightAltProbe(void *port);","static uint32_t tglRightAltProbe(void *) {return 0;}")
 with tempfile.TemporaryDirectory(prefix="tgl-probe-") as directory:
     tmp=Path(directory);(tmp/"check.cpp").write_text(fixture)
     subprocess.run(["clang++","-std=c++14","-O1","-g","-fsanitize=address,undefined",

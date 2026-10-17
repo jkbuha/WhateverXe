@@ -8,6 +8,90 @@
 //
 
 #include "kern_xe.hpp"
+#include "kern_right_port_observer.hpp"
+#include "kern_right_alt.hpp"
+#include "kern_edp_hang_log.hpp"
+#include "kern_edp_pll_fraction.hpp"
+#include "kern_edp_combo_scaling.hpp"
+#include "kern_edp_combo_profile.hpp"
+#include "kern_edp_framing.hpp"
+#include "kern_edp_enable_cycle.hpp"
+#include "kern_edp_aux_phy.hpp"
+#include "kern_edp_irefgen.hpp"
+#include "kern_edp_odcc.hpp"
+#include "kern_edp_aux_auto.hpp"
+#include "kern_edp_phy_init.hpp"
+namespace { uint32_t wxEdpAuxPHYCount=0; }
+namespace { uint32_t wxEdpEnableCycleOnce=0; }
+#include "kern_edp_aux_status.hpp"
+#include "kern_edp_handoff.hpp"
+namespace { EdpHandoff::Evidence wxEdpHandoff {}; }
+static void tglPublishEdpHandoff();
+
+namespace { EdpAuxStatus::Scope wxEdpAuxStatus; }
+namespace { uint32_t wxEdpScalingApplied=0; }
+namespace { EdpPLLFrac::Scope wxEdpPLLFracScope; }
+// Native InjectHPD iterates another FB's path count while indexing the
+// requested FB's array. A newly discovered internal FB may have no path yet.
+// Skip only a null slot; preserve native HPD notification and later allocation.
+extern "C" {
+ uintptr_t wxEdpHpdResume {},wxEdpHpdNext {},wxEdpHpdCounter {},wxEdpHpdSkipped {};
+}
+extern "C" __attribute__((naked,used)) void wxEdpHpdBridge() {
+ asm volatile(
+  "movq (%rax), %rdi\n"
+  "testq %rdi, %rdi\n"
+  "jz 1f\n"
+  "xorl %r8d, %r8d\n"
+  "testq %r13, %r13\n"
+  "sete %r8b\n"
+  "pushq %rcx\n"
+  "movq _wxEdpHpdCounter(%rip), %rcx\n"
+  "addq %r8, (%rcx)\n"
+  "popq %rcx\n"
+  "jmpq *_wxEdpHpdResume(%rip)\n"
+  "1: lock incq _wxEdpHpdSkipped(%rip)\n"
+  "jmpq *_wxEdpHpdNext(%rip)\n"
+ );
+}
+extern "C" {
+ uintptr_t wxEdpTimingResume {},wxEdpTimingEmpty {};
+}
+extern "C" __attribute__((naked,used)) void wxEdpTimingBridge() {
+ asm volatile(
+  "movl 0x160(%r12), %eax\n"
+  "movl 0x164(%r12), %ecx\n"
+  "testq %rax, %rax\n"
+  "jz 1f\n"
+  "testq %rbx, %rbx\n"
+  "jz 1f\n"
+  "testq %rcx, %rcx\n"
+  "jz 1f\n"
+  "imulq %rbx, %rax\n"
+  "xorl %edx, %edx\n"
+  "divq %rcx\n"
+  "jmpq *_wxEdpTimingResume(%rip)\n"
+  "1: jmpq *_wxEdpTimingEmpty(%rip)\n"
+ );
+}
+static RightPortObserver rightPortObserver;
+static void rightPortRecord(void *port,uint32_t kind,uint32_t a,uint32_t b=0,uint32_t c=0,uint32_t d=0) {
+ if(!port)return;
+ auto bytes=static_cast<uint8_t *>(port);
+ auto config=*reinterpret_cast<uint32_t **>(bytes+0x548);
+ if(config && config[0]==5 && (kind==4 || kind==5) && !c) {
+  c=*reinterpret_cast<uint32_t *>(bytes+0x580+0x38*4);
+  d=0x165000+(config[0]<<12)+(c&0xFFFF3FFFU);
+ }
+ if(config)rightPortObserver.record(kind,config[0],*reinterpret_cast<uint32_t *>(bytes+0x550),a,b,c,d);
+}
+static void rightPortPublish() {
+ uint32_t data[RightPortObserver::Capacity*RightPortObserver::Words] {};
+ const auto count=rightPortObserver.snapshot(data,sizeof(data)/sizeof(data[0]));
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WXRightPortStage1Revision",3,32);
+ root->setProperty("WXRightPortStage1",data,count*sizeof(data[0]));
+}
 #include "kern_alderlake_n.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
@@ -1998,6 +2082,11 @@ uint32_t tglProgramCounts[2] {}, tglProgramSequence {};
 
 void tglProgramRecord(void *access, unsigned long reg, uint32_t value, uint32_t fast, void *caller) {
 	if (!tglProgramEnabled || !tglProgramLock) return;
+ // Retain Combo PHY A requests only during the qualified internal modeset.
+ // The existing trace records arguments; it does not read or alter hardware.
+ const bool internalPHY=reg>=0x162000 && reg<=0x162BFF &&
+  __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==reinterpret_cast<uintptr_t>(current_thread()) &&
+  __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(access);
 	uint32_t group = 0;
 	if (reg >= 0x70180 && reg <= 0x70400) group = 1;
 	else if (!((reg >= 0x60000 && reg <= 0x60044) ||
@@ -2006,7 +2095,7 @@ void tglProgramRecord(void *access, unsigned long reg, uint32_t value, uint32_t 
 		reg == 0x64400 || reg == 0x46140 ||
 		(reg >= 0x46000 && reg <= 0x46080) ||
 		reg == 0x45400 || reg == 0x45404 || reg == 0x45450 || reg == 0x45454 ||
-		reg == 0x163890 || reg == 0x1638A0 || reg == 0x1638C0)) return;
+		reg == 0x163890 || reg == 0x1638A0 || reg == 0x1638C0 || internalPHY)) return;
 	TGLProgramRecord record {};
 	uint64_t uptime;
 	clock_get_uptime(&uptime); absolutetime_to_nanoseconds(uptime, record.q);
@@ -2934,6 +3023,7 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+ tglRightAltRequested=xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-tc-bootstrap");
     if(!xeProfile.admitted())return;
     xelpSelectedGPU=physicalGPU;xelpSelectedProfile=xeProfile;
 	if (adlnDetected) {
@@ -8461,6 +8551,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				hangOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
+   if(xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing"))IORegistryEntry::getRegistryRoot()->setProperty("WXEdpHangPersistentLog",hangOK);
 			// r123: the TGL caller loops reset -> extra stamp -> one-second wait
 			// while IOAccel holds its recovery locks. A stopped consumer fills its
 			// 511-slot software queue and submitToRing panics. ICL on this exact
@@ -8582,7 +8673,12 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				patcher.clearError();
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLPlatformNVRAMABIReady", tglPlatformNVRAMReady);
-			if (tglHDMIB) {
+			// The internal eDP output also uses Combo DPLL0/1. Admit the
+			// existing exact-table relocation for the physical 9A49 eDP trial;
+			// Type-C/DKL PLLs and the legacy HDMI admission stay unchanged.
+			const bool edpComboPLLTrial = xeProfile.identity == 0x9A498086U &&
+				checkKernelArgument("-wex-edp-probe") && checkKernelArgument("-wex-edp-routing");
+			if (tglHDMIB || edpComboPLLTrial) {
 				// r319: the donor's combo PLL tables still contain ICL MMIO
 				// addresses. TGL moved DPLL0/1 CFGCR0/1 (Linux v6.12 i915_reg.h).
 				// Correct both reads and writes through the native tables; retain
@@ -8601,6 +8697,8 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 					ready = !memcmp(site, after, sizeof(after));
 				}
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLHDMIComboPLLReady", ready);
+				if (edpComboPLLTrial)
+					IORegistryEntry::getRegistryRoot()->setProperty("WXEdpComboPLLReady", ready);
 				patcher.clearError();
 			}
 			if (tglHDMIB) {
@@ -9256,6 +9354,114 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
     IORegistryEntry::getRegistryRoot()->setProperty("TGLBootReadoutReady",tglBootReadoutReady);
     patcher.clearError();
    }
+   if(xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-probe")) {
+    const uint8_t getBytes[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0xff,0x05,0xfa,0xe8,0x08,0x00,0x80,0xbf,0x18,0x09,0x00,0x00,0x00,0x74,0x0c,0x48,0xff,0x05,0xf2,0xe8,0x08,0x00,0x45,0x31,0xff,0xeb,0x7e,0x49,0x89,0xf6,0x49,0x89,0xfc,0x48,0x8b,0xbf,0x40,0x0c,0x00,0x00,0xbe,0x04,0x72,0x0c,0x00,0xe8,0x3a,0xd0,0x00,0x00};
+    const uint8_t putBytes[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x49,0x89,0xff,0x48,0xff,0x05,0xba,0xe7,0x08,0x00,0x48,0x8b,0xbf,0x40,0x0c,0x00,0x00,0xbe,0x04,0x72,0x0c,0x00,0xe8,0xbd,0xce,0x00,0x00};
+    const uint8_t auxBytes[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x48,0xff,0x05,0x03,0x18,0x08,0x00,0x48,0xff,0x05,0x8c,0x11,0x08,0x00,0x45,0x89,0xc5,0x41,0x89,0xcc,0x48,0x89,0xd3,0x89,0x75,0xd4,0x49,0x89,0xff,0x4c,0x8d,0x35,0x2e,0x74,0x0d,0x00,0x49,0x8b,0x06,0x48,0x8b,0xb8,0x30,0x0c,0x00,0x00};
+    const auto get=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController15enableVDDForAuxEP14AppleIntelPort",address,size);
+    const auto put=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController16disableVDDForAuxEv",address,size);
+    const auto aux=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb",address,size);
+    tglEdpVddReady=tglTCNativeFunctions.complete() && size>0x61B18 && get==address+0x512CC && put==address+0x51462 && aux==address+0x61748 &&
+     !memcmp(reinterpret_cast<void *>(get),getBytes,sizeof(getBytes)) &&
+     !memcmp(reinterpret_cast<void *>(put),putBytes,sizeof(putBytes)) &&
+     !memcmp(reinterpret_cast<void *>(aux),auxBytes,sizeof(auxBytes));
+    if(tglEdpVddReady){tglEdpVddGet=get;tglEdpVddPut=put;}
+    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpIdentifyNativeReady",tglEdpVddReady);
+    patcher.clearError();
+   }
+   if(xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing") && tglEdpVddReady) {
+    struct Site {uintptr_t offset;uint32_t length;uint8_t context[22];};
+    static const Site sites[] {
+     {0x48e38,6,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0d,0x48,0xff,0x05,0xa8,0x58,0x09,0x00,0x41,0xbc,0x0f,0x00,0x00,0x00}},
+     {0x493c6,6,{0x83,0x78,0x08,0x00,0x4c,0x89,0xea,0x75,0x12,0x48,0xff,0x05,0x1a,0x53,0x09,0x00,0x41,0xbc,0x0f,0x00,0x00,0x00}},
+     {0x49eaa,5,{0x4a,0x09,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x36,0x48,0x09,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x4af0e,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0xd2,0x37,0x09,0x00,0xbe,0x0f,0x00,0x00,0x00}},
+     {0x4ccde,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x02,0x1a,0x09,0x00,0xbe,0x0f,0x00,0x00,0x00}},
+     {0x4d705,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0xdb,0x0f,0x09,0x00,0xb9,0x0f,0x00,0x00,0x00}},
+     {0x4df95,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x4b,0x07,0x09,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x4e165,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x7b,0x05,0x09,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x4e2af,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x31,0x04,0x09,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x4e439,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0xa7,0x02,0x09,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x4f3b0,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x30,0xf3,0x08,0x00,0xbe,0x0f,0x00,0x00,0x00}},
+     {0x5252b,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0xb5,0xc1,0x08,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x52615,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0xcb,0xc0,0x08,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x526fd,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0xe3,0xbf,0x08,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x52a6d,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x73,0xbc,0x08,0x00,0xbb,0x0f,0x00,0x00,0x00}},
+     {0x5776d,5,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x73,0x6f,0x08,0x00,0xbe,0x0f,0x00,0x00,0x00}},
+     {0x57a42,6,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0d,0x48,0xff,0x05,0x9e,0x6c,0x08,0x00,0x41,0xbf,0x0f,0x00,0x00,0x00}},
+     {0x57cd8,6,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0d,0x48,0xff,0x05,0x08,0x6a,0x08,0x00,0x41,0xbd,0x0f,0x00,0x00,0x00}},
+     {0x4956c,5,{0x05,0x00,0x00,0x83,0x7a,0x08,0x00,0x75,0x0c,0x48,0xff,0x05,0x74,0x51,0x09,0x00,0xb8,0x0f,0x00,0x00,0x00}},
+     {0x4f77f,6,{0x05,0x00,0x00,0x83,0x78,0x08,0x00,0x75,0x0d,0x48,0xff,0x05,0x61,0xef,0x08,0x00,0x41,0xbc,0x0f,0x00,0x00,0x00}},
+    };
+    bool ok=size>0x61B18;
+    for(const auto &site:sites)ok=ok && !memcmp(reinterpret_cast<void *>(address+site.offset-16),site.context,16+site.length);
+    const uint8_t timingHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+    const uint8_t timingPath[] {0x83,0xbe,0xd8,0x3f,0x00,0x00,0xff,0x74,0x17,0x48,0xff,0x05,0xe9,0x45,0x09,0x00,0x48,0xff,0x05,0x2a,0x74,0x09,0x00,0x48,0x81,0xc6,0x08,0x4a,0x00,0x00,0xeb,0x0e,0x48,0xff,0x05,0x22,0x74,0x09,0x00,0x48,0x81,0xc6,0xf0,0x49,0x00,0x00,0x4c,0x8b,0x26,0x4d,0x85,0xe4};
+    const uint8_t timingEmpty[] {0x48,0xff,0x05,0x94,0x4a,0x09,0x00,0xbe,0xa0,0x00,0x00,0x00,0x4c,0x89,0xff};
+    const uint8_t timingMath[] {0x41,0x8b,0x84,0x24,0x60,0x01,0x00,0x00,0x41,0x8b,0x8c,0x24,0x64,0x01,0x00,0x00,0x48,0x0f,0xaf,0xc3,0x31,0xd2,0x48,0xf7,0xf1};
+    const uint8_t modeHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0xa8,0x00,0x00,0x00};
+    const uint8_t edpHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x49,0x89,0xcf,0x49,0x89,0xd4};
+    const char *modeName="__ZN21AppleIntelFramebuffer21getCurrentDisplayModeEPiS0_";
+    const char *edpName="__ZN31AppleIntelFramebufferController10LightUpEDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2";
+    ok=ok && patcher.solveSymbol<mach_vm_address_t>(index,modeName,address,size)==address+0x32A88 &&
+     patcher.solveSymbol<mach_vm_address_t>(index,edpName,address,size)==address+0x5063E &&
+     !memcmp(reinterpret_cast<void *>(address+0x32A88),modeHead,sizeof(modeHead)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x5063E),edpHead,sizeof(edpHead)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x49D46),timingHead,sizeof(timingHead)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x49D6F),timingPath,sizeof(timingPath)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x49DBD),timingEmpty,sizeof(timingEmpty)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x4A00B),timingMath,sizeof(timingMath));
+    const uint8_t hpdHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38,0x48,0x89,0xf3};
+    const uint8_t hpdSite[] {0x48,0x8b,0x38,0x45,0x31,0xc0,0x4d,0x85,0xed,0x41,0x0f,0x94,0xc0,0x4c,0x01,0x05,0xf3,0x11,0x07,0x00};
+    const uint8_t hpdNext[] {0x49,0xff,0xc5,0x49,0x83,0xc4,0x08,0xe9,0x16,0xff,0xff,0xff};
+    ok=ok && size>0xE7168 && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController9InjectHPDEP21AppleIntelFramebuffer",address,size)==address+0x75E04 &&
+     !memcmp(reinterpret_cast<void *>(address+0x75E04),hpdHead,sizeof(hpdHead)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x75F59),hpdSite,sizeof(hpdSite)) &&
+     !memcmp(reinterpret_cast<void *>(address+0x75FA6),hpdNext,sizeof(hpdNext));
+    if(ok) {
+     KernelPatcher::RouteRequest hooks[] {{modeName,wrapTGLEdpCurrentMode,orgTGLEdpCurrentMode},{edpName,wrapTGLLightUpEdp,orgTGLLightUpEdp}};
+     patcher.clearError();ok=patcher.routeMultiple(index,hooks,arrsize(hooks),address,size);
+    }
+    if(ok) {
+     wxEdpTimingResume=address+0x4A024;wxEdpTimingEmpty=address+0x49DBD;
+     auto target=reinterpret_cast<uintptr_t>(wxEdpTimingBridge);
+     uint8_t jump[sizeof(timingMath)];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);memcpy(jump+6,&target,sizeof(target));
+     patcher.clearError();patcher.routeBlock(address+0x4A00B,jump,sizeof(jump));
+     ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x4A00B),jump,sizeof(jump));
+    }
+    if(ok) {
+     wxEdpHpdResume=address+0x75F6D;wxEdpHpdNext=address+0x75FA6;wxEdpHpdCounter=address+0xE7160;
+     const auto target=reinterpret_cast<uintptr_t>(wxEdpHpdBridge);
+     uint8_t jump[sizeof(hpdSite)];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);memcpy(jump+6,&target,sizeof(target));
+     patcher.clearError();patcher.routeBlock(address+0x75F59,jump,sizeof(jump));
+     ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x75F59),jump,sizeof(jump));
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpHpdGuardReady",ok);
+    if(ok) {
+     uint32_t done=0;
+     const uint8_t nops[6] {0x90,0x90,0x90,0x90,0x90,0x90};
+     for(const auto &site:sites) {
+      ++done;patcher.clearError();patcher.routeBlock(address+site.offset,nops,site.length);
+      ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+site.offset),nops,site.length);
+      if(!ok)break;
+     }
+     if(!ok)for(uint32_t i=0;i<done;++i){const auto &site=sites[i];patcher.clearError();patcher.routeBlock(address+site.offset,site.context+16,site.length);}
+    }
+    const auto auxState=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",address,size);
+    patcher.clearError();
+    const bool auxAuto=EdpAuxAuto::install(reinterpret_cast<uint8_t *>(address),size,auxState>=address?auxState-address:0,
+     ok && xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing"),
+     [&](size_t offset,const uint8_t *bytes,size_t length){
+      patcher.clearError();patcher.routeBlock(address+offset,const_cast<uint8_t *>(bytes),length);
+      return patcher.getError()==KernelPatcher::Error::NoError;
+     });
+    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxAutoReady",auxAuto);
+    tglEdpRoutingReady=ok;
+    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRoutingReady",ok);
+    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRoutingSiteCount",uint32_t(arrsize(sites)),32);
+    patcher.clearError();
+   }
+
 			if (tglAUXLock) {
 				KernelPatcher::RouteRequest aux("__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb", wrapTGLRunAUX, orgTGLRunAUX);
 				const bool routed = patcher.routeMultiple(index, &aux, 1, address, size);
@@ -9315,6 +9521,17 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			KernelPatcher::RouteRequest laneRequest("__ZN17AppleIntelPortHAL26getDklPhyLaneConfigBitMaskEv",
 				wrapTGLLaneMask, orgTGLLaneMask);
 			const bool laneOK = patcher.routeMultiple(index, &laneRequest, 1, address, size);
+   if(tglRightAltRequested){
+    patcher.clearError();
+    KernelPatcher::RouteRequest laneSet("__ZN17AppleIntelPortHAL15setFIALaneCountEj",wrapTGLSetFIALanes,orgTGLSetFIALanes);
+    const auto setter=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17AppleIntelPortHAL15setFIALaneCountEj",address,size);
+    const uint8_t laneEntry[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0xff,0x05,0x8e,0x27};
+    const bool qualified=size>0x60658 && setter==address+0x603E8 && !memcmp(reinterpret_cast<void *>(setter),laneEntry,sizeof(laneEntry));
+    patcher.clearError();
+    tglRightAltRoutingReady=qualified && laneOK && tglNativeFiaReady && tglDekelReady &&
+     patcher.routeMultiple(index,&laneSet,1,address,size);
+    IORegistryEntry::getRegistryRoot()->setProperty("WXRightAltRoutingReady",tglRightAltRoutingReady);
+   }
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGFixedDPLaneMaskRouted", laneOK);
 			patcher.clearError();
    tglRecordStartOrder(1,nullptr);
@@ -9478,12 +9695,14 @@ bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
 	bool result = FunctionCast(wrapTGLFramebufferStart, callbackXE->orgTGLFramebufferStart)(that, provider);
 	tglTimeEvent(22, 0, true, 0, result);
  tglRecordStartOrder(4,that,9,0,0,result);
+ tglPublishEdpHandoff();
 	tglFBIRQPublish();
 	IORegistryEntry::getRegistryRoot()->setProperty("TGLFramebufferStartResult", result);
  if(result) if(auto power=OSSerializer::forTarget(that,tglPowerSerialize)) {
   that->setProperty("TGLPowerSample",power);power->release();
  }
 	SYSLOG("igfx", "TGL framebuffer start returned %d", result);
+ if(result)tglIdentifyEdp(that);
 	return result;
 }
 
@@ -9494,9 +9713,18 @@ uint32_t XE::wrapTGLLaneMask(void *port) {
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = *reinterpret_cast<uint32_t **>(bytes + 0x548);
 	auto mode = *reinterpret_cast<uint32_t *>(bytes + 0x550);
+ if(config && callbackXE->tglRightAltEligible(config[0])) {
+  const auto accepted=tglRightAltProbe(port)==3;
+  auto access=*reinterpret_cast<uint8_t **>(bytes+0x578);
+  auto base=access?*reinterpret_cast<volatile uint8_t **>(access+0x50):nullptr;
+  const uint32_t result=accepted && mode==3 && base ? *reinterpret_cast<volatile uint32_t *>(base+0x16E8A0)&15 : 0;
+  rightPortRecord(port,0,result);return result;
+ }
 	if (config && callbackXE->tglLegacyTCEligible(config[0]) && mode == 4 && callbackXE->tglActive)
 		return 0xF;
-	return FunctionCast(wrapTGLLaneMask, callbackXE->orgTGLLaneMask)(port);
+	const auto result=FunctionCast(wrapTGLLaneMask, callbackXE->orgTGLLaneMask)(port);
+ rightPortRecord(port,0,result);
+ return result;
 }
 
 bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
@@ -10726,6 +10954,7 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
    IORegistryEntry::getRegistryRoot()->setProperty(key,c,sizeof(*c));
    if (c->q[3]==sizeof(c->regs) && c->q[4]==sizeof(c->ring))
     tglCaptureHangAddress(slot,c->q[2],c->regs,c->ring);
+   if(slot==0 && callbackXE->tglEdpRoutingReady)EdpHangLog::emit(*c,IOLog);
    IOFree(c,sizeof(*c));
   }
  }
@@ -11408,11 +11637,13 @@ uint32_t XE::wrapTGLProbePort(void *port) {
     uint32_t mode=0;
     if(callbackXE->xelpBindProbe(callbackXE->tglObservationController))
         mode=reinterpret_cast<XELP::ProbePort>(callbackXE->xelpProviderProbe)(port);
+    if(callbackXE->tglRightAltEligible(ddi))mode=tglRightAltProbe(port);
     tglAUXRecord(port,7,true,mode,0,0);
+    rightPortRecord(port,3,mode);
     // Register a fixed-DP backend only after the provider's powered mode4
     // probe. This is monotonic policy, NOT connection state or a power lease.
     // Never clear it at HPD-low: outstanding AUX refs must keep their puts.
-    if(mode==4 && ddi>=3 && ddi<=8)
+    if((mode==4 || (mode==3 && callbackXE->tglRightAltEligible(ddi))) && ddi>=3 && ddi<=8)
         __atomic_or_fetch(&callbackXE->tglModularProbed,1U<<ddi,__ATOMIC_RELEASE);
     if(mode==4 && ddi<9 && (callbackXE->tglTCAutoCandidates&(1U<<ddi))) {
         const auto selected=__atomic_or_fetch(&callbackXE->tglTCAutoRegistered,1U<<ddi,__ATOMIC_RELEASE);
@@ -11623,7 +11854,9 @@ uint32_t XE::wrapTGLSetPortMode(void *port, uint32_t mode) {
    __atomic_load_n(&self->tglTCAutoRegistered,__ATOMIC_ACQUIRE),32);
   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeTCDPHotplugRegistered",traceDDI,32);
  }
+ rightPortRecord(port,1,mode,self->tglTCModeAllowed(traceDDI,mode),self->tglLegacyTCEligible(traceDDI));
  if(!self->tglTCModeAllowed(traceDDI,mode))return kIOReturnNotReady;
+ if(self->tglRightAltEligible(traceDDI) && mode==3 && tglRightAltProbe(port)!=3)return kIOReturnNotReady;
  auto transitionLock=self->tglModeResultReady && traceDDI>=3 && traceDDI<=8 ? self->tglModeTransitionLock : nullptr;
  if(transitionLock) {
   tglAUXRecord(port,8,false,0,mode,0);
@@ -11635,12 +11868,13 @@ uint32_t XE::wrapTGLSetPortMode(void *port, uint32_t mode) {
 
 	tglConnectionRecord(port, 2, false, 0, mode, caller);
 	tglAUXRecord(port, 1, false, 0, mode, 0);
- const bool fiaEligible=(mode==0 || mode==4) && traceDDI<9 &&
-  (*reinterpret_cast<uint32_t *>(traceBytes+0x550)==0 || *reinterpret_cast<uint32_t *>(traceBytes+0x550)==4) &&
-  self->tglLegacyTCEligible(traceDDI) && (__atomic_load_n(&self->tglModularProbed,__ATOMIC_ACQUIRE)&(1U<<traceDDI));
+ const bool fiaEligible=(mode==0 || mode==4 || (mode==3 && self->tglRightAltEligible(traceDDI))) && traceDDI<9 &&
+  (*reinterpret_cast<uint32_t *>(traceBytes+0x550)==0 || self->tglDPMode(traceDDI,*reinterpret_cast<uint32_t *>(traceBytes+0x550))) &&
+  self->tglDPTransportEligible(traceDDI) && (__atomic_load_n(&self->tglModularProbed,__ATOMIC_ACQUIRE)&(1U<<traceDDI));
  TGLNativeFiaScope fiaScope(self->tglNativeFiaContext,reinterpret_cast<uintptr_t>(current_thread()),fiaEligible?port:nullptr,
   traceDDI,transitionLock && self->tglNativeFiaReady);
 	auto result = FunctionCast(wrapTGLSetPortMode, callbackXE->orgTGLSetPortMode)(port, mode);
+ rightPortRecord(port,2,mode,result);
  fiaScope.finish();
  if(fiaEligible && self->tglNativeFiaReady && transitionLock){
   TGLNativeFia mapping;
@@ -11945,8 +12179,65 @@ void XE::wrapTGLPowerInit(void *power,void *controller) {
   // power object as well as the already-retained controller/map for diagnosis.
   if(tglBootReadout.pgHeld)static_cast<OSObject *>(power)->retain();
  }
+ if(self->tglRightAltRequested && self->tglRightAltRoutingReady && self->tglTCNativeFunctions.complete() &&
+    state.controller==controller && state.cold.bootstrapHeld && state.cold.phase==TGLTCCold::Phase::Blocked &&
+    tglBootReadout.status==TGLBootReadout::Status::Success && tglBootReadout.ports[2].status==4) {
+  uint32_t q[9] {2};for(unsigned i=0;i<3;++i)q[1+i]=*reinterpret_cast<uint32_t *>(p+0x20+4*i);
+  bool valid=true;for(unsigned i=1;i<4;++i)valid&=q[i]!=UINT32_MAX;
+  if(valid){
+   self->tglTCNativeFunctions.getPG(power,3);static_cast<OSObject *>(power)->retain();
+   for(unsigned i=0;i<3;++i){q[4+i]=*reinterpret_cast<uint32_t *>(p+0x20+4*i);valid&=q[4+i]==q[1+i]+1;}
+   q[7]=*reinterpret_cast<volatile uint32_t *>(state.base+0x45404);
+   q[8]=*reinterpret_cast<volatile uint32_t *>(state.base+0x42000);
+   valid&=q[7]!=UINT32_MAX && q[8]!=UINT32_MAX && (q[7]&0x15)==0x15 && (q[8]&0x07000000)==0x07000000;
+   __atomic_store_n(&self->tglRightAltReady,valid,__ATOMIC_RELEASE);
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WXRightAltPower",q,sizeof(q));
+  IORegistryEntry::getRegistryRoot()->setProperty("WXRightAltReady",self->tglRightAltReady);
+ }
  __atomic_store_n(&tglBootReadoutStage,2,__ATOMIC_RELEASE);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLBootReadout",&tglBootReadout,sizeof(tglBootReadout));
+}
+
+
+uint32_t XE::tglRightAltProbe(void *port) {
+ auto self=callbackXE;if(!self->tglRightAltEligible(5) || __atomic_load_n(&self->tglRightAltFault,__ATOMIC_ACQUIRE))return 0;
+ auto owner=self->tglObservationController;
+ auto c=static_cast<uint8_t *>(owner);if(!c || owner!=tglBootstrapTrial.controller)return 0;
+ auto map=OSDynamicCast(IOMemoryMap,*reinterpret_cast<OSObject **>(c+0xC70));
+ auto binding=TGLTCNativeBinding::bind(self->tglTCNativeFunctions,owner,port,5,map?map->getVirtualAddress():0,map?map->getLength():0);
+ rightPortRecord(port,11,static_cast<uint32_t>(binding.status),binding.length);
+ if(!binding.ready() || binding.length<0x16E8C4)return 0;
+ auto read=[&](uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(binding.base+reg);};
+ const auto power=read(0x45404),fuse=read(0x42000);
+ const bool powered=power!=UINT32_MAX && fuse!=UINT32_MAX && (power&0x15)==0x15 && (fuse&0x07000000)==0x07000000;
+ if(!powered)return 0;
+ const bool cold=tglBootstrapTrial.cold.bootstrapHeld && tglBootstrapTrial.cold.phase==TGLTCCold::Phase::Blocked;
+ const auto first=read(0x1638A0),live=read(0x16E8A0),ready=read(0x16E890),pin=read(0x16E880),buffer=read(0x64500);
+ rightPortRecord(port,10,live,ready,pin,buffer);
+ return RightAlt::accept(self->xeProfile.identity,5,cold,powered,first,live,ready,pin,buffer,binding.nativeMode())?3:0;
+}
+void XE::wrapTGLSetFIALanes(void *port,uint32_t lanes) {
+ auto self=callbackXE;auto bytes=static_cast<uint8_t *>(port);
+ auto config=bytes?*reinterpret_cast<uint32_t **>(bytes+0x548):nullptr;
+ const auto ddi=config?config[0]:9;
+ auto lock=self->tglModeTransitionLock;
+ if(lock)IORecursiveLockLock(lock);
+ const bool target=self->tglRightAltEligible(ddi);
+ if(target){
+  if(tglRightAltProbe(port)==3 && (lanes==1 || lanes==2)){
+   auto access=*reinterpret_cast<uint8_t **>(bytes+0x578);
+   auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
+   auto reg=reinterpret_cast<volatile uint32_t *>(base+0x16E8C0);
+   const auto before=*reg;
+   if(before!=UINT32_MAX){
+    const auto wanted=RightAlt::lanePhysical(before,lanes);*reg=wanted;const auto after=*reg;
+    rightPortRecord(port,9,0x16E8C0,before,wanted,after);
+    if(after!=wanted)__atomic_store_n(&self->tglRightAltFault,true,__ATOMIC_RELEASE);
+   }
+  }
+ }else FunctionCast(wrapTGLSetFIALanes,self->orgTGLSetFIALanes)(port,lanes);
+ if(lock)IORecursiveLockUnlock(lock);
 }
 
 uint32_t XE::wrapTGLMailboxRead(void *controller, uint32_t command) {
@@ -12074,11 +12365,174 @@ void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 	}
 }
 
+// Diagnostic only: read panel identification after ordinary startup. The
+// automatic AUX/probe/mode paths remain the working HDMI baseline. No EDID
+// injection, display registration, path allocation, modeset, or GPU commands.
+void XE::tglIdentifyEdp(void *controller) {
+ static uint32_t started {};
+ if(__atomic_load_n(&started,__ATOMIC_ACQUIRE))return;
+ auto root=IORegistryEntry::getRegistryRoot();
+ auto blocked=[&](uint32_t stage){root->setProperty("WXEdpIdentifyBlockedStage",stage,32);};
+ auto self=callbackXE;auto &f=self->tglTCNativeFunctions;
+ if(!self->tglEdpVddReady || !f.complete() || !self->orgTGLEDID || !self->orgTGLReadAUX ||
+    !self->orgTGLRegisterRead || controller!=self->tglObservationController || *f.controllerSlot!=controller){
+  uint32_t flags[]={self->tglEdpVddReady,f.complete(),self->orgTGLEDID!=0,self->orgTGLReadAUX!=0,self->orgTGLRegisterRead!=0,controller==self->tglObservationController,f.controllerSlot&&*f.controllerSlot==controller};
+  root->setProperty("WXEdpIdentifyBlockedFields",flags,sizeof(flags));blocked(1);return;}
+ auto ctl=static_cast<uint8_t *>(controller);
+ if(ctl[0x918] || !ctl[0xE55] || !*reinterpret_cast<void **>(ctl+0xD60)){
+  uint32_t flags[]={ctl[0x918],ctl[0xE55],*reinterpret_cast<void **>(ctl+0xD60)!=nullptr};
+  root->setProperty("WXEdpIdentifyBlockedFields",flags,sizeof(flags));blocked(2);return;}
+ auto port=f.portByDDI(0);if(!port){blocked(3);return;}
+ auto pb=static_cast<uint8_t *>(port);auto cfg=*reinterpret_cast<uint32_t **>(pb+0x548);
+ auto power=*reinterpret_cast<uint8_t **>(ctl+0xC8);
+ auto manager=*reinterpret_cast<uint8_t **>(ctl+0xC40);
+ auto map=OSDynamicCast(IOMemoryMap,*reinterpret_cast<OSObject **>(ctl+0xC70));
+ auto lock=*reinterpret_cast<IORecursiveLock **>(ctl+0xC30);
+ if(!cfg || cfg[0]!=0 || cfg[2]!=0 || *reinterpret_cast<uint32_t *>(pb+0x550)!=1 ||
+    *reinterpret_cast<uint32_t *>(pb+0x594)!=0x64010 || !power || power[0x18] || !manager || !map || !lock ||
+    *reinterpret_cast<void **>(power+0x10)!=controller || *reinterpret_cast<void **>(power+0x78)!=manager ||
+    *reinterpret_cast<void **>(pb+0x578)!=manager ||
+    *reinterpret_cast<uintptr_t *>(manager+0x50)!=map->getVirtualAddress() ||
+    *reinterpret_cast<uint32_t *>(manager+0x60)<=0xC7210 || map->getLength()<*reinterpret_cast<uint32_t *>(manager+0x60)){
+  uint32_t fields[] {cfg?cfg[0]:UINT32_MAX,cfg?cfg[2]:UINT32_MAX,
+   *reinterpret_cast<uint32_t *>(pb+0x550),*reinterpret_cast<uint32_t *>(pb+0x594),
+   power?uint32_t(power[0x18]):UINT32_MAX,manager&&map?uint32_t(*reinterpret_cast<uintptr_t *>(manager+0x50)==map->getVirtualAddress()):0U,
+   power&&*reinterpret_cast<void **>(power+0x10)==controller,power&&*reinterpret_cast<void **>(power+0x78)==manager,
+   *reinterpret_cast<void **>(pb+0x578)==manager,manager?*reinterpret_cast<uint32_t *>(manager+0x60):0U,map?uint32_t(map->getLength()):0U,lock!=nullptr};
+  root->setProperty("WXEdpIdentifyBlockedFields",fields,sizeof(fields));blocked(4);return;
+ }
+ if(__atomic_exchange_n(&started,1U,__ATOMIC_ACQ_REL))return;
+ blocked(0);
+ uint32_t q[16] {1};uint8_t dpcd[6] {},edid[128] {};
+ // Match native AUX ordering: acquire power before the AUX mutex.
+ f.getPG(power,3);f.getAux(port);
+ IORecursiveLockLock(lock);
+ q[1]=wrapTGLRegisterRead(manager,0xC7204);q[2]=wrapTGLRegisterRead(manager,0xC7200);
+ bool owned=false;uint32_t ready=0;
+ if(q[1]==UINT32_MAX || q[2]==UINT32_MAX)ready=0xE00002D8U;
+ else if(!(q[1]&8) && !(q[2]&0x80000000U)) {
+  ready=reinterpret_cast<uint32_t (*)(void *,void *)>(self->tglEdpVddGet)(controller,port);
+  owned=ready!=0xE00002EBU;if(!owned)ready=0;
+  if(!ready)IOSleep((((wrapTGLRegisterRead(manager,0xC7208)>>16)&0x1FFF)+9)/10);
+ }
+ q[3]=ready;q[4]=owned;
+ q[5]=q[6]=0xE00002D8U;
+ if(!ready) {
+  q[5]=FunctionCast(wrapTGLReadAUX,self->orgTGLReadAUX)(port,0,dpcd,sizeof(dpcd));
+  q[6]=FunctionCast(wrapTGLEDID,self->orgTGLEDID)(port,0x50,0,edid,sizeof(edid));
+ }
+ if(owned)q[7]=reinterpret_cast<uint32_t (*)(void *)>(self->tglEdpVddPut)(controller);
+ q[8]=wrapTGLRegisterRead(manager,0xC7204);q[9]=wrapTGLRegisterRead(manager,0xC7200);
+ IORecursiveLockUnlock(lock);
+ f.putAux(port);f.putPG(power,3);
+ uint8_t sum=0;for(const auto v:edid)sum+=v;
+ const uint8_t header[] {0,255,255,255,255,255,255,0};
+ q[10]=!q[6] && !sum && !memcmp(edid,header,sizeof(header));q[11]=sum;
+ root->setProperty("WXEdpIdentifyResult",q,sizeof(q));
+ root->setProperty("WXEdpProbeDPCD",dpcd,sizeof(dpcd));
+ root->setProperty("WXEdpProbeEDID",edid,sizeof(edid));
+}
+
 uint32_t XE::wrapTGLRunAUX(void *port, uint32_t command, uint32_t *packet, uint32_t length, bool flag) {
 	const auto header = packet && length >= 4 ? packet[0] : 0;
 	const uint32_t args = length | (static_cast<uint32_t>(flag) << 16);
 	tglAUXRecord(port, 0, false, 0, command, args, header, header);
-	const auto result = FunctionCast(wrapTGLRunAUX, callbackXE->orgTGLRunAUX)(port, command, packet, length, flag);
+ // The donor only supplies VDD around later EDID paths. Initial native
+ // DPCD transactions also need panel power. Scope the existing VDD routines
+ // under the SAME recursive AUX lock, and never release inherited power.
+ auto self=callbackXE;
+ auto pb=static_cast<uint8_t *>(port);
+ auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ auto ctl=static_cast<uint8_t *>(self->tglObservationController);
+ auto &f=self->tglTCNativeFunctions;
+ IORecursiveLock *lock=nullptr;
+ void *manager=nullptr;
+ bool owned=false;
+ uint32_t powerResult=0;
+ uint32_t observedControl=UINT32_MAX,observedStatus=UINT32_MAX,observedRefs=0;
+ bool observedPanel=false;
+ if(self->tglEdpRoutingReady && config && config[0]==0 && config[2]==0 &&
+    *reinterpret_cast<uint32_t *>(pb+0x550)==1 && ctl && f.complete() &&
+    *f.controllerSlot==ctl && f.portByDDI(0)==port && !ctl[0x918] && ctl[0xE55] &&
+    *reinterpret_cast<void **>(ctl+0xD60) &&
+    *reinterpret_cast<uint32_t *>(pb+0x594)==0x64010) {
+  auto power=*reinterpret_cast<uint8_t **>(ctl+0xC8);
+  manager=*reinterpret_cast<void **>(ctl+0xC40);
+  auto map=OSDynamicCast(IOMemoryMap,*reinterpret_cast<OSObject **>(ctl+0xC70));
+  auto access=static_cast<uint8_t *>(manager);
+  if(power && manager && map && !power[0x18] &&
+     *reinterpret_cast<void **>(power+0x10)==ctl &&
+     *reinterpret_cast<void **>(power+0x78)==manager &&
+     *reinterpret_cast<void **>(pb+0x578)==manager &&
+     *reinterpret_cast<uintptr_t *>(access+0x50)==map->getVirtualAddress() &&
+     *reinterpret_cast<uint32_t *>(access+0x60)>0xC7210 &&
+     map->getLength()>=*reinterpret_cast<uint32_t *>(access+0x60)) {
+   lock=*reinterpret_cast<IORecursiveLock **>(ctl+0xC30);
+   if(lock) {
+    IORecursiveLockLock(lock);
+    // Native readAUX/writeAUX own the AUX-domain reference before entering
+    // runAUXCommand. Do not access panel registers without that reference.
+    if(!*reinterpret_cast<uint32_t *>(power+0x54)) {
+     IORecursiveLockUnlock(lock);lock=nullptr;
+    } else {
+     const auto control=wrapTGLRegisterRead(manager,0xC7204);
+     const auto status=wrapTGLRegisterRead(manager,0xC7200);
+     observedControl=control;observedStatus=status;
+     observedRefs=*reinterpret_cast<uint32_t *>(power+0x54);observedPanel=true;
+     if(control!=UINT32_MAX && status!=UINT32_MAX && !(control&8) && !(status&0x80000000U)) {
+      powerResult=reinterpret_cast<uint32_t (*)(void *,void *)>(self->tglEdpVddGet)(ctl,port);
+      // Already powered is a borrowed state, never an owned VDD token.
+      owned=powerResult!=0xE00002EBU;
+      if(!owned)powerResult=0;
+      tglAUXRecord(port,10,true,powerResult,control,status);
+      if(!powerResult) {
+       // PPS on-delay is in 100us units. Round up rather than shortening it.
+       const auto delay=(wrapTGLRegisterRead(manager,0xC7208)>>16)&0x1FFF;
+       IOSleep((delay+9)/10);
+      }
+     }
+    }
+   }
+  }
+ }
+ const auto auxThread=reinterpret_cast<uintptr_t>(current_thread());
+ uint64_t auxObservation[6] {};
+ const bool observing=observedPanel && !powerResult &&
+  EdpAuxStatus::begin(wxEdpAuxStatus,auxThread,reinterpret_cast<uintptr_t>(manager));
+ uint64_t phyRecord[64] {};
+ const bool phyCaptured=observedPanel && !powerResult && manager &&
+  EdpAuxPHY::capture(wxEdpPLLFracScope,wxEdpAuxPHYCount,auxThread,reinterpret_cast<uintptr_t>(manager),header,
+   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(manager)+0x60),
+   [&](uint32_t reg){return wrapTGLRegisterRead(manager,reg);},phyRecord);
+ const auto result=powerResult ? powerResult :
+  FunctionCast(wrapTGLRunAUX, self->orgTGLRunAUX)(port,command,packet,length,flag);
+ if(observing)EdpAuxStatus::end(wxEdpAuxStatus,auxThread,auxObservation);
+ if(owned) {
+  const auto cleanup=reinterpret_cast<uint32_t (*)(void *)>(self->tglEdpVddPut)(ctl);
+  tglAUXRecord(port,11,true,cleanup,0,0);
+ }
+ if(lock)IORecursiveLockUnlock(lock);
+ if(phyCaptured) {
+  phyRecord[3]=result;char key[64];snprintf(key,sizeof(key),"WXEdpAuxPHYFirst%u",static_cast<uint32_t>(phyRecord[1]));
+  IORegistryEntry::getRegistryRoot()->setProperty(key,phyRecord,sizeof(phyRecord));
+ }
+
+ // Record only values already read under the qualified native AUX reference.
+ // Bounded diagnostic evidence; no additional MMIO, power requests or sleeps.
+ if(observedPanel) {
+  static uint32_t sequence=0;
+  const auto seq=__sync_add_and_fetch(&sequence,1);
+  if(seq<=128) {
+   uint64_t record[16] {},uptime;clock_get_uptime(&uptime);absolutetime_to_nanoseconds(uptime,record);
+   record[1]=seq;record[2]=header;record[3]=command;
+   record[4]=observedControl;record[5]=observedStatus;record[6]=observedRefs;
+   record[7]=powerResult;record[8]=owned;record[9]=result;
+   memcpy(record+10,auxObservation,sizeof(auxObservation));
+   char key[48];snprintf(key,sizeof(key),"WXEdpAuxPowerFirst%u",seq);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));
+  }
+ }
+
 	tglAUXRecord(port, 0, true, result, command, args, header, packet && length >= 4 ? packet[0] : 0);
 	return result;
 }
@@ -12118,6 +12572,9 @@ uint32_t XE::wrapTGLPortState(void *port) {
 		snprintf(key, sizeof(key), "TGLWEGPort%uProbeState", config[0]);
 		IORegistryEntry::getRegistryRoot()->setProperty(key, values, sizeof(values));
 	}
+ // Startup can return before the internal port has its native mode.
+ // Retry at its synchronous state boundary; successful identification runs once.
+ if(config && config[0]==0)tglIdentifyEdp(callbackXE->tglObservationController);
 	return result;
 }
 
@@ -12316,8 +12773,30 @@ uint32_t XE::wrapTGLTopDDC(void *fb, int connection, uint32_t block, uint32_t ty
 	return r;
 }
 
+void XE::tglCaptureEdpHandoff(void *access,unsigned phase,uint32_t reg,uint32_t value,uint64_t caller) {
+ auto s=callbackXE;auto ctl=s?static_cast<uint8_t *>(s->tglObservationController):nullptr;
+ auto manager=static_cast<uint8_t *>(access);
+ if(!s || !s->tglEdpRoutingReady || s->xeProfile.identity!=0x9A498086U || !ctl || !manager ||
+    *reinterpret_cast<void **>(ctl+0xC40)!=access || *reinterpret_cast<uint32_t *>(manager+0x60)<0x164294)return;
+ auto base=*reinterpret_cast<volatile uint8_t **>(manager+0x50);if(!base)return;
+ uint32_t software[8] {*reinterpret_cast<uint32_t *>(ctl+0xC5C),*reinterpret_cast<uint32_t *>(ctl+0xD48),
+  *reinterpret_cast<uint32_t *>(ctl+0x1548),*reinterpret_cast<uint32_t *>(ctl+0x154C),
+  *reinterpret_cast<uint32_t *>(ctl+0x1550),*reinterpret_cast<uint32_t *>(ctl+0x1554),
+  *reinterpret_cast<uint32_t *>(ctl+0x1558),*reinterpret_cast<uint32_t *>(ctl+0xCE4)};
+ EdpHandoff::capture(wxEdpHandoff,phase,true,reg,value,caller,software,
+  [&](uint32_t address){return *reinterpret_cast<volatile uint32_t *>(base+address);});
+}
+static void tglPublishEdpHandoff() {
+ for(unsigned i=0;i<4;++i)if(__atomic_load_n(&wxEdpHandoff.slots[i].state,__ATOMIC_ACQUIRE)==2){
+  char key[40];snprintf(key,sizeof(key),"WXEdpHandoff%u",i);
+  IORegistryEntry::getRegistryRoot()->setProperty(key,wxEdpHandoff.slots[i].q,sizeof(wxEdpHandoff.slots[i].q));
+ }
+}
 uint32_t XE::wrapTGLRegisterRead(void *access, unsigned long reg) {
+ if(reg==0x60400 || reg==0x64000 || reg==0x60540 || reg==0xC7204)
+  tglCaptureEdpHandoff(access,0,reg,0,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 	auto value = FunctionCast(wrapTGLRegisterRead, callbackXE->orgTGLRegisterRead)(access, reg);
+ EdpAuxStatus::sample(wxEdpAuxStatus,reinterpret_cast<uintptr_t>(current_thread()),reinterpret_cast<uintptr_t>(access),reg,value,false);
 	const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 	auto s = callbackXE;
 	if (reg == 0x42000 && s->tglPG1FuseReadCaller && caller == s->tglPG1FuseReadCaller) {
@@ -12577,6 +13056,7 @@ uint32_t XE::wrapTGLClientAttribute(void *client, uint32_t attribute, unsigned l
 	tglTrace(10, 9, false, attribute, static_cast<uint32_t>(inputSize), 0, 0);
 	const auto r = FunctionCast(wrapTGLClientAttribute, callbackXE->orgTGLClientAttribute)(client, attribute, input, inputSize, output, outputSize, arguments);
 	tglTrace(10, 9, true, attribute, static_cast<uint32_t>(inputSize), r, 0);
+ if(callbackXE->tglEdpRoutingReady)IORegistryEntry::getRegistryRoot()->setProperty("WXEdpHpdNullPathsSkipped",__atomic_load_n(&wxEdpHpdSkipped,__ATOMIC_RELAXED),64);
 	return r;
 }
 
@@ -12727,7 +13207,7 @@ uint32_t XE::wrapTGLAGDCPortStatus(void *controller, void *request, void *output
 // the resource pool multi-port must not silently enable an unimplemented PHY.
 XE::TGLTrainingLease *XE::tglTrainingLeaseForDDI(uint32_t ddi) {
 	auto s = callbackXE;
-	if (!s->tglTrainingLeaseReady || ddi >= TGLPortCount || !s->tglLegacyTCEligible(ddi)) return nullptr;
+	if (!s->tglTrainingLeaseReady || ddi >= TGLPortCount || !s->tglDPTransportEligible(ddi)) return nullptr;
 	auto &lease = s->tglTrainingLeases[ddi];
 	return &lease;
 }
@@ -12798,9 +13278,13 @@ uint32_t XE::tglPrepareTrainingLease(void *controller, TGLTrainingLease &lease) 
 	auto s = callbackXE;
 	auto ctl = static_cast<uint8_t *>(controller);
 	auto port = static_cast<uint8_t *>(reinterpret_cast<void *(*)(uint32_t)>(s->tglPortByDDI)(lease.ddi));
-	if (!ctl || !port || ctl[0xE55] ||
-		*reinterpret_cast<void **>(ctl + 0xD40) != s->tglNoPanelPlatform ||
-		*reinterpret_cast<uint32_t *>(port + 0x550) != 4 || port[0x117]) return 1;
+	if (!ctl || !port) return 1;
+ // The legacy lease was limited to no-panel boards. For this powered DP-alt
+ // trial, validate the actual native controller/port binding instead of
+ // clearing its built-in-panel flag or replacing its platform description.
+ const bool altBoard=s->tglRightAltEligible(lease.ddi) && controller==s->tglObservationController && tglRightAltProbe(port)==3;
+ if ((!altBoard && (ctl[0xE55] || *reinterpret_cast<void **>(ctl + 0xD40) != s->tglNoPanelPlatform)) ||
+     !s->tglDPMode(lease.ddi,*reinterpret_cast<uint32_t *>(port + 0x550)) || port[0x117]) return 1;
 	auto access = *reinterpret_cast<uint8_t **>(ctl + 0xC40);
 	auto power = *reinterpret_cast<void **>(ctl + 0xC8);
 	if (!access || !power || *reinterpret_cast<uint32_t *>(access + 0x60) < 0x16A000 ||
@@ -13015,6 +13499,7 @@ void XE::wrapTGLControllerStop(void *controller, IOService *provider) {
 		}
 	}
 	FunctionCast(wrapTGLControllerStop, s->orgTGLControllerStop)(controller, provider);
+ __atomic_store_n(&s->tglRightAltReady,false,__ATOMIC_RELEASE);
  tglRecordStartOrder(8,controller);
 }
 
@@ -13054,6 +13539,13 @@ uint32_t XE::wrapTGLTrainingBegin(void *controller, void *request) {
 }
 
 uint32_t XE::wrapTGLTraining(void *controller, void *request, void *output) {
+ if(callbackXE->tglRightAltRequested && request && *static_cast<uint32_t *>(request)==6) {
+  auto port=reinterpret_cast<void *(*)(uint32_t)>(callbackXE->tglPortByDDI)(5);
+  if(!callbackXE->tglRightAltEligible(5) || __atomic_load_n(&callbackXE->tglRightAltFault,__ATOMIC_ACQUIRE) || !port || *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(port)+0x550)!=3){
+   if(output){memmove(output,request,0x50);*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(output)+0x38)=0x10000;}
+   rightPortPublish();return kIOReturnNotReady;
+  }
+ }
 	auto req = static_cast<uint8_t *>(request);
 	const uint32_t id = req ? *reinterpret_cast<uint32_t *>(req) : 9;
 	uint32_t a = req ? *reinterpret_cast<uint32_t *>(req + 8) : 0;
@@ -13115,6 +13607,7 @@ uint32_t XE::wrapTGLTraining(void *controller, void *request, void *output) {
 		IORegistryEntry::getRegistryRoot()->setProperty(historyKey, record, sizeof(record));
 	}
 	tglTrace(19, id, true, a, b, r, value);
+ if(id==6)rightPortPublish();
 	return r;
 }
 
@@ -13486,7 +13979,61 @@ void XE::tglObservePath(void *port, void *path, uint32_t event, bool done, uint3
 	}
 }
 
+void XE::tglEdpBoundaryProbe(void *port,uint32_t phase,uint32_t nativeResult) {
+ // Read-only AUX health probe; existing native AUX machinery owns power/locks.
+ auto pb=static_cast<uint8_t *>(port);
+ auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+ if(phase<1 || phase>4 || !config || config[0]!=0 || config[2]!=0 || config[3]!=0 ||
+    pb[0x11]!=2 || *reinterpret_cast<uint32_t *>(pb+0x550)!=1 ||
+    *reinterpret_cast<uint32_t *>(pb+0x124)!=2 || *reinterpret_cast<uint32_t *>(pb+0x128)!=10 ||
+    __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)!=thread ||
+    __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)!=reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(pb+0x578)))return;
+ static uint32_t attempts=0;const auto sequence=__atomic_add_fetch(&attempts,1U,__ATOMIC_RELAXED);
+ if(sequence>32)return;
+ uint8_t power=0xFF;const auto auxResult=wrapTGLReadAUX(port,0x600,&power,1);
+ uint64_t record[8]={1,sequence,phase,nativeResult,auxResult,power,0x424E4459,0};
+ char key[64];snprintf(key,sizeof(key),"WXEdpBoundaryFirst%u",sequence);
+ IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));
+}
+
 uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
+ // BEGIN bounded internal sink-state probe (read-only).
+ auto pb=static_cast<uint8_t *>(port);
+ auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+ // Record entry qualification before deciding whether AUX may be used.
+ if(__atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==thread) {
+  static uint32_t entries=0;
+  const auto entry=__atomic_add_fetch(&entries,1U,__ATOMIC_RELAXED);
+  if(entry<=8) {
+   uint64_t guard[12]={2,entry,request!=nullptr,config!=nullptr,
+    config?config[0]:0xFFFFFFFFU,config?config[2]:0xFFFFFFFFU,config?config[3]:0xFFFFFFFFU,
+    pb?pb[0x11]:0xFFU,pb?*reinterpret_cast<uint32_t *>(pb+0x550):0xFFFFFFFFU,
+    pb?*reinterpret_cast<uint32_t *>(pb+0x124):0xFFFFFFFFU,
+    pb?*reinterpret_cast<uint32_t *>(pb+0x128):0xFFFFFFFFU,
+    pb && __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(pb+0x578))};
+   char key[64];snprintf(key,sizeof(key),"WXEdpSinkGuardFirst%u",entry);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,guard,sizeof(guard));
+  }
+ }
+ if(config && config[0]==0 && config[2]==0 && config[3]==0 &&
+    pb[0x11]==2 && *reinterpret_cast<uint32_t *>(pb+0x550)==1 &&
+    *reinterpret_cast<uint32_t *>(pb+0x124)==2 && *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+    __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+    __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(pb+0x578))) {
+  static uint32_t attempts=0;
+  const auto sequence=__atomic_add_fetch(&attempts,1U,__ATOMIC_RELAXED);
+  if(sequence<=8) {
+   uint8_t power=0xFF,psr=0xFF;
+   const auto powerResult=wrapTGLReadAUX(port,0x600,&power,1);
+   const auto psrResult=wrapTGLReadAUX(port,0x170,&psr,1);
+   uint64_t record[8]={1,sequence,powerResult,power,psrResult,psr,0x53494E4B,0};
+   char key[64];snprintf(key,sizeof(key),"WXEdpSinkStateFirst%u",sequence);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));
+  }
+ }
+ // END bounded internal sink-state probe.
  tglAUXRecord(port,10,false,0,0,0);
 	SYSLOG("igfx", "TGL330 port-training enter");
 	auto caller = __builtin_return_address(0);
@@ -13521,8 +14068,55 @@ void XE::wrapTGLFreePath(void *path) {
 	tglObservePath(port, path, 2, true, 0, 0, caller);
 }
 
+uint32_t XE::wrapTGLEdpCurrentMode(void *fb,int32_t *mode,int32_t *depth) {
+ int32_t localMode=0,localDepth=0;
+ auto self=callbackXE;
+ const auto result=FunctionCast(wrapTGLEdpCurrentMode,self->orgTGLEdpCurrentMode)(fb,mode?mode:&localMode,depth?depth:&localDepth);
+ auto ctl=static_cast<uint8_t *>(self->tglObservationController);
+ // -5 is the donor's inherited/unresolved-mode sentinel, not a usable mode.
+ // An empty timing conversion must never be advertised as a successful mode.
+ if(self->tglEdpRoutingReady && ctl && fb==*reinterpret_cast<void **>(ctl+0xD60) &&
+    !result && (mode?*mode:localMode)<0) {
+  static uint32_t rejected {};
+  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpUnresolvedModeRejected",__atomic_add_fetch(&rejected,1U,__ATOMIC_RELAXED),32);
+  return 0xE00002D8U;
+ }
+ return result;
+}
+uint32_t XE::wrapTGLLightUpEdp(void *controller,void *fb,void *path,const void *timing) {
+ tglObservePath(nullptr,path,3,false,0,0,__builtin_return_address(0));
+ auto root=IORegistryEntry::getRegistryRoot();root->setProperty("WXEdpLightUpEntered",true);
+ auto self=callbackXE;auto ctl=static_cast<uint8_t *>(controller);
+ auto pb=path?*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
+ auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ auto access=ctl?*reinterpret_cast<void **>(ctl+0xC40):nullptr;
+ const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+ const bool target=self->tglEdpRoutingReady && self->xeProfile.identity==0x9A498086U &&
+  ctl && ctl==self->tglObservationController && fb && fb==*reinterpret_cast<void **>(ctl+0xD60) &&
+  path && config && config[0]==0 && config[2]==0 && config[3]==0 &&
+  *reinterpret_cast<uint32_t *>(pb+0x550)==1 && *reinterpret_cast<uint32_t *>(pb+0x124)==2 &&
+  *reinterpret_cast<uint32_t *>(pb+0x128)==10 && access &&
+  *reinterpret_cast<void **>(pb+0x578)==access &&
+  *reinterpret_cast<void **>(static_cast<uint8_t *>(fb)+0x4A40)==access &&
+  *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640)==0;
+ if(target){tglCaptureEdpHandoff(access,2,0,0,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));tglPublishEdpHandoff();}
+ const bool scoped=target && EdpPLLFrac::begin(wxEdpPLLFracScope,thread,reinterpret_cast<uintptr_t>(access));
+ const auto result=FunctionCast(wrapTGLLightUpEdp,callbackXE->orgTGLLightUpEdp)(controller,fb,path,timing);
+ if(scoped)EdpPLLFrac::end(wxEdpPLLFracScope,thread);
+ if(scoped)tglProgramPublish();
+ tglPublishEdpHandoff();
+ root->setProperty("WXEdpPLLFracApplied",__atomic_load_n(&wxEdpPLLFracScope.applied,__ATOMIC_RELAXED),32);
+ root->setProperty("WXEdpScalingApplied",__atomic_load_n(&wxEdpScalingApplied,__ATOMIC_RELAXED),32);
+ tglObservePath(nullptr,path,3,true,result,0,__builtin_return_address(0));
+ root->setProperty("WXEdpLightUpResult",result,32);return result;
+}
+
 uint32_t XE::wrapTGLLightUpDP(void *controller, void *fb, void *path, const void *timing) {
  auto port=path?*reinterpret_cast<void **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
+ if(callbackXE->tglRightAltRequested && port){
+  auto c=*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port)+0x548);
+  if(c && c[0]==5 && (tglRightAltProbe(port)!=3 || *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(port)+0x550)!=3))return kIOReturnNotReady;
+ }
  tglAUXRecord(port,11,false,0,0,0);
 	auto caller = __builtin_return_address(0);
 	tglObservePath(nullptr, path, 3, false, 0, 0, caller);
@@ -13564,8 +14158,8 @@ volatile uint8_t *XE::tglClockOrderTarget(void *controller, void *port, void *pa
 	auto p = static_cast<uint8_t *>(port), f = static_cast<uint8_t *>(fb), d = static_cast<uint8_t *>(path);
 	auto config = *reinterpret_cast<uint32_t **>(p + 0x548);
 	auto access = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(controller) + 0xC40);
-	if (!config || !callbackXE->tglLegacyTCEligible(config[0]) || config[2] != 1 || p[0x117] || f[0x1E8] || f[0x1EA] ||
-		*reinterpret_cast<uint32_t *>(p + 0x550) != 4 || *reinterpret_cast<uint32_t *>(d + 0x3640) >= 3 ||
+	if (!config || !callbackXE->tglDPTransportEligible(config[0]) || config[2] != 1 || p[0x117] || f[0x1E8] || f[0x1EA] ||
+		!callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(p + 0x550)) || *reinterpret_cast<uint32_t *>(d + 0x3640) >= 3 ||
 		*reinterpret_cast<void **>(d + 0x3648) != port || *reinterpret_cast<void **>(d + 0x32B0) != fb ||
 		*reinterpret_cast<void **>(f + 0x1D0) != controller || !access ||
 		*reinterpret_cast<void **>(p + 0x578) != access || *reinterpret_cast<void **>(f + 0x4A40) != access ||
@@ -13863,6 +14457,14 @@ void XE::tglObserveScanout(void *fb, void *plane, uint32_t event, bool done, uin
 // Per-thread slots span the synchronous gamma call; publication is after it has
 // returned and released its native register lock. Upload and readback stay separate.
 void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
+ if(reg==0x64000)tglCaptureEdpHandoff(access,(value&0x80000000U)?1:3,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+ EdpAuxStatus::sample(wxEdpAuxStatus,reinterpret_cast<uintptr_t>(current_thread()),reinterpret_cast<uintptr_t>(access),reg,value,true);
+ const auto scaled=EdpComboScaling::writeValue(wxEdpPLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),
+  reinterpret_cast<uintptr_t>(access),reg,value);
+ if(scaled!=value)__atomic_add_fetch(&wxEdpScalingApplied,1U,__ATOMIC_RELAXED);
+ value=scaled;
+ value=EdpPLLFrac::writeValue(wxEdpPLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),
+  reinterpret_cast<uintptr_t>(access),reg,value);
 	auto &tx = tglClockOffTransaction;
 	if (callbackXE->tglClockOffCaller && reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == callbackXE->tglClockOffCaller &&
 		reg == tx.clockReg && !(value & 0xF0000000U) &&
@@ -14074,6 +14676,36 @@ uint32_t XE::wrapTGLReadAUX(void *port, uint32_t address, void *data, uint32_t l
 }
 
 uint32_t XE::wrapTGLWriteAUX(void *port, uint32_t address, void *data, uint32_t length) {
+ // Linux intel_dp_update_link_train writes only negotiated lane_count.
+ // Clip only the captured four-byte request for this two-lane internal sink,
+ // inside its qualified native modeset; do not modify the caller's buffer.
+ auto pb=static_cast<uint8_t *>(port);
+ auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+ // Linux intel_dp_set_link_train sends pattern plus negotiated lane set
+ // together. The donor starts SST with TPS1/VS0/pre0, but writes only TPS1.
+ // Supply that same captured initial state atomically for this sink.
+ uint8_t trainingStart[3]={0x21,0,0};
+ if(address==0x102 && length==1 && data && *static_cast<uint8_t *>(data)==0x21 &&
+    config && config[0]==0 && config[2]==0 && config[3]==0 && pb[0x11]==2 &&
+    *reinterpret_cast<uint32_t *>(pb+0x550)==1 && *reinterpret_cast<uint32_t *>(pb+0x124)==2 &&
+    *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+    __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+    __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(pb+0x578))) {
+  data=trainingStart;length=sizeof(trainingStart);
+  static uint32_t combined=0;
+  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpTrainingStartCombined",__atomic_add_fetch(&combined,1U,__ATOMIC_RELAXED),32);
+ }
+ if(address==0x103 && length==4 && data && config && config[0]==0 && config[2]==0 && config[3]==0 &&
+    pb[0x11]==2 && *reinterpret_cast<uint32_t *>(pb+0x550)==1 &&
+    *reinterpret_cast<uint32_t *>(pb+0x124)==2 && *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+    __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+    __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(pb+0x578))) {
+  length=2;
+  static uint32_t shortened=0;
+  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpLaneWriteShortened",__atomic_add_fetch(&shortened,1U,__ATOMIC_RELAXED),32);
+ }
+
 	auto caller = __builtin_return_address(0);
 	tglDPCDRecord(port, address, data, length, true, false, 0, caller);
 	const auto r = tglInvokeBootstrapAUX(callbackXE->tglBootstrapAUXReady, 1, port, [&] {
@@ -14090,6 +14722,89 @@ uint32_t XE::wrapTGLI2CAUX(void *port, uint32_t command, uint32_t *packet, uint3
 }
 
 uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
+ // Internal training evidence only: existing power state gates all reads.
+ // No power requests, writes, waits, native virtual calls or serializer.
+ auto edpPrepareRoute = [&]() {
+  auto self=callbackXE;
+  if (!path || pattern!=1 || !self->tglEdpRoutingReady || self->xeProfile.identity!=0x9A498086U) return;
+  auto pb=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x3648);
+  auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+  auto fb=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x32B0);
+  auto ctl=fb?*reinterpret_cast<uint8_t **>(fb+0x1D0):nullptr;
+  if (!config || config[0]!=0 || config[2]!=0 || !ctl || ctl!=self->tglObservationController ||
+      *reinterpret_cast<void **>(ctl+0xD60)!=fb || *reinterpret_cast<uint32_t *>(pb+0x550)!=1) return;
+  auto access=*reinterpret_cast<uint8_t **>(ctl+0xC40);
+  if (!access || *reinterpret_cast<void **>(pb+0x578)!=access || *reinterpret_cast<void **>(fb+0x4A40)!=access) return;
+  auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
+  const auto size=*reinterpret_cast<uint32_t *>(access+0x60);
+  const auto pipe=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640);
+  if (!base || pipe>=3 || size<0x164294) return;
+  const auto mainPower=*reinterpret_cast<volatile uint32_t *>(base+0x45404);
+  const auto ioPower=*reinterpret_cast<volatile uint32_t *>(base+0x45454);
+  if (mainPower==0xFFFFFFFFU || ioPower==0xFFFFFFFFU || (mainPower&0x3FU)!=0x3FU || (ioPower&3U)!=3U) return;
+  // TGL uses (port+1) for both route fields. DDI A must have a
+  // selected transcoder clock before DP_TP_CTL/DDI_BUF_CTL are enabled.
+  auto clock=reinterpret_cast<volatile uint32_t *>(base+0x46140+4*pipe);
+  auto func=reinterpret_cast<volatile uint32_t *>(base+0x60400+0x1000*pipe);
+  const uint32_t clockBefore=*clock,funcBefore=*func;
+  const auto buffer=*reinterpret_cast<volatile uint32_t *>(base+0x64000);
+  const auto training=*reinterpret_cast<volatile uint32_t *>(base+0x60540+0x1000*pipe);
+  const auto lanes=*reinterpret_cast<uint32_t *>(pb+0x124);
+  const auto rate=*reinterpret_cast<uint32_t *>(pb+0x128);
+  auto pathClock=reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x128);
+  const auto pathFunc=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x12C);
+  if (lanes!=2 || rate!=10 || (buffer&0x80000000U) || (training&0x80000000U) ||
+      (clockBefore!=0 && clockBefore!=0x10000000U) ||
+      (funcBefore!=0x02000002U && funcBefore!=0x0A000002U) ||
+      (*pathClock!=0 && *pathClock!=0x10000000U) || pathFunc!=0x8A000002U) return;
+  // Existing route guards above require the physical built-in panel,
+  // powered PW1/2/3 and DDI A, 2 lanes/HBR and an inactive output.
+  uint32_t phyInitRecord[64] {};
+  if(EdpPHYInit::apply(wxEdpPLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),reinterpret_cast<uintptr_t>(access),
+    [&](uint32_t reg){return wrapTGLRegisterRead(access,reg);},
+    [&](uint32_t reg,uint32_t value){wrapTGLRegisterWrite(access,reg,value);},phyInitRecord))
+   IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPHYInit",phyInitRecord,sizeof(phyInitRecord));
+  *clock=0x10000000U;
+  if (*clock!=0x10000000U) {*clock=clockBefore;(void)*clock;return;}
+  *func=0x0A000002U;
+  if (*func!=0x0A000002U) {*func=funcBefore;(void)*func;*clock=clockBefore;(void)*clock;return;}
+  *pathClock=0x10000000U; // Native LightUpEDP writes this again after training.
+  uint32_t record[] {1,pipe,clockBefore,*clock,funcBefore,*func,buffer,training,*pathClock,pathFunc};
+  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPreTrainingRoute",record,sizeof(record));
+ };
+ edpPrepareRoute();
+ auto edpSnapshot = [&](bool done) {
+  auto self=callbackXE;
+  if (!path || pattern>5 || !self->tglEdpRoutingReady || self->xeProfile.identity!=0x9A498086U) return;
+  auto pb=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x3648);
+  auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+  auto fb=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x32B0);
+  auto ctl=fb?*reinterpret_cast<uint8_t **>(fb+0x1D0):nullptr;
+  if (!config || config[0]!=0 || config[2]!=0 || !ctl || ctl!=self->tglObservationController ||
+      *reinterpret_cast<void **>(ctl+0xD60)!=fb || *reinterpret_cast<uint32_t *>(pb+0x550)!=1) return;
+  auto access=*reinterpret_cast<uint8_t **>(ctl+0xC40);
+  if (!access || *reinterpret_cast<void **>(pb+0x578)!=access || *reinterpret_cast<void **>(fb+0x4A40)!=access) return;
+  auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
+  const auto size=*reinterpret_cast<uint32_t *>(access+0x60);
+  const auto pipe=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640);
+  if (!base || pipe>=3 || size<0x164294) return;
+  static uint32_t sequence=0;
+  uint32_t r[40] {};r[0]=1;r[1]=__sync_add_and_fetch(&sequence,1);r[2]=pattern;r[3]=done;r[4]=pipe;
+  r[5]=*reinterpret_cast<volatile uint32_t *>(base+0x45404);
+  r[6]=*reinterpret_cast<volatile uint32_t *>(base+0x45454);
+  // Qualify DDI A IO and the shared PW1/PW2/PW3 contract before
+  // touching the dependent display/PLL banks. Unqualified captures are explicit.
+  r[7]=r[5]!=0xFFFFFFFFU && r[6]!=0xFFFFFFFFU && (r[5]&0x3FU)==0x3FU && (r[6]&3U)==3U;
+  const uint32_t regs[] {0x46140+4*pipe,0x60400+0x1000*pipe,0x60540+0x1000*pipe,
+    0x64000,0x46010,0x46014,0x164280,0x164284,0x164288,0x16428C,0x164290};
+  for (unsigned i=0;i<arrsize(regs);++i) {r[8+2*i]=regs[i];if(r[7])r[9+2*i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);}
+  r[30]=*reinterpret_cast<uint32_t *>(pb+0x124);r[31]=*reinterpret_cast<uint32_t *>(pb+0x128);
+  r[32]=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x128);
+  r[33]=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x12C);
+  char key[48];snprintf(key,sizeof(key),"WXEdpTrainingFirst%u",r[1]);
+  if(r[1]<=32)IORegistryEntry::getRegistryRoot()->setProperty(key,r,sizeof(r));
+ };
+ edpSnapshot(false);
 	auto port = *reinterpret_cast<void **>(static_cast<uint8_t *>(path) + 0x3648);
 	tglObserveActivation(callbackXE->tglObservationController, port, path, 1, false, pattern);
 	// TGL needs the transcoder clock and DDI route before enabling DP_TP_CTL.
@@ -14104,9 +14819,9 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 		auto access = ctl ? *reinterpret_cast<uint8_t **>(ctl + 0xC40) : nullptr;
 		const auto transcoder = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path) + 0x3640);
 		TGLTypeCPort mapping;
-		if (config && callbackXE->tglLegacyTCEligible(config[0]) &&
+		if (config && callbackXE->tglDPTransportEligible(config[0]) &&
 			TGLTypeCPort::resolve(config[0], mapping) && config[2] == 1 &&
-			*reinterpret_cast<uint32_t *>(pb + 0x550) == 4 && !pb[0x117] &&
+			callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(pb + 0x550)) && !pb[0x117] &&
 			transcoder < 3 && ctl == callbackXE->tglObservationController && access &&
 			*reinterpret_cast<void **>(pb + 0x578) == access &&
 			*reinterpret_cast<void **>(fb + 0x4A40) == access) {
@@ -14170,6 +14885,29 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 		}
 	}
 	const auto result = FunctionCast(wrapTGLTrainingPattern, callbackXE->orgTGLTrainingPattern)(path, pattern);
+ // Internal SST equivalent of the existing Type-C framing correction.
+ // The owning LightUpEDP scope has already qualified physical identity,
+ // built-in framebuffer, pipe 0, DDI A, two lanes/HBR and MMIO ownership.
+ if(!result && pattern<=5 && port) {
+  auto pb=static_cast<uint8_t *>(port);
+  auto config=*reinterpret_cast<uint32_t **>(pb+0x548);
+  auto access=*reinterpret_cast<void **>(pb+0x578);
+  const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+  if(config && config[0]==0 && config[2]==0 && config[3]==0 && !pb[0x117] && pb[0x11A]<=1 &&
+     *reinterpret_cast<uint32_t *>(pb+0x550)==1 &&
+     *reinterpret_cast<uint32_t *>(pb+0x124)==2 && *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+     *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640)==0 && access &&
+     __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+     __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(access)) {
+   const auto before=wrapTGLRegisterRead(access,0x60540);
+   const auto wanted=EdpFraming::value(wxEdpPLLFracScope,thread,reinterpret_cast<uintptr_t>(access),0x60540,before,pb[0x11A]);
+   if(wanted!=before)wrapTGLRegisterWrite(access,0x60540,wanted);
+   const auto after=wrapTGLRegisterRead(access,0x60540);
+   uint32_t record[8]={1,pattern,pb[0x11A],before,wanted,after,before!=wanted,0x4652414D};
+   char key[64];snprintf(key,sizeof(key),"WXEdpFramingPattern%u",pattern);
+   IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));
+  }
+ }
 	// The donor constructs DP_TP_CTL from enable/MST/pattern only, losing bit18.
 	// Its own normal and fast training write port+11a to DPCD101 bit7. Use that
 	// same negotiated field, not an unconditional enhanced-framing override.
@@ -14181,9 +14919,9 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 		auto access = ctl ? *reinterpret_cast<uint8_t **>(ctl + 0xC40) : nullptr;
 		const auto transcoder = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path) + 0x3640);
 		TGLTypeCPort mapping;
-		if (config && callbackXE->tglLegacyTCEligible(config[0]) &&
+		if (config && callbackXE->tglDPTransportEligible(config[0]) &&
 			TGLTypeCPort::resolve(config[0], mapping) && config[2] == 1 && !p[0x117] && p[0x11A] <= 1 &&
-			*reinterpret_cast<uint32_t *>(p + 0x550) == 4 && transcoder < 3 &&
+			callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(p + 0x550)) && transcoder < 3 &&
 			ctl == callbackXE->tglObservationController && access &&
 			*reinterpret_cast<void **>(p + 0x578) == access &&
 			*reinterpret_cast<void **>(fb + 0x4A40) == access) {
@@ -14215,6 +14953,8 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 			}
 		}
 	}
+ if(pattern==1)tglEdpBoundaryProbe(port,1,result);
+ edpSnapshot(true);
 	tglObserveActivation(callbackXE->tglObservationController, port, path, 1, true, result);
 	return result;
 }
@@ -14312,12 +15052,27 @@ void XE::tglSnapshotTransmitter(void *port, bool done, uint32_t result) {
 // Linux v6.12 tgl_dkl_phy_trans_dp_hbr2. Use its synchronous PortDriveConfig
 // override, keeping the native lane mask, RMW, PMD hook and return value.
 uint32_t XE::wrapTGLSignalLevels(void *port, uint32_t swing, uint32_t emphasis, void *overrideConfig) {
+ // BEGIN internal Combo profile adapter.
+ EdpComboProfile::Report comboReport;
+ auto comboAccess=port?*reinterpret_cast<void **>(static_cast<uint8_t *>(port)+0x578):nullptr;
+ if(EdpComboProfile::apply(wxEdpPLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),port,swing,emphasis,overrideConfig,
+   [&](uint32_t reg){return wrapTGLRegisterRead(comboAccess,reg);},
+   [&](uint32_t reg,uint32_t value){wrapTGLRegisterWrite(comboAccess,reg,value);},
+   [&](void *selected){return FunctionCast(wrapTGLSignalLevels,callbackXE->orgTGLSignalLevels)(port,swing,emphasis,selected);},comboReport)) {
+  static uint32_t count=0;const auto sequence=__atomic_add_fetch(&count,1U,__ATOMIC_RELAXED);
+  uint32_t record[8]={1,sequence,swing,emphasis,comboReport.level,comboReport.result,comboReport.applied,0x434F4D42};
+  char key[64];snprintf(key,sizeof(key),"WXEdpComboProfileFirst%u",sequence);
+  if(sequence<=32)IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));
+  tglEdpBoundaryProbe(port,2,comboReport.result);
+  return comboReport.result;
+ }
+ // END internal Combo profile adapter.
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = bytes ? *reinterpret_cast<uint32_t **>(bytes + 0x548) : nullptr;
 	const auto rate = bytes ? *reinterpret_cast<uint32_t *>(bytes + 0x128) : 0;
 	const bool target = callbackXE->tglDekelReady && !overrideConfig && config &&
-		callbackXE->tglLegacyTCEligible(config[0]) && config[3] == 1 &&
-		*reinterpret_cast<uint32_t *>(bytes + 0x550) == 4 &&
+		callbackXE->tglDPTransportEligible(config[0]) && config[3] == 1 &&
+		callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(bytes + 0x550)) &&
 		(rate == 6 || rate == 10 || rate == 20) &&
 		swing <= 3 && emphasis <= 3 && swing + emphasis <= 3;
 	if (!target)
@@ -14353,8 +15108,8 @@ void XE::wrapTGLPhyClockGating(void *port, bool gate) {
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = *reinterpret_cast<uint32_t **>(bytes + 0x548);
 	const auto lanes = *reinterpret_cast<uint32_t *>(bytes + 0x124);
-	const bool target = config && callbackXE->tglLegacyTCEligible(config[0]) && config[3] == 1 &&
-		*reinterpret_cast<uint32_t *>(bytes + 0x550) == 4 &&
+	const bool target = config && callbackXE->tglDPTransportEligible(config[0]) && config[3] == 1 &&
+		callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(bytes + 0x550)) &&
 		(lanes == 1 || lanes == 2 || lanes == 4);
 	uint32_t before[2] {};
 	bool valid[2] {};
@@ -14405,6 +15160,18 @@ void XE::wrapTGLPhyClockGating(void *port, bool gate) {
 // Linux icl_program_mg_dp_mode: legacy DP uses LN1 x1 for one lane,
 // otherwise x2 on both lane groups. Keep all non-mode bits from the donor.
 void XE::wrapTGLSetDklDPMode(void *port) {
+ auto self=callbackXE;auto p=static_cast<uint8_t *>(port);
+ auto c=p?*reinterpret_cast<uint32_t **>(p+0x548):nullptr;
+ if(c && self->tglRightAltEligible(c[0])) {
+  const auto lanes=*reinterpret_cast<uint32_t *>(p+0x124);
+  if(tglRightAltProbe(port)==3 && (lanes==1 || lanes==2))for(unsigned group=0;group<2;++group){
+   uint32_t before=0;
+   if(!tglDekelAccess(port,0x48+group,false,before) || before==UINT32_MAX)continue;
+   uint32_t wanted=(before&~0xC0U)|(lanes==1?0x40U:0x80U);
+   tglDekelAccess(port,0x48+group,true,wanted);
+  }
+  return;
+ }
 	FunctionCast(wrapTGLSetDklDPMode, callbackXE->orgTGLSetDklDPMode)(port);
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = *reinterpret_cast<uint32_t **>(bytes + 0x548);
@@ -14457,6 +15224,8 @@ uint32_t XE::wrapTGLPortReadReg(void *port,uint32_t reg) {
  const bool mapped=tglNativeFiaAccess(port,reg,reinterpret_cast<uintptr_t>(__builtin_return_address(0)),false,mapping);
  const auto physical=mapped?(reg==0x163890?mapping.fia.ready:mapping.fia.owned):reg;
  auto value=FunctionCast(wrapTGLPortReadReg,callbackXE->orgTGLPortReadReg)(port,physical);
+ if(reg==0x1638a0 || reg==0x163890 || reg==0x163894 || reg==0x1638c0)
+  rightPortRecord(port,reg==0x1638a0?6:reg==0x163890?7:reg==0x163894?8:9,reg,physical,value,mapped);
  if(mapped){
   value=mapping.logical(value);
   __atomic_add_fetch(&callbackXE->tglNativeFiaReads,1,__ATOMIC_RELAXED);
@@ -14483,9 +15252,9 @@ void XE::wrapTGLPortWriteReg(void *port, uint32_t reg, uint32_t value) {
 		auto bytes = static_cast<uint8_t *>(port);
 		auto config = *reinterpret_cast<uint32_t **>(bytes + 0x548);
 		TGLTypeCPort mapping;
-		if (config && callbackXE->tglLegacyTCEligible(config[0]) && config[3] == 1 &&
+		if (config && callbackXE->tglDPTransportEligible(config[0]) && config[3] == 1 &&
 			TGLTypeCPort::resolve(config[0], mapping) && reg == mapping.ddiBuffer &&
-			*reinterpret_cast<uint32_t *>(bytes + 0x550) == 4 &&
+			callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(bytes + 0x550)) &&
 			*reinterpret_cast<uint32_t *>(bytes + 0x590) == reg) {
 			const auto rate = *reinterpret_cast<uint32_t *>(bytes + 0x128);
 			// Guard to the three sink-supported 8b/10b rates observed on MI646.
@@ -14518,18 +15287,31 @@ void XE::wrapTGLPortWriteReg(void *port, uint32_t reg, uint32_t value) {
 
 uint32_t XE::wrapTGLEnablePort(void *port) {
 	auto config = *reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port) + 0x548);
+ if(config && config[0]==5 && callbackXE->tglRightAltRequested &&
+    (tglRightAltProbe(port)!=3 || *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(port)+0x550)!=3))return kIOReturnNotReady;
 	const uint32_t id = config ? config[0] : 9;
 	tglTrace(21, id, false, 0, 0, 0, 0);
 	tglSnapshotTransmitter(port, false, 0);
+	tglEdpBoundaryProbe(port,3,0);
 	const auto original = FunctionCast(wrapTGLEnablePort, callbackXE->orgTGLEnablePort)(port);
+	tglEdpBoundaryProbe(port,4,original);
+ EdpEnableCycle::Report cycleReport;
+ auto cycleAccess=port?*reinterpret_cast<void **>(static_cast<uint8_t *>(port)+0x578):nullptr;
+ if(EdpEnableCycle::probe(wxEdpPLLFracScope,wxEdpEnableCycleOnce,reinterpret_cast<uintptr_t>(current_thread()),port,original,
+   [&](uint32_t reg){return wrapTGLRegisterRead(cycleAccess,reg);},
+   [&](uint32_t reg,uint32_t value){wrapTGLRegisterWrite(cycleAccess,reg,value);},
+   [&](uint8_t *power){return wrapTGLReadAUX(port,0x600,power,1);},
+   [&](uint32_t us){IODelay(us);},cycleReport))
+  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEnableCycle",cycleReport.q,sizeof(cycleReport.q));
+
 	auto r = original;
 	// The donor only waits 100 * 5us. Linux allows 3ms for TGL TC PHYs.
 	// Observe another bounded 3ms and accept only a real enabled/non-idle state.
 	auto bytes = static_cast<uint8_t *>(port);
 	TGLTypeCPort mapping;
-	if (callbackXE->tglLegacyTCEligible(id) && TGLTypeCPort::resolve(id, mapping) &&
+	if (callbackXE->tglDPTransportEligible(id) && TGLTypeCPort::resolve(id, mapping) &&
 		original == 0xE00002D6 &&
-		*reinterpret_cast<uint32_t *>(bytes + 0x550) == 4 &&
+		callbackXE->tglDPMode(config[0],*reinterpret_cast<uint32_t *>(bytes + 0x550)) &&
 		*reinterpret_cast<uint32_t *>(bytes + 0x590) == mapping.ddiBuffer) {
 		auto access = *reinterpret_cast<uint8_t **>(bytes + 0x578);
 		auto base = access ? *reinterpret_cast<volatile uint8_t **>(access + 0x50) : nullptr;
@@ -14575,7 +15357,7 @@ bool XE::tglDekelAccess(void *port, uint32_t index, bool write, uint32_t &value)
 	if (!config || !TGLTypeCPort::resolve(config[0], mapping)) return false;
 	auto access = *reinterpret_cast<uint8_t **>(bytes + 0x578);
 	const auto mode = *reinterpret_cast<uint32_t *>(bytes + 0x550);
-	if (!access || mode != 4 || index < 0x34 || index > 0x49 || !callbackXE->tglDekelLock) return false;
+	if (!access || !callbackXE->tglDPMode(config[0],mode) || (mode==3 && __atomic_load_n(&callbackXE->tglRightAltFault,__ATOMIC_ACQUIRE)) || index < 0x34 || index > 0x49 || !callbackXE->tglDekelLock) return false;
 	const auto raw = *reinterpret_cast<uint32_t *>(bytes + 0x580 + index * 4);
 	if (raw != expected[index - 0x34]) return false;
 	auto base = *reinterpret_cast<volatile uint8_t **>(access + 0x50);
@@ -14676,22 +15458,30 @@ bool XE::tglDekelAccess(void *port, uint32_t index, bool write, uint32_t &value)
 
 uint32_t XE::wrapTGLReadDekel(void *port, uint32_t index) {
 	auto config = *reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port) + 0x548);
-	if (!config || !callbackXE->tglLegacyTCEligible(config[0]))
-		return FunctionCast(wrapTGLReadDekel, callbackXE->orgTGLReadDekel)(port, index);
+ if(config && config[0]==5 && callbackXE->tglRightAltRequested && !callbackXE->tglRightAltEligible(5))return 0;
+	if (!config || !callbackXE->tglDPTransportEligible(config[0])) {
+  const auto result=FunctionCast(wrapTGLReadDekel, callbackXE->orgTGLReadDekel)(port, index);
+  if(index==0x38)rightPortRecord(port,4,index,result);
+  return result;
+ }
 	uint32_t value = 0;
 	if (!tglDekelAccess(port, index, false, value)) {
 		IORegistryEntry::getRegistryRoot()->setProperty("TGLDekelRejectedRead", index, 32);
 	}
+	if(index==0x38 && callbackXE->tglRightAltEligible(config[0]))rightPortRecord(port,4,index,value,0x46030,0x46038);
 	return value;
 }
 
 void XE::wrapTGLWriteDekel(void *port, uint32_t index, uint32_t value) {
 	auto config = *reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port) + 0x548);
-	if (!config || !callbackXE->tglLegacyTCEligible(config[0])) {
-		FunctionCast(wrapTGLWriteDekel, callbackXE->orgTGLWriteDekel)(port, index, value);
+ if(config && config[0]==5 && callbackXE->tglRightAltRequested && !callbackXE->tglRightAltEligible(5))return;
+	if (!config || !callbackXE->tglDPTransportEligible(config[0])) {
+		if(index==0x38)rightPortRecord(port,5,index,value);
+  FunctionCast(wrapTGLWriteDekel, callbackXE->orgTGLWriteDekel)(port, index, value);
 		return;
 	}
 	if (!tglDekelAccess(port, index, true, value)) {
 		IORegistryEntry::getRegistryRoot()->setProperty("TGLDekelRejectedWrite", index, 32);
 	}
+ if(index==0x38 && callbackXE->tglRightAltEligible(config[0]))rightPortRecord(port,5,index,value,0x46030,0x46038);
 }

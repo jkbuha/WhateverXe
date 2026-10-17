@@ -30,7 +30,9 @@ def main():
    if not a.release:cmd+=['-DDEBUG=1']
    run(cmd+['-c',source,'-o',obj]);objects.append(obj)
   exe=bundle/'MacOS'/name
-  run(['xcrun','ld','-arch','x86_64','-kext','-undefined','dynamic_lookup','-no_fixup_chains','-macos_version_min',('10.6' if name=='WhateverXe' else '10.15'),'-o',exe,*objects,sdk/'Library/x86_64/libkmod.a'])
+  link_help=subprocess.run(['xcrun','ld','-help'],capture_output=True,text=True)
+  no_chains=['-no_fixup_chains'] if 'fixup_chains' in link_help.stdout+link_help.stderr else []
+  run(['xcrun','ld','-arch','x86_64','-kext','-undefined','dynamic_lookup',*no_chains,'-macos_version_min',('10.6' if name=='WhateverXe' else '10.15'),'-o',exe,*objects,sdk/'Library/x86_64/libkmod.a'])
   libs={x:'10.0.0' for x in ['com.apple.kpi.bsd','com.apple.kpi.dsep','com.apple.kpi.iokit','com.apple.kpi.libkern','com.apple.kpi.mach','com.apple.kpi.unsupported']};libs['com.apple.iokit.IOPCIFamily']='1.1'
   ident='org.b00t0x.'+name
   info=dict(CFBundleIdentifier=ident,CFBundleExecutable=name,CFBundleName=name,CFBundlePackageType='KEXT',CFBundleVersion=version,CFBundleShortVersionString=version,OSBundleCompatibleVersion=version,OSBundleRequired='Root',OSBundleLibraries=libs)

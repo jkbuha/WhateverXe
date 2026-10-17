@@ -14,6 +14,8 @@ void IODelay(unsigned n){assert(n==8);++delays;}
 struct XE {
  void *tglObservationController;uintptr_t tglClockOffCaller=1,orgTGLPathLookup,orgTGLDisableClocks;
  bool tglLegacyTCEligible(unsigned d){return d>=3&&d<=8;}
+ bool tglDPTransportEligible(unsigned d){return tglLegacyTCEligible(d);}
+ bool tglDPMode(unsigned d,unsigned m){return tglLegacyTCEligible(d)&&m==4;}
  static volatile uint8_t *tglClockOrderTarget(void*,void*,void*,void*);
  static void wrapTGLDisableClocks(void*,void*,void*);
  static void *wrapTGLPathLookup(void*);
