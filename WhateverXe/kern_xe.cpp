@@ -2609,6 +2609,39 @@ extern "C" __attribute__((noinline, used)) void tglHostLoadSnapshot(void *owner,
  if (record==&tglHost.load[0] && q[4]==0) tglVMCapture(1,owner,base,q+68);
 }
 
+// Candidate limited to the saved single-level/layer 1920x1200 10-bit
+// legacy-Y CCS_E resolve. Preserve native descriptor layout and all other
+// cases; HALIGN4 and HALIGN16 give identical placement for this level0 image.
+extern "C" {
+ uint32_t tglResolveAlignmentEnabled {};
+ uint32_t tglResolveAlignmentFixes {};
+ uintptr_t tglResolveAlignmentResume {};
+}
+static bool tglResolveAlignmentSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t q[]={1,__atomic_load_n(&tglResolveAlignmentEnabled,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglResolveAlignmentFixes,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+extern "C" __attribute__((naked, used)) void tglResolveAlignmentBridge() {
+ asm volatile(
+  "movzbl 0x44(%r12), %eax\n pushfq\n"
+  "cmpl $1, _tglResolveAlignmentEnabled(%rip)\n jne 1f\n"
+  "cmpl $1920, 0x0c(%r12)\n jne 1f\n"
+  "cmpl $1200, 0x10(%r12)\n jne 1f\n"
+  "cmpl $7680, 0x18(%r12)\n jne 1f\n"
+  "cmpl $0x23457000, (%r14)\n jne 1f\n"
+  "cmpl $0x04af077f, 8(%r14)\n jne 1f\n"
+  "cmpl $0x1dff, 0x0c(%r14)\n jne 1f\n"
+  "cmpl $2, 0x10(%r14)\n jne 1f\n"
+  "cmpl $0, 0x14(%r14)\n jne 1f\n"
+  "cmpb $1, 0x44(%r12)\n jne 1f\n"
+  "movl $3, %eax\n lock incl _tglResolveAlignmentFixes(%rip)\n"
+  "1:\n popfq\n andq %r10, %rax\n shlq $14, %rax\n"
+  "movabsq $0x8000000037ff3000, %rcx\n"
+  "jmpq *_tglResolveAlignmentResume(%rip)\n");
+}
+
 // r125: donor 8D056..8D06D. FAST_CLEAR_0 (resolve type2) initializes CCS
 // metadata and requires PS bit8 (TGL PRM vol2d p64; Mesa BLORP AMBIGUATE).
 // This is independent of the userland color-clear optimization. Preserve the
@@ -8060,6 +8093,27 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				ccsReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsSite,ccsReplace,sizeof(ccsReplace));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSPageReservationReady",ccsReady);
+            // Exact donor's load/mask/shift and next mask constant, before
+            // the descriptor is committed and submitted by the native caller.
+            const uint8_t alignBlock[] {0x41,0x0F,0xB6,0x44,0x24,0x44,0x4C,0x21,0xD0,0x48,0xC1,0xE0,0x0E,0x48,0xB9,0x00,0x30,0xFF,0x37,0x00,0x00,0x00,0x80};
+            auto alignSite=reinterpret_cast<uint8_t *>(address+0x8CE43);
+            bool alignTrialOK=ccsReady && xeProfile.identity==0x9A498086U &&
+             checkKernelArgument("-wex-edp-routing") && checkKernelArgument("-wex-edp-probe") &&
+             !memcmp(alignSite,alignBlock,sizeof(alignBlock));
+            if(alignTrialOK){
+             tglResolveAlignmentResume=address+0x8CE5A;
+             uint8_t jump[sizeof(alignBlock)];memset(jump,0x90,sizeof(jump));
+             jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(tglResolveAlignmentBridge);memcpy(jump+6,&target,8);
+             patcher.clearError();patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(alignSite),jump,sizeof(jump));
+             alignTrialOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(alignSite,jump,sizeof(jump));
+            }
+            __atomic_store_n(&tglResolveAlignmentEnabled,alignTrialOK?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveAlignmentReady",alignTrialOK);
+            if(alignTrialOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveAlignmentSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveAlignmentLive",live);live->release();}
+            patcher.clearError();
+
 			patcher.clearError();
 			// r287: HiZ resolve lays out commands/state relative to cursor+4096,
 			// but requests only the *remaining* pool space, so the pool never
