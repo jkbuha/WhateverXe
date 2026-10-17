@@ -128,6 +128,7 @@ static void rightPortPublish() {
 #include "kern_xelp_queue_memory.hpp"
 #include "kern_tgl_hang_refs.hpp"
 #include "kern_edp_compression_capture.hpp"
+#include "kern_edp_auxmap_capture.hpp"
 #include "kern_tgl_recovery.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -8690,6 +8691,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveResourceReady",resourceCaptureOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveBackingReady",resourceCaptureOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpCompressionReady",resourceCaptureOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxMapReady",resourceCaptureOK);
             __atomic_store_n(&tglResolveRectangleEnabled,resourceCaptureOK?1U:0U,__ATOMIC_RELEASE);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRectangleReady",resourceCaptureOK);
             if(resourceCaptureOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveRectangleSerialize)){
@@ -11191,6 +11193,22 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
        laterRoot==c->q[11] && !finalMapping.status && finalMapping.rootPhysical==c->q[12];
       compression->q[15]=stillOwned?1:0;if(!stillOwned)compression->q[1]=2;
       IORegistryEntry::getRegistryRoot()->setProperty("WXEdpCompression0",compression,sizeof(*compression));
+      if(compression->q[1]==0 && compression->q[15]==1){
+       auto auxmap=static_cast<EdpAuxMap::Capture *>(IOMalloc(sizeof(EdpAuxMap::Capture)));
+       if(auxmap){
+        bzero(auxmap,sizeof(*auxmap));EdpAuxMap::collect(*auxmap,*compression,pageRead);
+        uint64_t afterCtx=0,afterLRC=0,afterTable=0,afterID=0,afterRoot=0;
+        const auto mapping=TGLPPGTT::inspect(c->q[8],c->q[2]&~3ULL,tglVMRead);
+        const bool owner=tglVMRead(actualRing+0x20,afterCtx) && tglVMRead(actualRing+0x18,afterLRC) &&
+         tglVMRead(c->q[7]+0x260,afterTable) && read32(c->q[5]+0x7C,afterID) && lrcRoot(c->q[10],afterRoot) &&
+         afterCtx==c->q[5] && afterLRC==c->q[10] && afterTable==c->q[8] && afterID==c->q[6] &&
+         afterRoot==c->q[11] && !mapping.status && mapping.rootPhysical==c->q[12];
+        auxmap->q[15]=owner?1:0;if(!owner)auxmap->q[1]=8;
+        IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxMap0",auxmap,sizeof(*auxmap));
+        IOFree(auxmap,sizeof(*auxmap));
+       }
+      }
+
       IOFree(compression,sizeof(*compression));
      }
     }
