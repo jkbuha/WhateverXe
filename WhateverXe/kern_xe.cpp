@@ -2691,38 +2691,40 @@ extern "C" __attribute__((naked, used)) void tglResolveScratchBridge() {
   "jmpq *_tglResolveScratchResume(%rip)\n");
 }
 
-// Replicated-data colour-resolve helper, assembled for Xe-LP/12p1. The
-// output data is irrelevant for FULL_RESOLVE; the render-control message
-// must use the replicated-data form. Install inside native scratch ownership.
-static const uint8_t tglResolveReplicatedCode[32] {0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x70,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x32,0x01,0x04,0x00,0x04,0x00,0x00,0x00,0x0C,0x70,0x00,0x52,0x00,0x00,0xC4,0x00};
+// Normal SIMD16 colour-resolve RT write, assembled for Xe-LP/12p1.
+// Mesa's newer TGL workaround forbids replicated-data writes (BSpec47719,
+// WA14017879046/14017880152). All8 GRFs of the normal RGBA payload are
+// initialized; no sampler, varying or constant-buffer dependencies.
+static const uint8_t tglResolveNormalCode[144] {0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x70,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x71,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x72,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x73,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x74,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x75,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x76,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x61,0x00,0x03,0x80,0x20,0x42,0x05,0x77,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x32,0x01,0x04,0x00,0x04,0x00,0x00,0x00,0x44,0x70,0x00,0x50,0x00,0x00,0xC4,0x00};
+static_assert(0x4D00+sizeof(tglResolveNormalCode)<=0x5000,"Resolve helper must precede completion slot");
 extern "C" {
- uint32_t tglResolveReplicatedEnabled {};
- uint32_t tglResolveReplicatedCopies {};
- uint32_t tglResolveReplicatedSelects {};
- uintptr_t tglResolveReplicatedSource {};
- uintptr_t tglResolveReplicatedCopyResume {};
+ uint32_t tglResolveNormalEnabled {};
+ uint32_t tglResolveNormalCopies {};
+ uint32_t tglResolveNormalSelects {};
+ uintptr_t tglResolveNormalSource {};
+ uintptr_t tglResolveNormalCopyResume {};
 }
-extern "C" void *tglResolveReplicatedCopy(void *last,const void *source,size_t bytes) {
- // Preserve the last native copy unconditionally. The extra32bytes lie at
+extern "C" void *tglResolveNormalCopy(void *last,const void *source,size_t bytes) {
+ // Preserve the last native copy unconditionally. The extra144bytes lie at
  // 4D00, after native initialized state and before the5000 completion slot.
  memcpy(last,source,bytes);
- if(__atomic_load_n(&tglResolveReplicatedEnabled,__ATOMIC_ACQUIRE) && bytes==0x380){
-  memcpy(static_cast<uint8_t *>(last)+0x600,tglResolveReplicatedCode,sizeof(tglResolveReplicatedCode));
-  __atomic_add_fetch(&tglResolveReplicatedCopies,1U,__ATOMIC_RELEASE);
+ if(__atomic_load_n(&tglResolveNormalEnabled,__ATOMIC_ACQUIRE) && bytes==0x380){
+  memcpy(static_cast<uint8_t *>(last)+0x600,tglResolveNormalCode,sizeof(tglResolveNormalCode));
+  __atomic_add_fetch(&tglResolveNormalCopies,1U,__ATOMIC_RELEASE);
  }
  return last;
 }
-extern "C" __attribute__((naked, used)) void tglResolveReplicatedCopyBridge() {
+extern "C" __attribute__((naked, used)) void tglResolveNormalCopyBridge() {
  asm volatile(
   "addq $0x4700, %rbx\n movq %rbx, %rdi\n"
-  "movq _tglResolveReplicatedSource(%rip), %rsi\n movl $0x380, %edx\n"
-  "callq _tglResolveReplicatedCopy\n"
-  "jmpq *_tglResolveReplicatedCopyResume(%rip)\n");
+  "movq _tglResolveNormalSource(%rip), %rsi\n movl $0x380, %edx\n"
+  "callq _tglResolveNormalCopy\n"
+  "jmpq *_tglResolveNormalCopyResume(%rip)\n");
 }
-static bool tglResolveReplicatedSerialize(void *,void *,OSSerialize *serializer) {
- const uint32_t q[]={1,__atomic_load_n(&tglResolveReplicatedEnabled,__ATOMIC_RELAXED),
-  __atomic_load_n(&tglResolveReplicatedCopies,__ATOMIC_RELAXED),
-  __atomic_load_n(&tglResolveReplicatedSelects,__ATOMIC_RELAXED),0x4D00,32,0x5100,0x5000};
+static bool tglResolveNormalSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t q[]={1,__atomic_load_n(&tglResolveNormalEnabled,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglResolveNormalCopies,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglResolveNormalSelects,__ATOMIC_RELAXED),0x4D00,144,0x5100,0x5000};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -2761,15 +2763,15 @@ extern "C" __attribute__((naked, used)) void tglCCSPSBridge() {
   "1:\n movw %ax, 0xa0(%r15)\n popq %rax\n popfq\n"
   "movw $0x1f80, 0xa2(%r15)\n"
   "movq %r9, 0xac(%r15)\n movq %r9, 0xa4(%r15)\n movl %r9d, 0xb4(%r15)\n"
-  "pushfq\n cmpl $1, _tglResolveReplicatedEnabled(%rip)\n jne 2f\n"
-  "cmpl $0, _tglResolveReplicatedCopies(%rip)\n je 2f\n"
+  "pushfq\n cmpl $1, _tglResolveNormalEnabled(%rip)\n jne 2f\n"
+  "cmpl $0, _tglResolveNormalCopies(%rip)\n je 2f\n"
   "cmpl $0x1f8000c2, 0xa0(%r15)\n jne 2f\n"
   "cmpl $1920, 0x0c(%rdx)\n jne 2f\n cmpl $1200, 0x10(%rdx)\n jne 2f\n"
   "cmpl $7680, 0x18(%rdx)\n jne 2f\n cmpl $0xd1, 0x40(%rdx)\n jne 2f\n"
   "cmpl $0x2345f000, (%r14)\n jne 2f\n cmpl $2, 0x10(%r14)\n jne 2f\n"
   "cmpl $0, 0x14(%r14)\n jne 2f\n"
   "movq $0x4d00, 0x8c(%r15)\n movq $0x4d00, 0xa8(%r15)\n movq $0x4d00, 0xb0(%r15)\n"
-  "lock incl _tglResolveReplicatedSelects(%rip)\n"
+  "lock incl _tglResolveNormalSelects(%rip)\n"
   "2:\n popfq\n jmpq *_tglCCSPSResume(%rip)\n");
 }
 
@@ -8339,20 +8341,20 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveDrawLengthReady",drawLengthOK);
             patcher.clearError();
             const uint8_t lastCopyBlock[] {0x48,0x81,0xC3,0x00,0x47,0,0,0x48,0x8D,0x35,0x22,0x14,0x04,0,0xBA,0x80,0x03,0,0,0x48,0x89,0xDF,0xE8};
-            bool replicatedOK=ccsPSReady && scratchTrialOK && size>0xC7200 &&
+            bool normalOK=ccsPSReady && scratchTrialOK && size>0xC7200 &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__Z35resolve_initialize_scratch_space_g7P16IGAccelSysMemory",address,size)==address+0x85704 &&
              !memcmp(reinterpret_cast<void *>(address+0x85A50),lastCopyBlock,sizeof(lastCopyBlock));
-            if(replicatedOK){
-             tglResolveReplicatedSource=address+0xC6E80;tglResolveReplicatedCopyResume=address+0x85A6B;
+            if(normalOK){
+             tglResolveNormalSource=address+0xC6E80;tglResolveNormalCopyResume=address+0x85A6B;
              uint8_t jump[27];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
-             const uintptr_t target=reinterpret_cast<uintptr_t>(tglResolveReplicatedCopyBridge);memcpy(jump+6,&target,8);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(tglResolveNormalCopyBridge);memcpy(jump+6,&target,8);
              patcher.clearError();patcher.routeBlock(address+0x85A50,jump,sizeof(jump));
-             replicatedOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x85A50),jump,sizeof(jump));
+             normalOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(address+0x85A50),jump,sizeof(jump));
             }
-            __atomic_store_n(&tglResolveReplicatedEnabled,replicatedOK?1U:0U,__ATOMIC_RELEASE);
-            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveReplicatedReady",replicatedOK);
-            if(replicatedOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveReplicatedSerialize)){
-             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveReplicatedLive",live);live->release();}
+            __atomic_store_n(&tglResolveNormalEnabled,normalOK?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveNormalReady",normalOK);
+            if(normalOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveNormalSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveNormalLive",live);live->release();}
             patcher.clearError();
 
 			patcher.clearError();
