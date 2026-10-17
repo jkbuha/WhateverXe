@@ -14100,20 +14100,12 @@ void XE::wrapTGLFreePath(void *path) {
 }
 
 uint32_t XE::wrapTGLEdpCurrentMode(void *fb,int32_t *mode,int32_t *depth) {
+ // IOGraphicsTypes.h defines -5 as kIODisplayModeIDBootProgrammable.
+ // Preserve native mode IDs and errors; signedness is not validity.
  int32_t localMode=0,localDepth=0;
- auto self=callbackXE;
- const auto result=FunctionCast(wrapTGLEdpCurrentMode,self->orgTGLEdpCurrentMode)(fb,mode?mode:&localMode,depth?depth:&localDepth);
- auto ctl=static_cast<uint8_t *>(self->tglObservationController);
- // -5 is the donor's inherited/unresolved-mode sentinel, not a usable mode.
- // An empty timing conversion must never be advertised as a successful mode.
- if(self->tglEdpRoutingReady && ctl && fb==*reinterpret_cast<void **>(ctl+0xD60) &&
-    !result && (mode?*mode:localMode)<0) {
-  static uint32_t rejected {};
-  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpUnresolvedModeRejected",__atomic_add_fetch(&rejected,1U,__ATOMIC_RELAXED),32);
-  return 0xE00002D8U;
- }
- return result;
+ return FunctionCast(wrapTGLEdpCurrentMode,callbackXE->orgTGLEdpCurrentMode)(fb,mode?mode:&localMode,depth?depth:&localDepth);
 }
+
 uint32_t XE::wrapTGLLightUpEdp(void *controller,void *fb,void *path,const void *timing) {
  tglObservePath(nullptr,path,3,false,0,0,__builtin_return_address(0));
  auto root=IORegistryEntry::getRegistryRoot();root->setProperty("WXEdpLightUpEntered",true);
