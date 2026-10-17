@@ -127,6 +127,7 @@ static void rightPortPublish() {
 #include "kern_xelp_queue_trace.hpp"
 #include "kern_xelp_queue_memory.hpp"
 #include "kern_tgl_hang_refs.hpp"
+#include "kern_edp_compression_capture.hpp"
 #include "kern_tgl_recovery.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -8688,6 +8689,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              resourceCaptureOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveResourceReady",resourceCaptureOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveBackingReady",resourceCaptureOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpCompressionReady",resourceCaptureOK);
             __atomic_store_n(&tglResolveRectangleEnabled,resourceCaptureOK?1U:0U,__ATOMIC_RELEASE);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRectangleReady",resourceCaptureOK);
             if(resourceCaptureOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveRectangleSerialize)){
@@ -11171,6 +11173,27 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
     auto final=TGLPPGTT::inspect(c->q[8],c->q[2]&~3ULL,tglVMRead);
     refs->q[1]=owned && ctx==c->q[5] && lrc==c->q[10] && table==c->q[8] &&
      id==c->q[6] && root==c->q[11] && !final.status && final.rootPhysical==c->q[12] ? 0 : 2;
+    if(refs->q[1]==0){
+     auto compression=static_cast<EdpCompression::Capture *>(IOMalloc(sizeof(EdpCompression::Capture)));
+     if(compression){
+      bzero(compression,sizeof(*compression));
+      auto copy=[](uint64_t a,void *to,size_t n)->uint64_t {
+       if((a>>47)!=0x1FFFF || a>UINT64_MAX-n)return 0;
+       return tglVM.nofault(a,reinterpret_cast<uint64_t>(to),n);
+      };
+      EdpCompression::collect(*compression,*refs,tglResolveResources,tglResolveMapVtable,tglResolveMemoryVtable,
+       c->q[10],c->q[5],c->q[12],c->q[8],copy,pageRead);
+      uint64_t laterCtx=0,laterLRC=0,laterTable=0,laterID=0,laterRoot=0;
+      const auto finalMapping=TGLPPGTT::inspect(c->q[8],c->q[2]&~3ULL,tglVMRead);
+      const bool stillOwned=tglVMRead(actualRing+0x20,laterCtx) && tglVMRead(actualRing+0x18,laterLRC) &&
+       tglVMRead(c->q[7]+0x260,laterTable) && read32(c->q[5]+0x7C,laterID) && lrcRoot(c->q[10],laterRoot) &&
+       laterCtx==c->q[5] && laterLRC==c->q[10] && laterTable==c->q[8] && laterID==c->q[6] &&
+       laterRoot==c->q[11] && !finalMapping.status && finalMapping.rootPhysical==c->q[12];
+      compression->q[15]=stillOwned?1:0;if(!stillOwned)compression->q[1]=2;
+      IORegistryEntry::getRegistryRoot()->setProperty("WXEdpCompression0",compression,sizeof(*compression));
+      IOFree(compression,sizeof(*compression));
+     }
+    }
     IORegistryEntry::getRegistryRoot()->setProperty("TGLHangRefs0",refs,sizeof(*refs));
     IOFree(refs,sizeof(*refs));
    }
