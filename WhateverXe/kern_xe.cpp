@@ -8299,6 +8299,29 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(attributesOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveAttributesSerialize)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveAttributesLive",live);live->release();}
             patcher.clearError();
+            // TGL PRM vol2a 3DPRIMITIVE: non-extended packet length=5.
+            // Native emitter sets length8 but Extended Parameters Present=0.
+            // r15 is zero from8D2FC and preserved across the two memcpy calls;
+            // its final three DWORD stores become legal MI_NOOP padding.
+            // Preserve batch size, all draw parameters and following commands.
+            const uint8_t drawLengthFind[] {0xC6,0x83,0x80,0x01,0,0,0x08};
+            const uint8_t drawLengthReplace[] {0xC6,0x83,0x80,0x01,0,0,0x05};
+            const uint8_t drawHeaderTail[] {0x66,0xC7,0x83,0x81,0x01,0,0,0,0,0xC6,0x83,0x83,0x01,0,0,0x7B};
+            const uint8_t drawZeroReg[] {0x45,0x31,0xFF};
+            const uint8_t drawZeroSave[] {0x44,0x89,0xBD,0xA8,0xFE,0xFF,0xFF,0x4C,0x89,0xBD,0xA0,0xFE,0xFF,0xFF,0x4C,0x89,0xBD,0x98,0xFE,0xFF,0xFF};
+            auto drawLengthSite=reinterpret_cast<uint8_t *>(address+0x8D420);
+            bool drawLengthOK=attributesOK &&
+             !memcmp(drawLengthSite,drawLengthFind,sizeof(drawLengthFind)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x8D427),drawHeaderTail,sizeof(drawHeaderTail)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x8D2FC),drawZeroReg,sizeof(drawZeroReg)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x8D40B),drawZeroSave,sizeof(drawZeroSave));
+            if(drawLengthOK){
+             KernelPatcher::LookupPatch patch {currentGraphics,drawLengthFind,drawLengthReplace,sizeof(drawLengthFind),1};
+             patcher.clearError();patcher.applyLookupPatch(&patch,drawLengthSite,sizeof(drawLengthFind)+1);
+             drawLengthOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(drawLengthSite,drawLengthReplace,sizeof(drawLengthReplace));
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveDrawLengthReady",drawLengthOK);
+            patcher.clearError();
             const uint8_t lastCopyBlock[] {0x48,0x81,0xC3,0x00,0x47,0,0,0x48,0x8D,0x35,0x22,0x14,0x04,0,0xBA,0x80,0x03,0,0,0x48,0x89,0xDF,0xE8};
             bool replicatedOK=ccsPSReady && scratchTrialOK && size>0xC7200 &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__Z35resolve_initialize_scratch_space_g7P16IGAccelSysMemory",address,size)==address+0x85704 &&
