@@ -25,6 +25,7 @@ namespace { uint32_t wxEdpAuxPHYCount=0; }
 namespace { uint32_t wxEdpEnableCycleOnce=0; }
 #include "kern_edp_aux_status.hpp"
 #include "kern_edp_handoff.hpp"
+#include "kern_edp_aux_lease.hpp"
 namespace { EdpHandoff::Evidence wxEdpHandoff {}; }
 static void tglPublishEdpHandoff();
 
@@ -13998,6 +13999,32 @@ void XE::tglEdpBoundaryProbe(void *port,uint32_t phase,uint32_t nativeResult) {
 }
 
 uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
+ auto self=callbackXE;auto ctl=static_cast<uint8_t *>(self->tglObservationController);
+ auto pb=static_cast<uint8_t *>(port);auto cfg=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ auto access=pb?*reinterpret_cast<uint8_t **>(pb+0x578):nullptr;
+ auto power=ctl?*reinterpret_cast<uint8_t **>(ctl+0xC8):nullptr;
+ auto &f=self->tglTCNativeFunctions;const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+ bool eligible=self->tglEdpRoutingReady && self->xeProfile.identity==0x9A498086U && f.complete() && ctl &&
+  *f.controllerSlot==ctl && !ctl[0x918] && power && !power[0x18] &&
+  *reinterpret_cast<void **>(power+0x10)==ctl && *reinterpret_cast<void **>(power+0x78)==access &&
+  access && *reinterpret_cast<void **>(ctl+0xC40)==access && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 &&
+  pb[0x11]==2 && *reinterpret_cast<uint32_t *>(pb+0x550)==1 &&
+  *reinterpret_cast<uint32_t *>(pb+0x124)==2 && *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+  __atomic_load_n(&wxEdpPLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+  __atomic_load_n(&wxEdpPLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(access);
+ uint64_t lease[8] {1};
+ if(eligible){auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
+  eligible=base && *reinterpret_cast<uint32_t *>(access+0x60)>=0x164294;
+  if(eligible){const auto main=*reinterpret_cast<volatile uint32_t *>(base+0x45404),io=*reinterpret_cast<volatile uint32_t *>(base+0x45454);
+   eligible=main!=0xFFFFFFFFU && io!=0xFFFFFFFFU && (main&0x3FU)==0x3FU && (io&3U)==3U;}}
+ const auto result=EdpAuxLease::run(eligible,[&]{
+  lease[1]=*reinterpret_cast<uint32_t *>(power+0x54);f.getAux(port);
+  lease[2]=*reinterpret_cast<uint32_t *>(power+0x54);
+ },[&]{
+  lease[3]=*reinterpret_cast<uint32_t *>(power+0x54);f.putAux(port);
+  lease[4]=*reinterpret_cast<uint32_t *>(power+0x54);
+ },[&]()->uint32_t {
+
  // BEGIN bounded internal sink-state probe (read-only).
  auto pb=static_cast<uint8_t *>(port);
  auto config=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
@@ -14049,6 +14076,10 @@ uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
 	tglObservePath(port, nullptr, 0, true, r, request ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(request) + 0x38) : 0, caller);
 	tglDPCDPublish();
 	return r;
+
+ });
+ if(eligible){lease[5]=result;lease[7]=0x4C454153;IORegistryEntry::getRegistryRoot()->setProperty("WXEdpTrainingAuxLease",lease,sizeof(lease));}
+ return result;
 }
 
 void *XE::wrapTGLPathLookup(void *port) {
