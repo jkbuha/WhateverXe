@@ -209,7 +209,8 @@ static TGLResolveCodeRecord tglResolveCodeRecords[12] {};
 static uint32_t tglResolveCodeCount;
 static mach_vm_address_t tglResolveResourceOriginal;
 static uint32_t tglResolveResourceCount;
-struct TGLResolveResourceRecord {uint64_t q[16];uint8_t resource[512],params[160];};
+static uint64_t tglResolveMapVtable,tglResolveMemoryVtable;
+struct TGLResolveResourceRecord {uint64_t q[16];uint8_t resource[512],params[160],map[0x128],memory[0x198];};
 static TGLResolveResourceRecord tglResolveResources[4] {};
 static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task);
 
@@ -8664,10 +8665,18 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing") && checkKernelArgument("-wex-edp-probe") &&
              patcher.solveSymbol<mach_vm_address_t>(index,resourceSubmit,address,size)==address+0x2C84C &&
              !memcmp(reinterpret_cast<void *>(address+0x2C84C),resourceHead,sizeof(resourceHead));
+            const uint8_t mapSize[] {0xB9,0x28,0x01,0,0},memorySize[] {0xB9,0x98,0x01,0,0};
+            resourceCaptureOK=resourceCaptureOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IGAccelMemoryMap",address,size)==address+0xCCEF8 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IGAccelSysMemory",address,size)==address+0xCD6D8 &&
+             !memcmp(reinterpret_cast<void *>(address+0x10BCF),mapSize,sizeof(mapSize)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x126F5),memorySize,sizeof(memorySize));
+            if(resourceCaptureOK){tglResolveMapVtable=address+0xCCF08;tglResolveMemoryVtable=address+0xCD6E8;}
             patcher.clearError();
             if(resourceCaptureOK){KernelPatcher::RouteRequest route[] {{resourceSubmit,tglResolveResourceCapture,tglResolveResourceOriginal}};
              resourceCaptureOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveResourceReady",resourceCaptureOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveBackingReady",resourceCaptureOK);
             patcher.clearError();
 
             patcher.clearError();
@@ -11303,13 +11312,14 @@ bool XE::wrapTGLResolveCode(void *pool,void *mapped,void *params,bool mode,const
  return result;
 }
 
-// Observe caller-owned CPU objects before native submission. No pointer
-// chasing, virtual calls, GPU reads, memory maps or argument modifications.
+// Observe caller-owned CPU objects before native submission. Follow only the
+// exact native retained map/memory classes. No virtual calls, GPU reads,
+// memory maps or argument modifications.
 // Raw resource fields remain uninterpreted until checked against donor code.
 static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task) {
  const auto slot=__atomic_fetch_add(&tglResolveResourceCount,1U,__ATOMIC_RELAXED);
  if(slot<4 && tglVM.nofault){
-  auto &r=tglResolveResources[slot];auto q=r.q;q[0]=1;tglHostClock(q+1);
+  auto &r=tglResolveResources[slot];auto q=r.q;q[0]=2;tglHostClock(q+1);
   q[2]=reinterpret_cast<uint64_t>(owner);q[3]=reinterpret_cast<uint64_t>(resource);
   q[4]=reinterpret_cast<uint64_t>(params);q[5]=reinterpret_cast<uint64_t>(rects);q[6]=reinterpret_cast<uint64_t>(task);
   auto read=[](uint64_t a,void *dest,size_t n)->uint64_t {
@@ -11318,6 +11328,21 @@ static void tglResolveResourceCapture(void *owner,void *resource,void *params,co
   };
   q[7]=read(q[3],r.resource,sizeof(r.resource));q[8]=read(q[4],r.params,sizeof(r.params));
   q[9]=1; // pre-submission snapshot; native result is not inferred
+  // Native family Resource2::checkDirty follows resource+40 as MemoryMap;
+  // MemoryMap retains IOAccelMemory at+18. Follow only exact donor types,
+  // with class-sized copies validated against their native MetaClass sizes.
+  if(q[7]==sizeof(r.resource)){
+   memcpy(q+10,r.resource+0x40,8);
+   if(read(q[10],q+11,8)==8 && tglResolveMapVtable && q[11]==tglResolveMapVtable){
+    q[12]=read(q[10],r.map,sizeof(r.map));
+    if(q[12]==sizeof(r.map)){
+     memcpy(q+13,r.map+0x18,8);
+     if(read(q[13],q+14,8)==8 && tglResolveMemoryVtable && q[14]==tglResolveMemoryVtable)
+      q[15]=read(q[13],r.memory,sizeof(r.memory));
+    }
+   }
+  }
+
   char key[48];snprintf(key,sizeof(key),"WXEdpResolveResource%u",slot);
   IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));
  }
