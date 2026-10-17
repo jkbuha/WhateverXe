@@ -2711,6 +2711,29 @@ static bool tglResolveReplicatedSerialize(void *,void *,OSSerialize *serializer)
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
+// TGL PRM vol2d p71: Attribute Enable must match whether SBE emits
+// any attributes. This exact native colour-resolve emitter always writes an
+// SBE with zero attributes at8D10B, but enables PS_EXTRA attribute payloads.
+// Preserve the native RAX value, stores and flags; change only PS_EXTRA bit8.
+extern "C" {
+ uint32_t tglResolveAttributesEnabled {};
+ uint32_t tglResolveAttributesCount {};
+ uintptr_t tglResolveAttributesResume {};
+}
+extern "C" __attribute__((naked, used)) void tglResolveAttributesBridge() {
+ asm volatile(
+  "movabsq $0x80000100784f0000, %rax\n movq %rax, 0xb8(%r15)\n"
+  "pushfq\n cmpl $1, _tglResolveAttributesEnabled(%rip)\n jne 1f\n"
+  "andl $0xfffffeff, 0xbc(%r15)\n lock incl _tglResolveAttributesCount(%rip)\n"
+  "1:\n popfq\n jmpq *_tglResolveAttributesResume(%rip)\n");
+}
+static bool tglResolveAttributesSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t q[]={1,__atomic_load_n(&tglResolveAttributesEnabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&tglResolveAttributesCount,__ATOMIC_ACQUIRE),0x100,0};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 // r125: donor 8D056..8D06D. FAST_CLEAR_0 (resolve type2) initializes CCS
 // metadata and requires PS bit8 (TGL PRM vol2d p64; Mesa BLORP AMBIGUATE).
 // This is independent of the userland color-clear optimization. Preserve the
@@ -8255,6 +8278,27 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				ccsPSReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsPSSite,jump,sizeof(jump));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSFastClearZeroReady",ccsPSReady);
+            // Admit only the exact zero-attribute SBE emitter and native
+            // PS_EXTRA store; unrelated PS and blit emitters are untouched.
+            const uint8_t attributesBlock[] {0x48,0xB8,0x00,0x00,0x4F,0x78,0x00,0x01,0x00,0x80,0x49,0x89,0x87,0xB8,0,0,0};
+            const uint8_t attributesSBE[] {0x48,0xB8,0x04,0x00,0x1F,0x78,0x20,0x08,0x20,0x30,0x49,0x89,0x87,0xFC,0,0,0};
+            auto attributesSite=reinterpret_cast<uint8_t *>(address+0x8D083);
+            bool attributesOK=ccsPSReady && scratchTrialOK && xeProfile.identity==0x9A498086U &&
+             checkKernelArgument("-wex-edp-routing") && checkKernelArgument("-wex-edp-probe") &&
+             !memcmp(attributesSite,attributesBlock,sizeof(attributesBlock)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x8D10B),attributesSBE,sizeof(attributesSBE));
+            if(attributesOK){
+             tglResolveAttributesResume=address+0x8D094;
+             uint8_t jump[sizeof(attributesBlock)];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(tglResolveAttributesBridge);memcpy(jump+6,&target,8);
+             patcher.clearError();patcher.routeBlock(address+0x8D083,jump,sizeof(jump));
+             attributesOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(attributesSite,jump,sizeof(jump));
+            }
+            __atomic_store_n(&tglResolveAttributesEnabled,attributesOK?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveAttributesReady",attributesOK);
+            if(attributesOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveAttributesSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveAttributesLive",live);live->release();}
+            patcher.clearError();
             const uint8_t lastCopyBlock[] {0x48,0x81,0xC3,0x00,0x47,0,0,0x48,0x8D,0x35,0x22,0x14,0x04,0,0xBA,0x80,0x03,0,0,0x48,0x89,0xDF,0xE8};
             bool replicatedOK=ccsPSReady && scratchTrialOK && size>0xC7200 &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__Z35resolve_initialize_scratch_space_g7P16IGAccelSysMemory",address,size)==address+0x85704 &&
