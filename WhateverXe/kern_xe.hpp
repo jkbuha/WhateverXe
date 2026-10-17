@@ -514,6 +514,8 @@ private:
 	static void wrapAlderLakeNNativeGPUInfo(IOService *that);
 	static bool wrapAlderLakeNNativeIRQ(IOService *that);
 	mach_vm_address_t orgTGLFastCopy {}, tglSourceCopy {};
+	mach_vm_address_t orgTGLResolveInit {};
+	static bool wrapTGLResolveInit(void *context);
 	mach_vm_address_t orgTGLBlitDeferredInit {};
 	static void wrapTGLBlitDeferredInit(void *context,void *params,const void *rects);
 	mach_vm_address_t orgTGLSurfaceAux {};
