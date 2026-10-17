@@ -41,7 +41,7 @@ inline bool walkable(const uint8_t *b,unsigned n,unsigned begin,unsigned end) {
  return false;
 }
 template<class ReadPage>
-void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t bb,ReadPage read) {
+void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t bb,ReadPage read,const uint64_t *inherited=nullptr) {
  c.q[0]=131;c.q[3]=base;c.q[4]=bb;
  c.q[8]=1;
  if (n>16384 || n<88 || bb<base || bb-base>n-4 || ((bb-base)&3)) return;
@@ -52,8 +52,16 @@ void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t b
  c.q[5]=base+anchor;c.q[8]=0;
  const uint8_t *s=batch+anchor;
  // Missing modify-enable means inherited state, not zero or a usable base.
- if (!(word(s+16)&1) || !(word(s+24)&1) || !(word(s+40)&1)) {c.q[8]=2;return;}
- c.q[9]=pair(s+16)&~4095ULL;c.q[10]=pair(s+24)&~4095ULL;c.q[11]=pair(s+40)&~4095ULL;
+ // Optional bases are CPU initialization candidates for this exact context,
+ // not proof that the GPU executed or retained that initialization. q29 marks
+ // every inherited candidate used; explicit packet bases always take priority.
+ const unsigned offsets[]={16,24,40};
+ for(unsigned i=0;i<3;++i){
+  if(word(s+offsets[i])&1)c.q[9+i]=pair(s+offsets[i])&~4095ULL;
+  else if(inherited && inherited[i] && !(inherited[i]&4095) && !(inherited[i]>>47)){
+   c.q[9+i]=inherited[i];c.q[29]|=1ULL<<i;
+  }else{c.q[8]=2;return;}
+ }
  auto add=[&](uint64_t gpu,uint64_t kind)->Page* {
   if (!gpu || gpu>>47) return nullptr;
   const uint64_t page=gpu&~4095ULL;
@@ -95,6 +103,11 @@ void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t b
   o+=dw*4;
  }
  c.q[25]=static_cast<uint32_t>(baseVertex);c.q[26]=ibBytes;c.q[27]=nc;
+ // Capture the candidate inherited allocation's first pages too. A zero
+ // shader offset can be valid, while the legacy parser treats zero as absent.
+ // These remain candidate allocation bytes, not proven executed shaders.
+ if(c.q[29]&2)span(c.q[10],4096,Constant);
+ if(c.q[29]&4)span(c.q[11],4096,Shader);
  // Capture external batches first; absent pages remain explicit holes.
  for (unsigned i=0;i<nc;++i) span(calls[i],256,Batch);
  for (unsigned i=0;i<4;++i) if (programs[i]) span(address(c.q[11],programs[i]),512,Shader);

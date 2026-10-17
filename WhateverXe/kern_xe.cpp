@@ -201,6 +201,9 @@ static uint64_t tglPPGTTClass;
 static uintptr_t tglExtendedBufferReturn;
 static uintptr_t tglBlitPoolSubmit;
 static uint32_t tglBlitDeferredInitCount;
+static EdpResolveInit::Capture tglResolveInitCopies[4] {};
+static uint32_t tglResolveInitCount;
+static uint32_t tglResolveInitReady[4] {};
 static bool tglBlitDeferredSerialize(void *,void *,OSSerialize *serializer) {
  const uint32_t q[]={310,__atomic_load_n(&tglBlitDeferredInitCount,__ATOMIC_RELAXED)};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
@@ -10855,7 +10858,19 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
      p.q[3]=p.q[2]==4096 && !memcmp(&p.before,&p.after,sizeof(p.before));
      p.q[4]=p.q[3] ? 0 : 3;
     };
-    TGLHangRefs::collect(*refs,c->bytes[0],sizeof(c->bytes),c->q[13],c->q[2]&~3ULL,pageRead);
+    uint64_t inherited[3]={};bool haveInherited=false;
+    for(unsigned i=0;i<4;++i){
+     if(!__atomic_load_n(&tglResolveInitReady[i],__ATOMIC_ACQUIRE))continue;
+     const auto &init=tglResolveInitCopies[i];
+     if(init.q[1]!=c->q[5] || init.q[8]!=1 || init.q[7]<0xA0)continue;
+     const auto *s=init.commands+0x48;
+     if(TGLHangRefs::word(s)!=0x61010014)continue;
+     const unsigned offsets[]={16,24,40};
+     for(unsigned j=0;j<3;++j)if(TGLHangRefs::word(s+offsets[j])&1)
+      inherited[j]=TGLHangRefs::pair(s+offsets[j])&~4095ULL;
+     haveInherited=true;refs->q[30]=init.q[1];refs->q[31]=0x494E4954;break;
+    }
+    TGLHangRefs::collect(*refs,c->bytes[0],sizeof(c->bytes),c->q[13],c->q[2]&~3ULL,pageRead,haveInherited?inherited:nullptr);
     uint64_t ctx=0,lrc=0,table=0,id=0,root=0;
     const bool owned=tglVMRead(actualRing+0x20,ctx) && tglVMRead(actualRing+0x18,lrc) &&
      tglVMRead(c->q[7]+0x260,table) && read32(c->q[5]+0x7C,id) && lrcRoot(c->q[10],root);
@@ -10987,8 +11002,8 @@ void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t
 bool XE::wrapTGLResolveInit(void *context) {
  const bool result=FunctionCast(wrapTGLResolveInit,callbackXE->orgTGLResolveInit)(context);
  if(callbackXE->tglEdpRoutingReady && callbackXE->xeProfile.identity==0x9A498086U){
-  static EdpResolveInit::Capture captures[4] {};static uint32_t count=0;
-  const auto slot=__atomic_fetch_add(&count,1U,__ATOMIC_RELAXED);
+  auto &captures=tglResolveInitCopies;
+  const auto slot=__atomic_fetch_add(&tglResolveInitCount,1U,__ATOMIC_RELAXED);
   if(slot<4){
    auto pool=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(context)+0xE0);
    if(pool){
@@ -10996,6 +11011,7 @@ bool XE::wrapTGLResolveInit(void *context) {
     auto current=*reinterpret_cast<uint8_t **>(pool+0x1858);
     auto limit=*reinterpret_cast<uint8_t **>(pool+0x1850);
     if(EdpResolveInit::copy(captures[slot],true,context,pool,start,current,limit,result)){
+     __atomic_store_n(&tglResolveInitReady[slot],1U,__ATOMIC_RELEASE);
      char key[48];snprintf(key,sizeof(key),"WXEdpResolveInit%u",slot);
      IORegistryEntry::getRegistryRoot()->setProperty(key,&captures[slot],sizeof(captures[slot]));
     }
