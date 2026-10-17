@@ -2642,6 +2642,40 @@ extern "C" __attribute__((naked, used)) void tglResolveAlignmentBridge() {
   "jmpq *_tglResolveAlignmentResume(%rip)\n");
 }
 
+// Failure captures show both post-sync writes at the instruction allocation
+// base. Trial: retain the native writes/values, but use an unused owned tail
+// location within the exact donor's 0x5100-byte scratch allocation. No shader
+// bytes are rewritten, and no allocation, rectangle or native waits change.
+extern "C" {
+ uint32_t tglResolveScratchEnabled {};
+ uint32_t tglResolveScratchFixes {};
+ uintptr_t tglResolveScratchResume {};
+}
+static bool tglResolveScratchSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t q[]={1,__atomic_load_n(&tglResolveScratchEnabled,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglResolveScratchFixes,__ATOMIC_RELAXED),0x5000};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+extern "C" __attribute__((naked, used)) void tglResolveScratchBridge() {
+ asm volatile(
+  "pushfq\n cmpl $1, _tglResolveScratchEnabled(%rip)\n jne 1f\n"
+  "testq %r12, %r12\n je 1f\n testq $0xfff, %r12\n jne 1f\n"
+  "movabsq $0x7fffffffafff, %rax\n cmpq %rax, %r12\n ja 1f\n"
+  "cmpl $0x2345f000, (%r14)\n jne 1f\n"
+  "cmpl $0x04af077f, 8(%r14)\n jne 1f\n"
+  "cmpl $0x1dff, 0x0c(%r14)\n jne 1f\n"
+  "cmpl $2, 0x10(%r14)\n jne 1f\n"
+  "cmpl $0, 0x14(%r14)\n jne 1f\n"
+  "cmpl $5, 0x18(%r14)\n jne 1f\n"
+  "lock incl _tglResolveScratchFixes(%rip)\n popfq\n"
+  "leaq 0x5000(%r12), %r12\n jmp 2f\n"
+  "1:\n popfq\n"
+  "2:\n movl %r12d, %r13d\n shrl $2, %r13d\n shlq $2, %r13\n shrq $32, %r12\n"
+  "movabsq $0x001014047a000004, %rax\n"
+  "jmpq *_tglResolveScratchResume(%rip)\n");
+}
+
 // r125: donor 8D056..8D06D. FAST_CLEAR_0 (resolve type2) initializes CCS
 // metadata and requires PS bit8 (TGL PRM vol2d p64; Mesa BLORP AMBIGUATE).
 // This is independent of the userland color-clear optimization. Preserve the
@@ -8115,6 +8149,26 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             patcher.clearError();
 
 			patcher.clearError();
+            const uint8_t scratchBlock[] {0x45,0x89,0xE5,0x41,0xC1,0xED,0x02,0x49,0xC1,0xE5,0x02,0x49,0xC1,0xEC,0x20,0x48,0xB8,0x04,0x00,0x00,0x7A,0x04,0x14,0x10,0x00};
+            const char *resolveScratchSize="_g7_resolve_scratch_space_size";
+            auto scratchSite=reinterpret_cast<uint8_t *>(address+0x8CF32);
+            bool scratchTrialOK=alignTrialOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,resolveScratchSize,address,size)==address+0xC26C0 &&
+             *reinterpret_cast<const uint64_t *>(address+0xC26C0)==0x5100 &&
+             !memcmp(scratchSite,scratchBlock,sizeof(scratchBlock));
+            if(scratchTrialOK){
+             tglResolveScratchResume=address+0x8CF4B;
+             uint8_t jump[sizeof(scratchBlock)];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(tglResolveScratchBridge);memcpy(jump+6,&target,8);
+             patcher.clearError();patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(scratchSite),jump,sizeof(jump));
+             scratchTrialOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(scratchSite,jump,sizeof(jump));
+            }
+            __atomic_store_n(&tglResolveScratchEnabled,scratchTrialOK?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveScratchReady",scratchTrialOK);
+            if(scratchTrialOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveScratchSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveScratchLive",live);live->release();}
+            patcher.clearError();
+
 			// r287: HiZ resolve lays out commands/state relative to cursor+4096,
 			// but requests only the *remaining* pool space, so the pool never
 			// rotates before the emitter runs across its mapped 4 KiB page.

@@ -108,6 +108,7 @@ void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t b
  // These remain candidate allocation bytes, not proven executed shaders.
  if(c.q[29]&2)span(c.q[10],4096,Constant);
  if(c.q[29]&4)span(c.q[11],4096,Shader);
+ if(c.q[29]&4)span(address(c.q[11],0x5000),256,Constant);
  // Capture external batches first; absent pages remain explicit holes.
  for (unsigned i=0;i<nc;++i) span(calls[i],256,Batch);
  for (unsigned i=0;i<4;++i) if (programs[i]) span(address(c.q[11],programs[i]),512,Shader);
