@@ -2647,7 +2647,9 @@ extern "C" __attribute__((naked, used)) void tglResolveAlignmentBridge() {
 
 // Failure captures show both post-sync writes at the instruction allocation
 // base. Trial: retain the native writes/values, but use an unused owned tail
-// location within the exact donor's 0x5100-byte scratch allocation. No shader
+// location within the exact donor's 0x5100-byte scratch allocation. This
+// applies to every native colour resolve, regardless of surface dimensions.
+// The first observed resolve escaped the earlier surface-specific gate. No shader
 // bytes are rewritten, and no allocation, rectangle or native waits change.
 extern "C" {
  uint32_t tglResolveScratchEnabled {};
@@ -2655,7 +2657,7 @@ extern "C" {
  uintptr_t tglResolveScratchResume {};
 }
 static bool tglResolveScratchSerialize(void *,void *,OSSerialize *serializer) {
- const uint32_t q[]={1,__atomic_load_n(&tglResolveScratchEnabled,__ATOMIC_RELAXED),
+ const uint32_t q[]={2,__atomic_load_n(&tglResolveScratchEnabled,__ATOMIC_RELAXED),
   __atomic_load_n(&tglResolveScratchFixes,__ATOMIC_RELAXED),0x5000};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
@@ -2665,12 +2667,6 @@ extern "C" __attribute__((naked, used)) void tglResolveScratchBridge() {
   "pushfq\n cmpl $1, _tglResolveScratchEnabled(%rip)\n jne 1f\n"
   "testq %r12, %r12\n je 1f\n testq $0xfff, %r12\n jne 1f\n"
   "movabsq $0x7fffffffafff, %rax\n cmpq %rax, %r12\n ja 1f\n"
-  "cmpl $0x2345f000, (%r14)\n jne 1f\n"
-  "cmpl $0x04af077f, 8(%r14)\n jne 1f\n"
-  "cmpl $0x1dff, 0x0c(%r14)\n jne 1f\n"
-  "cmpl $2, 0x10(%r14)\n jne 1f\n"
-  "cmpl $0, 0x14(%r14)\n jne 1f\n"
-  "cmpl $5, 0x18(%r14)\n jne 1f\n"
   "lock incl _tglResolveScratchFixes(%rip)\n popfq\n"
   "leaq 0x5000(%r12), %r12\n jmp 2f\n"
   "1:\n popfq\n"
@@ -8168,6 +8164,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             }
             __atomic_store_n(&tglResolveScratchEnabled,scratchTrialOK?1U:0U,__ATOMIC_RELEASE);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveScratchReady",scratchTrialOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveScratchScope",2,32);
             if(scratchTrialOK)if(auto live=OSSerializer::forTarget(nullptr,tglResolveScratchSerialize)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveScratchLive",live);live->release();}
             patcher.clearError();
@@ -11120,16 +11117,23 @@ void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t
  if (tglCorrectCCSAlignment(surface)) __atomic_fetch_add(&tglCCSAlignmentCounts[2],1,__ATOMIC_RELAXED);
 }
 
-static void tglResolveCodeSnapshot(unsigned phase,void *context,void *pool,void *mapped,bool result) {
+static void tglResolveCodeSnapshot(unsigned phase,void *context,void *pool,void *mapped,void *params,bool result) {
  if(!pool || !mapped || !tglVM.nofault)return;
  const auto slot=__atomic_fetch_add(&tglResolveCodeCount,1U,__ATOMIC_RELAXED);if(slot>=12)return;
- auto &q=tglResolveCodeRecords[slot].q;q[0]=1;q[1]=phase;q[2]=reinterpret_cast<uintptr_t>(context);
+ auto &q=tglResolveCodeRecords[slot].q;q[0]=2;q[1]=phase;q[2]=reinterpret_cast<uintptr_t>(context);
  q[3]=reinterpret_cast<uintptr_t>(mapped);q[4]=reinterpret_cast<uintptr_t>(pool);q[7]=result;
  // Exact IGSharedMappedBuffer factory used by native ExtendedContext init:
  // +38 is its already-existing kernel CPU mapping. Do not map or touch MMIO.
  if(tglVM.nofault(q[3]+0x38,reinterpret_cast<uint64_t>(q+5),8)==8 && q[5])
   q[6]=tglVM.nofault(q[5],reinterpret_cast<uint64_t>(q+8),32);
  tglHostClock(q+12);q[15]=0x434F4445;
+ if(params){
+  const auto source=reinterpret_cast<uintptr_t>(params);uint32_t format=0,pitch=0;uint64_t mask=0;
+  if(tglVM.nofault(source+0x0C,reinterpret_cast<uint64_t>(q+13),8)==8)mask|=1;
+  if(tglVM.nofault(source+0x40,reinterpret_cast<uint64_t>(&format),4)==4)mask|=2;
+  if(tglVM.nofault(source+0x18,reinterpret_cast<uint64_t>(&pitch),4)==4)mask|=4;
+  q[14]=format|(static_cast<uint64_t>(pitch)<<32);q[15]|=mask<<32;
+ }
  char key[48];snprintf(key,sizeof(key),"WXEdpResolveCode%u",slot);
  IORegistryEntry::getRegistryRoot()->setProperty(key,&tglResolveCodeRecords[slot],sizeof(tglResolveCodeRecords[slot]));
 }
@@ -11142,9 +11146,9 @@ bool XE::wrapTGLResolveCode(void *pool,void *mapped,void *params,bool mode,const
    context=reinterpret_cast<void *>(tglResolveInitCopies[i].q[1]);break;
   }
  }
- if(qualified)tglResolveCodeSnapshot(1,context,pool,mapped,false);
+ if(qualified)tglResolveCodeSnapshot(1,context,pool,mapped,params,false);
  const bool result=FunctionCast(wrapTGLResolveCode,callbackXE->orgTGLResolveCode)(pool,mapped,params,mode,rects);
- if(qualified)tglResolveCodeSnapshot(2,context,pool,mapped,result);
+ if(qualified)tglResolveCodeSnapshot(2,context,pool,mapped,params,result);
  return result;
 }
 
@@ -11162,7 +11166,7 @@ bool XE::wrapTGLResolveInit(void *context) {
     if(EdpResolveInit::copy(captures[slot],true,context,pool,start,current,limit,result)){
      __atomic_store_n(&tglResolveInitReady[slot],1U,__ATOMIC_RELEASE);
      auto mapped=*reinterpret_cast<void **>(static_cast<uint8_t *>(context)+0xD8);
-     tglResolveCodeSnapshot(0,context,pool,mapped,result);
+     tglResolveCodeSnapshot(0,context,pool,mapped,nullptr,result);
      char key[48];snprintf(key,sizeof(key),"WXEdpResolveInit%u",slot);
      IORegistryEntry::getRegistryRoot()->setProperty(key,&captures[slot],sizeof(captures[slot]));
     }
