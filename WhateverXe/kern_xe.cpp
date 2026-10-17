@@ -130,6 +130,7 @@ static void rightPortPublish() {
 #include "kern_edp_compression_capture.hpp"
 #include "kern_edp_auxmap_capture.hpp"
 #include "kern_edp_auxrange_trace.hpp"
+#include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -228,6 +229,8 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
 
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount;
+static bool tglPassThrough(void *,void *,void *,uint32_t,uint8_t,uint8_t);
+static uint32_t tglPassThroughChecks,tglPassThroughEligible,tglPassThroughZero,tglPassThroughSkipped;
 static void tglEntryEnable(void *,void *,uint64_t,void *,void *,uint8_t,uint8_t,bool);
 static bool tglEntryResolve(void *,void *,void *,void *,uint32_t,uint8_t,uint8_t);
 
@@ -8749,6 +8752,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(entriesOK){KernelPatcher::RouteRequest route[] {{entryEnable,tglEntryEnable,tglEntryEnableOriginal},{entryResolve,tglEntryResolve,tglEntryResolveOriginal}};
              entriesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEntriesReady",entriesOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPassThroughReady",entriesOK);
             patcher.clearError();
 
             __atomic_store_n(&tglResolveRectangleEnabled,resourceCaptureOK?1U:0U,__ATOMIC_RELEASE);
@@ -11509,6 +11513,54 @@ static void tglAuxUnmapRange(void *table,const void *range){
  tglAuxRanges.finish(slot,r,UINT64_MAX,tglHostClock);
 }
 
+// Diagnostic trial: omit only a full resolve of a never-enabled, unmapped,
+// exact panel layout whose complete CCS allocation is currently zero. CPU
+// reads only; no AUX mapping, page-table mutation, shaders or MMIO changes.
+static bool tglPassThrough(void *resource,void *entry,void *task,uint32_t type,uint8_t level,uint8_t face){
+ __atomic_add_fetch(&tglPassThroughChecks,1U,__ATOMIC_RELAXED);
+ bool skipped=false;
+ do {
+  if(type!=3 || level || face || !tglVM.enabled || !tglVM.nofault)break;
+  uint8_t e[160] {},r[512] {},map[0x128] {},mem[0x198] {};
+  if(tglAuxTraceRead(reinterpret_cast<uint64_t>(entry),e,sizeof(e))!=sizeof(e) ||
+   tglAuxTraceRead(reinterpret_cast<uint64_t>(resource),r,sizeof(r))!=sizeof(r))break;
+  const auto mp=EdpPassThrough::pair(r+0x40);uint64_t vt=0;
+  if(tglAuxTraceRead(mp,&vt,8)!=8 || vt!=tglResolveMapVtable ||
+   tglAuxTraceRead(mp,map,sizeof(map))!=sizeof(map))break;
+  const auto memory=EdpPassThrough::pair(map+0x18);
+  if(tglAuxTraceRead(memory,&vt,8)!=8 || vt!=tglResolveMemoryVtable ||
+   tglAuxTraceRead(memory,mem,sizeof(mem))!=sizeof(mem) ||
+   !EdpPassThrough::eligible(e,map,mem,reinterpret_cast<uint64_t>(task)))break;
+  __atomic_add_fetch(&tglPassThroughEligible,1U,__ATOMIC_RELAXED);
+  const auto tp=reinterpret_cast<uint64_t>(task);uint64_t table=0;
+  if(!tglVMRead(tp+0x260,table))break;
+  const auto base=EdpPassThrough::pair(map+0x98);uint64_t root=0;bool zero=true;
+  uint8_t page[4096] {};
+  for(unsigned i=0;i<9;++i){
+   const auto gpu=base+9338880+uint64_t(i)*4096;
+   const auto before=TGLPPGTT::inspect(table,gpu,tglVMRead);
+   if(before.status || !before.rootPhysical || (i && before.rootPhysical!=root) ||
+    before.physical>UINT64_MAX-tglVM.directBase){zero=false;break;}
+   root=before.rootPhysical;const auto cpu=tglVM.directBase+before.physical;
+   if(cpu<tglVM.directBase || cpu>=tglVM.directEnd || tglVM.directEnd-cpu<4096 ||
+    tglVM.nofault(cpu,reinterpret_cast<uint64_t>(page),sizeof(page))!=sizeof(page)){zero=false;break;}
+   const auto after=TGLPPGTT::inspect(table,gpu,tglVMRead);
+   if(memcmp(&before,&after,sizeof(before))){zero=false;break;}
+   for(unsigned j=0;j<4096;++j)if(page[j]){zero=false;break;}
+   if(!zero)break;
+  }
+  uint64_t later=0;uint8_t laterMap[0x128] {},laterMem[0x198] {};
+  if(!zero || !tglVMRead(tp+0x260,later) || later!=table ||
+   tglAuxTraceRead(mp,laterMap,sizeof(laterMap))!=sizeof(laterMap) || memcmp(map,laterMap,sizeof(map)) ||
+   tglAuxTraceRead(memory,laterMem,sizeof(laterMem))!=sizeof(laterMem) || memcmp(mem,laterMem,sizeof(mem)))break;
+  __atomic_add_fetch(&tglPassThroughZero,1U,__ATOMIC_RELAXED);
+  skipped=EdpPassThrough::complete(static_cast<uint8_t *>(entry),e);
+  if(skipped)__atomic_add_fetch(&tglPassThroughSkipped,1U,__ATOMIC_RELAXED);
+ } while(false);
+ uint32_t q[]={1,__atomic_load_n(&tglPassThroughChecks,__ATOMIC_RELAXED),__atomic_load_n(&tglPassThroughEligible,__ATOMIC_RELAXED),__atomic_load_n(&tglPassThroughZero,__ATOMIC_RELAXED),__atomic_load_n(&tglPassThroughSkipped,__ATOMIC_RELAXED)};
+ IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPassThroughCounts",q,sizeof(q));return skipped;
+}
+
 // First32 calls only: caller-owned ResourceInfoEntry, captured before and after
 // native execution. Immutable separate properties keep pre-call evidence available
 // even if execution never returns. No list walking or graphics-state mutation.
@@ -11533,7 +11585,8 @@ static void tglEntryEnable(void *resource,void *entry,uint64_t gpu,void *accel,v
 static bool tglEntryResolve(void *resource,void *entry,void *accel,void *task,uint32_t type,uint8_t level,uint8_t face){
  const auto slot=__atomic_fetch_add(&tglEntryCount,1U,__ATOMIC_RELAXED);
  tglEntrySnapshot(slot,0,2,resource,entry,0,accel,task,type,level,face,false,UINT64_MAX);
- const bool result=FunctionCast(tglEntryResolve,tglEntryResolveOriginal)(resource,entry,accel,task,type,level,face);
+ const bool bypass=tglPassThrough(resource,entry,task,type,level,face);
+ const bool result=bypass ? true : FunctionCast(tglEntryResolve,tglEntryResolveOriginal)(resource,entry,accel,task,type,level,face);
  tglEntrySnapshot(slot,1,2,resource,entry,0,accel,task,type,level,face,false,result?1:0);return result;
 }
 
