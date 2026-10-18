@@ -8,6 +8,13 @@ Intel Xe-LP integrated GPUs. It is derived from WhateverGreen.
 This project is experimental and requires the Xe root patch provided by the
 [OpenCore Legacy Patcher fork](https://github.com/b00t0x/OpenCore-Legacy-Patcher).
 
+This fork includes experimental internal-display changes for physical Tiger Lake
+`9A49` on Big Sur `20G1443`. Internal 1920×1200 output currently requires an
+HDMI display connected at boot and during use. The external display remains
+blank in this mode; cable-free startup, hotplug and long-term stability are
+unresolved. This is a conditional development baseline, not general internal-panel
+support. The upstream release links below do not contain these fork changes.
+
 ## Compatibility
 
 The current target is **macOS Big Sur build 20G1443**.

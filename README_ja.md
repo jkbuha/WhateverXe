@@ -6,6 +6,8 @@ WhateverXeは、一部のIntel Xe-LP内蔵GPU向けにAppleのグラフィック
 
 本プロジェクトは実験段階であり、[OpenCore Legacy Patcherのfork](https://github.com/b00t0x/OpenCore-Legacy-Patcher)が提供するXe root patchを必要とします。
 
+このforkには、Big Sur `20G1443`上の物理Tiger Lake `9A49`向けに実験的な内蔵ディスプレイ対応を含みます。現時点では、内蔵1920×1200画面の出力には起動時と使用中にHDMIディスプレイを接続しておく必要があります。このモードでは外部画面は表示されず、ケーブルなしの起動、ホットプラグ、長時間の安定性は未解決です。条件付きの開発用ベースラインであり、一般的な内蔵画面対応ではありません。以下のupstreamリリースには、このforkの変更は含まれません。
+
 ## 対応範囲
 
 現在の対象は **macOS Big Sur build 20G1443** です。
