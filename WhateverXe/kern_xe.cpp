@@ -127,6 +127,7 @@ static void rightPortPublish() {
 #include "kern_xelp_queue_trace.hpp"
 #include "kern_xelp_queue_memory.hpp"
 #include "kern_tgl_hang_refs.hpp"
+#include "kern_tgl_render_window.hpp"
 #include "kern_edp_compression_capture.hpp"
 #include "kern_edp_auxmap_capture.hpp"
 #include "kern_edp_auxrange_trace.hpp"
@@ -11255,6 +11256,42 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
  // r131: only the first qualified RCS fault. Read references after kernel
  // relocation through the same owned software PPGTT; no GPU work/hot-path hook.
  if (slot==0 && c->q[16]==0) {
+  // The original four-page receipt and its parsers remain unchanged. This
+  // independent failure-only window retains earlier shader/surface setup.
+  using Window=TGLRenderWindow::Capture<TGLHangRefs::Page>;
+  auto window=static_cast<Window *>(IOMalloc(sizeof(Window)));
+  if(window){
+   bzero(window,sizeof(*window));tglHostClock(window->q+8);
+   window->q[10]=c->q[5];window->q[11]=c->q[7];window->q[12]=c->q[8];
+   window->q[13]=c->q[12];window->q[14]=actualRing;window->q[15]=c->q[10];
+   auto owned=[&] {
+    uint64_t context,lrc,task,table,identity,root,klass;
+    if(!tglVMRead(actualRing+0x20,context) || context!=c->q[5] ||
+       !tglVMRead(actualRing+0x18,lrc) || lrc!=c->q[10] ||
+       !tglVMRead(context+0x58,task) || task!=c->q[7] ||
+       !read32(context+0x7C,identity) || identity!=c->q[6] ||
+       !tglVMRead(task+0x260,table) || table!=c->q[8] ||
+       !tglVMRead(table,klass) || klass!=tglPPGTTClass ||
+       !lrcRoot(lrc,root) || root!=c->q[12])return false;
+    const auto active=TGLPPGTT::inspect(table,c->q[2]&~3ULL,tglVMRead);
+    return !active.status && active.rootPhysical==root;
+   };
+   auto readPage=[&](TGLHangRefs::Page &p){
+    p.q[4]=1;p.before=TGLPPGTT::inspect(c->q[8],p.q[0],tglVMRead);
+    auto &m=p.before;
+    if(m.status || m.rootPhysical!=c->q[12] || m.physical>UINT64_MAX-tglVM.directBase)return;
+    const uint64_t cpu=tglVM.directBase+m.physical;p.q[4]=2;
+    if(cpu<tglVM.directBase || cpu>=tglVM.directEnd || tglVM.directEnd-cpu<4096)return;
+    p.q[2]=tglVM.nofault(cpu,reinterpret_cast<uint64_t>(p.bytes),4096);
+    p.after=TGLPPGTT::inspect(c->q[8],p.q[0],tglVMRead);
+    p.q[3]=p.q[2]==4096 && !memcmp(&p.before,&p.after,sizeof(p.before));
+    p.q[4]=p.q[3]?0:3;
+   };
+   TGLRenderWindow::collect(*window,c->q[2]&~3ULL,owned,readPage);
+   tglHostClock(window->q+9);
+   IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRenderWindow0",window,sizeof(*window));
+   IOFree(window,sizeof(*window));
+  }
   bool pagesOK=true;
   for(unsigned i=0;i<4;++i) pagesOK=pagesOK && c->stable[i];
   if (pagesOK) {
