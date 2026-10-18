@@ -135,6 +135,7 @@ static void rightPortPublish() {
 #include "kern_tgl_segment_resources.hpp"
 #include "kern_tgl_c0_entry.hpp"
 #include "kern_tgl_c0_fresh.hpp"
+#include "kern_tgl_blit_copies.hpp"
 #include "kern_tgl_observation_budget.hpp"
 #include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
@@ -266,6 +267,25 @@ static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount,tglC0EntryCount,tglC0FreshCount;
 static bool tglC0FreshReady;
 static bool tglC0StorageABI(uint64_t);
+static mach_vm_address_t tglBlitCopyOriginal;
+static uint64_t tglBlitCopyOwnerClass,tglBlitCopyCalls;
+static uint32_t tglBlitCopyCount;
+static TGLBlitCopies::Record tglBlitCopyRecords[2][TGLBlitCopies::Capacity] {};
+static bool tglBlitCopy(void *,void *,const void *,void *,bool);
+static bool tglBlitCopySerialize(void *,void *,OSSerialize *serializer){
+ const uint64_t h[]={1,__atomic_load_n(&tglBlitCopyCount,__ATOMIC_ACQUIRE),TGLBlitCopies::Capacity,sizeof(TGLBlitCopies::Record),2,tglAuxDonorBegin};
+ auto data=OSData::withCapacity(sizeof(h)+sizeof(tglBlitCopyRecords));if(!data)return false;
+ bool ok=data->appendBytes(h,sizeof(h));const TGLBlitCopies::Record empty {};
+ for(unsigned phase=0;phase<2;++phase)for(unsigned i=0;i<TGLBlitCopies::Capacity;++i){const auto &r=tglBlitCopyRecords[phase][i];
+  ok=ok && data->appendBytes(__atomic_load_n(r.q+15,__ATOMIC_ACQUIRE)?&r:&empty,sizeof(r));}
+ if(ok)ok=data->serialize(serializer);data->release();return ok;
+}
+static bool tglBlitCopyProgressSerialize(void *,void *,OSSerialize *serializer){
+ const uint64_t h[]={1,__atomic_load_n(&tglBlitCopyCalls,__ATOMIC_RELAXED),__atomic_load_n(&tglBlitCopyCount,__ATOMIC_ACQUIRE),TGLBlitCopies::Capacity};
+ auto data=OSData::withBytes(h,sizeof(h));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 static bool tglPassThrough(void *,void *,void *,uint32_t,uint8_t,uint8_t);
 static uint32_t tglPassThroughChecks,tglPassThroughEligible,tglPassThroughZero,tglPassThroughSkipped;
 static void tglEntryEnable(void *,void *,uint64_t,void *,void *,uint8_t,uint8_t,bool);
@@ -8816,6 +8836,29 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              entriesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEntriesReady",entriesOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0EntriesReady",entriesOK);
+            // Read-only native paging/copy argument receipts. Keep the original
+            // five-argument submit function and all emitter decisions intact.
+            const char *copySubmit="__ZN16IntelAccelerator10submitBlitEP15blit3d_params_tRK8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyEP11IGAccelTaskb";
+            const uint8_t copyHead[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x38};
+            bool copyTraceOK=entriesOK && segmentOK && xeProfile.identity==0x9A498086U &&
+             patcher.solveSymbol<mach_vm_address_t>(index,copySubmit,address,size)==address+0x2BC8E &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IntelAccelerator",address,size)==address+0xD1060 &&
+             !memcmp(reinterpret_cast<void *>(address+0x2BC8E),copyHead,sizeof(copyHead)) &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZN8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyE4growEm",address,size)==address+0x7599C &&
+             !memcmp(reinterpret_cast<void *>(address+0x759B5),"\x48\xC1\xE7\x05",4) &&
+             !memcmp(reinterpret_cast<void *>(address+0x759C6),"\x49\x8B\x7F\x10",4);
+            patcher.clearError();
+            if(copyTraceOK){
+             tglBlitCopyOwnerClass=address+0xD1070;
+             KernelPatcher::RouteRequest route[] {{copySubmit,tglBlitCopy,tglBlitCopyOriginal}};
+             copyTraceOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpBlitCopiesReady",copyTraceOK);
+            if(copyTraceOK)if(auto live=OSSerializer::forTarget(nullptr,tglBlitCopySerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpBlitCopies",live);live->release();}
+            if(copyTraceOK)if(auto live=OSSerializer::forTarget(nullptr,tglBlitCopyProgressSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpBlitCopyProgress",live);live->release();}
+            patcher.clearError();
             // Exact native AUX_NONE selection and zero-CCS resolve fast path.
             tglC0FreshReady=entriesOK && segmentOK && tglC0StorageABI(address) &&
              !memcmp(reinterpret_cast<void *>(address+0x73FC6),"\xF6\x86\x91\x00\x00\x00\x02",7) &&
@@ -11909,6 +11952,31 @@ static __attribute__((noinline)) bool tglPassThrough(void *resource,void *entry,
  } while(false);
  uint32_t q[]={1,__atomic_load_n(&tglPassThroughChecks,__ATOMIC_RELAXED),__atomic_load_n(&tglPassThroughEligible,__ATOMIC_RELAXED),__atomic_load_n(&tglPassThroughZero,__ATOMIC_RELAXED),__atomic_load_n(&tglPassThroughSkipped,__ATOMIC_RELAXED)};
  IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPassThroughCounts",q,sizeof(q));return skipped;
+}
+
+// Nofault CPU snapshots only. Scratch returns before native submitBlit,
+// which retains its five original arguments, return value and emitter choice.
+static __attribute__((noinline)) unsigned tglBlitCopyObserve(unsigned slot,bool after,void *owner,void *params,
+ const void *rects,void *task,uint64_t caller,bool option,bool result){
+ if(!after){__atomic_fetch_add(&tglBlitCopyCalls,1ULL,__ATOMIC_RELAXED);
+  if(__atomic_load_n(&tglBlitCopyCount,__ATOMIC_RELAXED)>=TGLBlitCopies::Capacity)return UINT32_MAX;
+ }else if(slot>=TGLBlitCopies::Capacity)return UINT32_MAX;
+ TGLBlitCopies::Record local {};
+ if(!TGLBlitCopies::collect(local,reinterpret_cast<uint64_t>(owner),reinterpret_cast<uint64_t>(params),
+     reinterpret_cast<uint64_t>(rects),reinterpret_cast<uint64_t>(task),tglBlitCopyOwnerClass,tglSegmentTaskClass,tglAuxTraceRead))return UINT32_MAX;
+ if(!after)slot=__atomic_fetch_add(&tglBlitCopyCount,1U,__ATOMIC_RELAXED);
+ if(slot>=TGLBlitCopies::Capacity)return UINT32_MAX;
+ local.q[1]=slot;local.q[2]=after;local.q[7]=caller;tglHostClock(local.q+8);
+ local.q[13]=option;local.q[14]=after?uint64_t(result):UINT64_MAX;
+ auto &r=tglBlitCopyRecords[after?1:0][slot];memcpy(&r,&local,sizeof(r));
+ __atomic_store_n(r.q+15,1ULL,__ATOMIC_RELEASE);return slot;
+}
+static bool tglBlitCopy(void *owner,void *params,const void *rects,void *task,bool option){
+ const auto caller=reinterpret_cast<uint64_t>(__builtin_return_address(0));
+ const auto slot=tglBlitCopyObserve(UINT32_MAX,false,owner,params,rects,task,caller,option,false);
+ const bool result=FunctionCast(tglBlitCopy,tglBlitCopyOriginal)(owner,params,rects,task,option);
+ if(slot<TGLBlitCopies::Capacity)tglBlitCopyObserve(slot,true,owner,params,rects,task,caller,option,result);
+ return result;
 }
 
 // First32 calls only: caller-owned ResourceInfoEntry, captured before and after
