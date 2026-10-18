@@ -228,7 +228,7 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
  if(ok)ok=data->serialize(serializer);data->release();return ok;
 }
 
-static uint64_t tglFailureContextVtable,tglFailureBufferVtable;
+static uint64_t tglFailureContextVtable,tglFailureBufferVtable,tglFailureResolveVtable;
 static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount;
@@ -8937,6 +8937,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
     !memcmp(reinterpret_cast<void *>(address+0x7D9AC),contextSize,sizeof(contextSize)) &&
     !memcmp(reinterpret_cast<void *>(address+0x10B8D),sharedSize,sizeof(sharedSize));
    if(tglFailureRingReady){tglFailureContextVtable=address+0xDC390;tglFailureBufferVtable=address+0xCCCD0;}
+   const uint8_t resolveSize[] {0xB9,0xE8,0,0,0};
+   const uint8_t resolveAppend[] {0x41,0x80,0x7E,0x68,0,0x74,0x14,0xC7,0x04,0x88,0,0,0,0x05,0x41,0x8B,0x4E,0x30,0xFF,0xC1,0xC7,0x04,0x88,0,0,0,0};
+   if(tglFailureRingReady &&
+    patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV24IGHardwareResolveContext",address,size)==address+0xDCAE0 &&
+    patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareResolveContext10initializeEv",address,size)==address+0x7D85A &&
+    !memcmp(reinterpret_cast<void *>(address+0x7DA0C),resolveSize,sizeof(resolveSize)) &&
+    !memcmp(reinterpret_cast<void *>(address+0x4C72A),resolveAppend,sizeof(resolveAppend)))
+    tglFailureResolveVtable=address+0xDCAF0;
+   IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRingReady",bool(tglFailureResolveVtable));
    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRingFailureReady",tglFailureRingReady);
    patcher.clearError();
 			if (hangOK) {
@@ -8946,6 +8955,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
    tglFailureRingReady=tglFailureRingReady && hangOK;
    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRingFailureReady",tglFailureRingReady);
+   IORegistryEntry::getRegistryRoot()->setProperty("WXEdpResolveRingReady",tglFailureRingReady && bool(tglFailureResolveVtable));
    if(xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing"))IORegistryEntry::getRegistryRoot()->setProperty("WXEdpHangPersistentLog",hangOK);
 			// r123: the TGL caller loops reset -> extra stamp -> one-second wait
 			// while IOAccel holds its recovery locks. A stopped consumer fills its
@@ -11156,7 +11166,8 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
 }
 
 namespace {
-// Failure-only CPU capture for a native ordinary RCS context. The existing
+// Failure-only CPU capture for ordinary RCS and exact native resolve contexts.
+// The existing
 // PPGTT batch observer deliberately declines a GGTT/inactive BB address; copy
 // this context's retained CPU ring instead, without reinterpreting that address.
 static void tglCaptureFailureRing(uint64_t actualRing,const uint8_t *regs,const uint8_t *ring){
@@ -11165,11 +11176,12 @@ static void tglCaptureFailureRing(uint64_t actualRing,const uint8_t *regs,const 
  auto pair=[](const uint8_t *p){uint64_t v;memcpy(&v,p,8);return v;};
  auto word=[](const uint8_t *p){uint32_t v;memcpy(&v,p,4);return v;};
  const auto ctx=pair(ring+0x20),owner=pair(ring+0x10);uint64_t vt=0,lrc=0,buffer=0;
- if(!tglVMRead(ctx,vt) || vt!=tglFailureContextVtable ||
-  !tglVMRead(ctx+0x98,lrc) || !tglVMRead(lrc,vt) || vt!=tglFailureBufferVtable ||
+ if(!tglVMRead(ctx,vt) || (vt!=tglFailureContextVtable && (!tglFailureResolveVtable || vt!=tglFailureResolveVtable)))return;
+ const bool resolve=vt==tglFailureResolveVtable;
+ if(!tglVMRead(ctx+0x98,lrc) || !tglVMRead(lrc,vt) || vt!=tglFailureBufferVtable ||
   !tglVMRead(actualRing+0x80,buffer) || !tglVMRead(buffer,vt) || vt!=tglFailureBufferVtable)return;
  auto out=static_cast<Record *>(IOMalloc(sizeof(Record)));if(!out)return;bzero(out,sizeof(*out));
- auto q=out->q;tglHostClock(q+Time);q[Submit]=UINT64_MAX;q[BankSlot]=UINT64_MAX;q[Unknown]=0x48414E47;
+ auto q=out->q;tglHostClock(q+Time);q[Submit]=UINT64_MAX;q[BankSlot]=UINT64_MAX;q[Unknown]=resolve?0x52534C56:0x48414E47;
  capture(*out,ctx,owner,tglVMRead,[](uint64_t a,uint8_t *to,uint64_t n)->uint64_t {
   if(!kernelRange(a,n))return 0;return tglVM.nofault(a,reinterpret_cast<uint64_t>(to),n);
  });
@@ -11189,11 +11201,12 @@ static void tglCaptureFailureRing(uint64_t actualRing,const uint8_t *regs,const 
    tglVMRead(actualRing+0x80,check) && check==q[RingBuffer] &&
    tglVMRead(check+0x38,cpu) && cpu==q[RingCPU] &&
    tglVMRead(ctx+0xB0,back) && back==actualRing &&
-   tglVMRead(ctx+0x89,descriptor) && descriptor==q[DescriptorAfter];
+   tglVMRead(ctx+0x89,descriptor) && descriptor==q[DescriptorAfter] &&
+   tglVMRead(ctx,check) && check==(resolve?tglFailureResolveVtable:tglFailureContextVtable);
   q[Stable]=stable;if(!stable)q[Status]=5;
  }else if(!q[Status]){q[Stable]=0;q[Status]=6;}
  tglHostClock(q+EndTime);
- IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRingFailure0",out,sizeof(*out));IOFree(out,sizeof(*out));
+ IORegistryEntry::getRegistryRoot()->setProperty(resolve?"WXEdpResolveRing0":"WXEdpRingFailure0",out,sizeof(*out));IOFree(out,sizeof(*out));
 }
 
 void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs,const uint8_t *ring) {
@@ -11447,7 +11460,12 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
     memcpy(&bb,c->regs+0x70,8);memcpy(&stampBase,c->ring+0x30,8);
     memcpy(&stampIndex,c->ring+0x38,4);memcpy(&writeIndex,c->ring+0x8A0,4);
     c->q[12]=bb;c->q[13]=stampIndex;
-    if ((bb&1) && stampIndex<64 && writeIndex<64 &&
+    uint64_t faultContext=0,faultContextVtable=0;
+    memcpy(&faultContext,c->ring+0x20,8);
+    const bool resolveGGTT=tglFailureRingReady && tglFailureResolveVtable &&
+     c->regs[0x94]==0 && c->ring[0x40]==0 && !(bb&3) &&
+     read(faultContext,&faultContextVtable,8)==8 && faultContextVtable==tglFailureResolveVtable;
+    if (((bb&1) || resolveGGTT) && stampIndex<64 && writeIndex<64 &&
         read(stampBase+stampIndex*64,&retired,4)==4) {
      c->q[14]=retired;bb&=~3ULL;
      for (unsigned n=0;n<64;++n) {
@@ -11461,8 +11479,11 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
       // ACTHD/BB_ADDR can point just past the last executed packet. Keep the
       // bounded resource bytes in that case; never read beyond its extent.
       if (static_cast<int32_t>(stamp-retired)<=0 || !total || total>0x10000000 ||
-          bb<gpu || bb-gpu>total || (cpu>>47)!=0x1FFFF || cpu+total<cpu) continue;
-      const uint64_t delta=bb-gpu,start=delta>8192 ? (delta-8192)&~3ULL : 0;
+          bb<gpu || bb-gpu>total+(resolveGGTT?8:0) || (cpu>>47)!=0x1FFFF || cpu+total<cpu) continue;
+      // Native FIFO appends BBE + zero beyond the descriptor word count.
+      // A cursor up to8 bytes past that count is admitted only for the exact
+      // resolve-context GGTT path. Never copy beyond the original extent.
+      const uint64_t delta=bb-gpu<total?bb-gpu:total,start=delta>8192 ? (delta-8192)&~3ULL : 0;
       const size_t size=static_cast<size_t>(total-start<sizeof(c->bytes) ? total-start : sizeof(c->bytes));
       c->q[5]=i;c->q[6]=gpu;c->q[7]=cpu;c->q[8]=total;c->q[9]=start;
       c->q[10]=read(cpu+start,c->bytes,size);c->q[11]=size;c->q[15]=stamp;
