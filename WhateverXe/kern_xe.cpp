@@ -223,6 +223,12 @@ static mach_vm_address_t tglSegmentOriginal;
 static uint64_t tglSegmentTaskClass,tglSegmentResourceClass,tglSegmentListClass;
 static TGLSegmentResources::Record tglSegmentRecords[TGLSegmentResources::Capacity];
 static uint32_t tglSegmentCount;
+static uint64_t tglSegmentProgress[5];
+static bool tglSegmentProgressSerialize(void *,void *,OSSerialize *serializer){
+ uint64_t q[6]={1};for(unsigned i=0;i<5;++i)q[i+1]=__atomic_load_n(tglSegmentProgress+i,__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static uint64_t tglSegmentProcess(void *,void *,const void *,const void *);
 static bool tglSegmentSerialize(void *,void *,OSSerialize *serializer){
  const uint64_t h[]={1,__atomic_load_n(&tglSegmentCount,__ATOMIC_ACQUIRE),TGLSegmentResources::Capacity,sizeof(TGLSegmentResources::Record)};
@@ -8757,6 +8763,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              checkKernelArgument("-wex-edp-probe") && checkKernelArgument("-wex-edp-routing") &&
              patcher.solveSymbol<mach_vm_address_t>(index,segment,address,size)==address+0x2F3BC &&
              !memcmp(reinterpret_cast<void *>(address+0x2F3BC),segmentHead,sizeof(segmentHead)) &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK19IOAccelCommandQueue10getGPUTaskEv",address,size)==address+0x30064 &&
+             !memcmp(reinterpret_cast<void *>(address+0x30064),"\x55\x48\x89\xE5\x48\x8B\x87\xB0\x05\x00\x00\x5D\xC3",13) &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV11IGAccelTask",address,size)==address+0xCA5E0 &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV15IGAccelResource",address,size)==address+0xD93D0 &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV26IGAccelSegmentResourceList",address,size)==address+0xD9158;
@@ -8767,6 +8775,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              segmentOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSegmentResourcesReady",segmentOK);
+            if(segmentOK)if(auto live=OSSerializer::forTarget(nullptr,tglSegmentProgressSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSegmentProgress",live);live->release();}
             if(segmentOK)if(auto live=OSSerializer::forTarget(nullptr,tglSegmentSerialize)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSegmentResources",live);live->release();}
             patcher.clearError();
@@ -11768,17 +11778,22 @@ static uint64_t tglAuxTraceRead(uint64_t a,void *to,size_t n){
 // GPU work, mappings, virtual calls, locks or changes to resource metadata.
 static __attribute__((noinline)) void tglSegmentObserve(void *queue,void *list){
  const auto q=reinterpret_cast<uint64_t>(queue),l=reinterpret_cast<uint64_t>(list);
- uint64_t device=0,task=0,vt=0,array=0,count=0;
- if(!tglVMRead(q+0x5C0,device) || !tglVMRead(device+0x150,task) ||
-    !tglVMRead(task,vt) || vt!=tglSegmentTaskClass ||
-    !tglVMRead(l,vt) || vt!=tglSegmentListClass ||
+ __atomic_fetch_add(tglSegmentProgress,1ULL,__ATOMIC_RELAXED);
+ const auto task=TGLSegmentResources::queueTask(q,tglSegmentTaskClass,tglVMRead);
+ if(!task)return;
+ __atomic_fetch_add(tglSegmentProgress+1,1ULL,__ATOMIC_RELAXED);
+ uint64_t vt=0,array=0,count=0;
+ if(!tglVMRead(l,vt) || vt!=tglSegmentListClass ||
     !tglVMRead(l+0x10,array) || !tglVMRead(l+8,count))return;
  count>>=32;if(!array || !count || count>256)return;
+ __atomic_fetch_add(tglSegmentProgress+2,1ULL,__ATOMIC_RELAXED);
  for(unsigned i=0;i<count;++i){
   uint64_t resource=0;if(!tglVMRead(array+8*i,resource) || !resource)continue;
+  __atomic_fetch_add(tglSegmentProgress+3,1ULL,__ATOMIC_RELAXED);
   TGLSegmentResources::Record local {};
   if(!TGLSegmentResources::collect(local,task,resource,tglSegmentTaskClass,tglSegmentResourceClass,
        tglResolveMapVtable,tglAuxTableVtable,tglAuxTraceRead))continue;
+  __atomic_fetch_add(tglSegmentProgress+4,1ULL,__ATOMIC_RELAXED);
   bool seen=false;
   for(unsigned j=0;j<TGLSegmentResources::Capacity;++j){const auto &r=tglSegmentRecords[j];
    if(__atomic_load_n(r.q+15,__ATOMIC_ACQUIRE) && r.q[4]==task && r.q[5]==resource &&

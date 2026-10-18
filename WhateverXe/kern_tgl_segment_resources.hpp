@@ -6,6 +6,13 @@
 namespace TGLSegmentResources {
 constexpr unsigned Capacity=256;
 struct Record {uint64_t q[16];uint8_t entry[160],map[296];};
+// Exact donor IOAccelCommandQueue::getGPUTask@30064.
+// Queue+5C0 is the accelerator, whose+150 is an internal task; it is not
+// the client GPU namespace. Never substitute that task for a failed lookup.
+template<class Read> uint64_t queueTask(uint64_t queue,uint64_t taskClass,Read read){
+ uint64_t task=0,vt=0;
+ return taskClass && read(queue+0x5B0,task) && read(task,vt) && vt==taskClass?task:0;
+}
 inline uint32_t word(const uint8_t *p){uint32_t v;memcpy(&v,p,4);return v;}
 inline uint64_t pair(const uint8_t *p){uint64_t v;memcpy(&v,p,8);return v;}
 inline bool layout(const uint8_t *e){return word(e+0x10)==0xC0 && word(e+8)==7680 &&

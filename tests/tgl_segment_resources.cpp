@@ -13,6 +13,11 @@ int main(){
  put(entry+8,7680,4);put(entry+0x10,0xc0,4);put(entry+0x14,3,4);put(entry+0x3c,9338880,4);put(entry+0x40,36480,4);put(entry+0x6c,1920,4);put(entry+0x70,1200,4);put(entry+0x91,3,1);
  put(map+0x98,0x40150000);put(map+0x18,sys);put(sys+0x40,9375744);put(aux+0x20,0);put(aux+0x18,0x70000);
  auto read=[&](uint64_t a,void *out,size_t n)->uint64_t{for(size_t i=0;i<n;++i)if(!memory.count(a+i))return 0;for(size_t i=0;i<n;++i)((uint8_t*)out)[i]=memory[a+i];return n;};
+ put(0x90000+0x5b0,task);put(0x90000+0x5c0,0xa0000);put(0xa0000+0x150,0xb0000);put(0xb0000,1);
+ auto read64=[&](uint64_t a,uint64_t &v){return read(a,&v,8)==8;};
+ assert(queueTask(0x90000,1,read64)==task);
+ put(0x90000+0x5b0,0);assert(queueTask(0x90000,1,read64)==0); // no internal-task fallback
+ put(0x90000+0x5b0,task);put(task,9);assert(queueTask(0x90000,1,read64)==0);put(task,1);
  Record r{};auto go=[&]{r={};return collect(r,task,res,1,2,3,4,read);};assert(go());assert(r.q[14]==0 && r.q[8]==0x40150000 && r.q[10]==9375744 && r.entry[0x91]==3);
  put(aux+0x30,task+1);assert(go() && r.q[14]==1);put(aux+0x30,task);
  put(map+16,0x40,4);assert(!go());put(map+16,0,4);
