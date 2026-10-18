@@ -133,6 +133,7 @@ static void rightPortPublish() {
 #include "kern_tgl_sample_aux.hpp"
 #include "kern_edp_auxrange_trace.hpp"
 #include "kern_tgl_segment_resources.hpp"
+#include "kern_tgl_c0_entry.hpp"
 #include "kern_tgl_observation_budget.hpp"
 #include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
@@ -261,7 +262,7 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
 static uint64_t tglFailureContextVtable,tglFailureBufferVtable,tglFailureResolveVtable;
 static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
-static uint32_t tglEntryCount;
+static uint32_t tglEntryCount,tglC0EntryCount;
 static bool tglPassThrough(void *,void *,void *,uint32_t,uint8_t,uint8_t);
 static uint32_t tglPassThroughChecks,tglPassThroughEligible,tglPassThroughZero,tglPassThroughSkipped;
 static void tglEntryEnable(void *,void *,uint64_t,void *,void *,uint8_t,uint8_t,bool);
@@ -8811,6 +8812,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(entriesOK){KernelPatcher::RouteRequest route[] {{entryEnable,tglEntryEnable,tglEntryEnableOriginal},{entryResolve,tglEntryResolve,tglEntryResolveOriginal}};
              entriesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEntriesReady",entriesOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0EntriesReady",entriesOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPassThroughReady",entriesOK);
             patcher.clearError();
 
@@ -11904,21 +11906,35 @@ static __attribute__((noinline)) bool tglPassThrough(void *resource,void *entry,
 // native execution. Immutable separate properties keep pre-call evidence available
 // even if execution never returns. No list walking or graphics-state mutation.
 struct TGLEntryRecord {uint64_t q[16];uint8_t entry[0xA0];};
-static void tglEntrySnapshot(unsigned slot,unsigned phase,unsigned op,void *resource,void *entry,
- uint64_t gpu,void *accel,void *task,uint32_t type,uint8_t level,uint8_t face,bool skip,uint64_t result){
- if(slot>=32)return;
+static __attribute__((noinline)) void tglEntrySnapshot(unsigned slot,unsigned phase,unsigned op,void *resource,void *entry,
+ uint64_t gpu,void *accel,void *task,uint32_t type,uint8_t level,uint8_t face,bool skip,uint64_t result,bool c0=false){
+ if(slot>=(c0 ? TGLC0Entry::Capacity : 32U))return;
  TGLEntryRecord r {};r.q[0]=1;r.q[1]=slot;r.q[2]=phase;r.q[3]=op;
  r.q[4]=reinterpret_cast<uint64_t>(resource);r.q[5]=reinterpret_cast<uint64_t>(entry);r.q[6]=gpu;
  r.q[7]=reinterpret_cast<uint64_t>(accel);r.q[8]=reinterpret_cast<uint64_t>(task);
  r.q[9]=type;r.q[10]=level;r.q[11]=face;r.q[12]=skip;r.q[13]=result;
  tglHostClock(r.q+14);r.q[15]=tglAuxTraceRead(r.q[5],r.entry,sizeof(r.entry));
- char key[48];snprintf(key,sizeof(key),"WXEdpEntry%u%c",slot,phase?'B':'A');
+ char key[48];snprintf(key,sizeof(key),c0 ? "WXEdpC0Entry%u%c" : "WXEdpEntry%u%c",slot,phase?'B':'A');
  IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));
 }
+// Capture the entry chosen by the native Metal caller, including alias/default
+// selection performed there. No inferred entry address or GPU address is used.
+// Scratch lives only in this helper, never across the original driver call.
+static __attribute__((noinline)) unsigned tglC0EntrySlot(void *entry){
+ if(__atomic_load_n(&tglC0EntryCount,__ATOMIC_RELAXED)>=TGLC0Entry::Capacity)return UINT32_MAX;
+ uint8_t bytes[0xA0] {};
+ if(tglAuxTraceRead(reinterpret_cast<uint64_t>(entry),bytes,sizeof(bytes))!=sizeof(bytes) ||
+    !TGLC0Entry::eligible(bytes))return UINT32_MAX;
+ const auto slot=__atomic_fetch_add(&tglC0EntryCount,1U,__ATOMIC_RELAXED);
+ return slot<TGLC0Entry::Capacity ? slot : UINT32_MAX;
+}
 static void tglEntryEnable(void *resource,void *entry,uint64_t gpu,void *accel,void *task,uint8_t level,uint8_t face,bool skip){
+ const auto c0=tglC0EntrySlot(entry);
+ tglEntrySnapshot(c0,0,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX,true);
  const auto slot=__atomic_fetch_add(&tglEntryCount,1U,__ATOMIC_RELAXED);
  tglEntrySnapshot(slot,0,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX);
  FunctionCast(tglEntryEnable,tglEntryEnableOriginal)(resource,entry,gpu,accel,task,level,face,skip);
+ tglEntrySnapshot(c0,1,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX,true);
  tglEntrySnapshot(slot,1,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX);
 }
 static bool tglEntryResolve(void *resource,void *entry,void *accel,void *task,uint32_t type,uint8_t level,uint8_t face){
