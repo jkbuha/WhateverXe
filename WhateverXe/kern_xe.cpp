@@ -2782,6 +2782,8 @@ static bool tglResolveAttributesSerialize(void *,void *,OSSerialize *serializer)
 // metadata and requires PS bit8 (TGL PRM vol2d p64; Mesa BLORP AMBIGUATE).
 // This is independent of the userland color-clear optimization. Preserve the
 // native registers/flags and all other resolve modes; no calls or observation.
+// Native-shader A/B trial: preserve all descriptor fixes, allocation/copy and
+// completion storage, but bypass only the experimental KSP substitution.
 extern "C" __attribute__((naked, used)) void tglCCSPSBridge() {
  asm volatile(
   "shll $6, %eax\n orl $2, %eax\n"
@@ -2789,7 +2791,7 @@ extern "C" __attribute__((naked, used)) void tglCCSPSBridge() {
   "1:\n movw %ax, 0xa0(%r15)\n popq %rax\n popfq\n"
   "movw $0x1f80, 0xa2(%r15)\n"
   "movq %r9, 0xac(%r15)\n movq %r9, 0xa4(%r15)\n movl %r9d, 0xb4(%r15)\n"
-  "pushfq\n cmpl $1, _tglResolveNormalEnabled(%rip)\n jne 2f\n"
+  "pushfq\n jmp 2f\n cmpl $1, _tglResolveNormalEnabled(%rip)\n jne 2f\n"
   "cmpl $0, _tglResolveNormalCopies(%rip)\n je 2f\n"
   "cmpl $0x1f8000c2, 0xa0(%r15)\n jne 2f\n"
   "cmpl $1920, 0x0c(%rdx)\n jne 2f\n cmpl $1200, 0x10(%rdx)\n jne 2f\n"
