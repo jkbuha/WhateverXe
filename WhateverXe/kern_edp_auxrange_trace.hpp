@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 namespace EdpAuxRanges {
-constexpr unsigned MaxRecords=128;
+constexpr unsigned MaxRecords=2048;
 struct Record {uint64_t q[16];};
 struct Trace {
  uint32_t count {};Record records[MaxRecords] {};
