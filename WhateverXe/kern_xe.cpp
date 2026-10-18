@@ -11647,10 +11647,10 @@ bool XE::wrapTGLResolveCode(void *pool,void *mapped,void *params,bool mode,const
 // memory maps. The scoped rectangle trial passes a temporary copy only after
 // validating current backing bounds; caller objects remain unchanged.
 // Raw resource fields remain uninterpreted until checked against donor code.
-static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task) {
+static __attribute__((noinline)) bool tglResolveResourcePrepare(void *owner,void *resource,void *params,const void *rects,void *task,uint64_t *trialVector,uint32_t *trialRect) {
  const auto slot=__atomic_fetch_add(&tglResolveResourceCount,1U,__ATOMIC_RELAXED);
  TGLResolveResourceRecord local {};
- uint64_t trialVector[3] {};uint32_t trialRect[4] {};const void *submitRects=rects;
+ bool adjusted=false;
  if((slot<4 || __atomic_load_n(&tglResolveRectangleEnabled,__ATOMIC_ACQUIRE)) && tglVM.nofault){
   auto &r=slot<4 ? tglResolveResources[slot] : local;auto q=r.q;q[0]=2;tglHostClock(q+1);
   q[2]=reinterpret_cast<uint64_t>(owner);q[3]=reinterpret_cast<uint64_t>(resource);
@@ -11682,7 +11682,7 @@ static void tglResolveResourceCapture(void *owner,void *resource,void *params,co
    read(vector[2],rect,sizeof(rect))==sizeof(rect) &&
    EdpResolveRectangle::prepare(q,r.params,r.map,r.memory,vector,rect,trialRect)){
    trialVector[0]=vector[0];trialVector[1]=vector[1];trialVector[2]=reinterpret_cast<uint64_t>(trialRect);
-   submitRects=trialVector;q[9]|=2;
+   adjusted=true;q[9]|=2;
    __atomic_add_fetch(&tglResolveRectangleCount,1U,__ATOMIC_RELEASE);
   }
   if(slot<4 && q[7]==512){
@@ -11698,6 +11698,15 @@ static void tglResolveResourceCapture(void *owner,void *resource,void *params,co
    IORegistryEntry::getRegistryRoot()->setProperty(key,&r,sizeof(r));}
 
  }
+ return adjusted;
+}
+
+static void tglResolveResourceCapture(void *owner,void *resource,void *params,const void *rects,void *task) {
+ // These small caller-owned arrays must outlive the native call; the large
+ // typed snapshots are released when the preparation helper returns.
+ uint64_t trialVector[3] {};uint32_t trialRect[4] {};
+ const bool adjusted=tglResolveResourcePrepare(owner,resource,params,rects,task,trialVector,trialRect);
+ const void *submitRects=adjusted?trialVector:rects;
  FunctionCast(tglResolveResourceCapture,tglResolveResourceOriginal)(owner,resource,params,submitRects,task);
 }
 
@@ -11726,7 +11735,27 @@ static void tglAuxUnmapRange(void *table,const void *range){
 // Diagnostic trial: omit only a full resolve of a never-enabled, unmapped,
 // exact panel layout whose complete CCS allocation is currently zero. CPU
 // reads only; no AUX mapping, page-table mutation, shaders or MMIO changes.
-static bool tglPassThrough(void *resource,void *entry,void *task,uint32_t type,uint8_t level,uint8_t face){
+// Release the page scratch before metadata publication or any native call.
+static __attribute__((noinline)) bool tglPassThroughZeroPages(uint64_t table,uint64_t base){
+ uint64_t root=0;bool zero=true;
+  uint8_t page[4096] {};
+  for(unsigned i=0;i<9;++i){
+   const auto gpu=base+9338880+uint64_t(i)*4096;
+   const auto before=TGLPPGTT::inspect(table,gpu,tglVMRead);
+   if(before.status || !before.rootPhysical || (i && before.rootPhysical!=root) ||
+    before.physical>UINT64_MAX-tglVM.directBase){zero=false;break;}
+   root=before.rootPhysical;const auto cpu=tglVM.directBase+before.physical;
+   if(cpu<tglVM.directBase || cpu>=tglVM.directEnd || tglVM.directEnd-cpu<4096 ||
+    tglVM.nofault(cpu,reinterpret_cast<uint64_t>(page),sizeof(page))!=sizeof(page)){zero=false;break;}
+   const auto after=TGLPPGTT::inspect(table,gpu,tglVMRead);
+   if(memcmp(&before,&after,sizeof(before))){zero=false;break;}
+   for(unsigned j=0;j<4096;++j)if(page[j]){zero=false;break;}
+   if(!zero)break;
+  }
+ return zero;
+}
+
+static __attribute__((noinline)) bool tglPassThrough(void *resource,void *entry,void *task,uint32_t type,uint8_t level,uint8_t face){
  __atomic_add_fetch(&tglPassThroughChecks,1U,__ATOMIC_RELAXED);
  bool skipped=false;
  do {
@@ -11744,21 +11773,7 @@ static bool tglPassThrough(void *resource,void *entry,void *task,uint32_t type,u
   __atomic_add_fetch(&tglPassThroughEligible,1U,__ATOMIC_RELAXED);
   const auto tp=reinterpret_cast<uint64_t>(task);uint64_t table=0;
   if(!tglVMRead(tp+0x260,table))break;
-  const auto base=EdpPassThrough::pair(map+0x98);uint64_t root=0;bool zero=true;
-  uint8_t page[4096] {};
-  for(unsigned i=0;i<9;++i){
-   const auto gpu=base+9338880+uint64_t(i)*4096;
-   const auto before=TGLPPGTT::inspect(table,gpu,tglVMRead);
-   if(before.status || !before.rootPhysical || (i && before.rootPhysical!=root) ||
-    before.physical>UINT64_MAX-tglVM.directBase){zero=false;break;}
-   root=before.rootPhysical;const auto cpu=tglVM.directBase+before.physical;
-   if(cpu<tglVM.directBase || cpu>=tglVM.directEnd || tglVM.directEnd-cpu<4096 ||
-    tglVM.nofault(cpu,reinterpret_cast<uint64_t>(page),sizeof(page))!=sizeof(page)){zero=false;break;}
-   const auto after=TGLPPGTT::inspect(table,gpu,tglVMRead);
-   if(memcmp(&before,&after,sizeof(before))){zero=false;break;}
-   for(unsigned j=0;j<4096;++j)if(page[j]){zero=false;break;}
-   if(!zero)break;
-  }
+  const auto base=EdpPassThrough::pair(map+0x98);const bool zero=tglPassThroughZeroPages(table,base);
   uint64_t later=0;uint8_t laterMap[0x128] {},laterMem[0x198] {};
   if(!zero || !tglVMRead(tp+0x260,later) || later!=table ||
    tglAuxTraceRead(mp,laterMap,sizeof(laterMap))!=sizeof(laterMap) || memcmp(map,laterMap,sizeof(map)) ||
