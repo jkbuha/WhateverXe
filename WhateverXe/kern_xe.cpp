@@ -8852,7 +8852,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             const bool copyGuards[]={entriesOK,segmentOK,xeProfile.identity==0x9A498086U,
              copyAddress==address+0x2BC8E,copyOwner==address+0xD1060,
              !memcmp(reinterpret_cast<void *>(address+0x2BC8E),copyHead,sizeof(copyHead)),
-             copyGrow==address+0x7599C,
+             // The donor has three local symbols with this exact name.
+             // Lilu resolves the first (0x36266); validate its own stride and
+             // array offset as well as the independently pinned copy below.
+             copyGrow==address+0x36266 &&
+              !memcmp(reinterpret_cast<void *>(address+0x3627F),"\x48\xC1\xE7\x05",4) &&
+              !memcmp(reinterpret_cast<void *>(address+0x36290),"\x49\x8B\x7F\x10",4),
              !memcmp(reinterpret_cast<void *>(address+0x759B5),"\x48\xC1\xE7\x05",4),
              !memcmp(reinterpret_cast<void *>(address+0x759C6),"\x49\x8B\x7F\x10",4)};
             uint64_t copySetup[16]={1,0,0x1FF,0,0,UINT64_MAX,
