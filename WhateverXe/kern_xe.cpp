@@ -136,6 +136,7 @@ static void rightPortPublish() {
 #include "kern_tgl_c0_entry.hpp"
 #include "kern_tgl_c0_fresh.hpp"
 #include "kern_tgl_blit_copies.hpp"
+#include "kern_tgl_surface_receipts.hpp"
 #include "kern_tgl_observation_budget.hpp"
 #include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
@@ -259,6 +260,27 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
  bool ok=data->appendBytes(h,sizeof(h));const EdpAuxRanges::Record empty {};
  for(unsigned i=0;i<EdpAuxRanges::MaxRecords;++i){const auto r=tglAuxRanges.published(i);ok=ok && data->appendBytes(r?r:&empty,sizeof(empty));}
  if(ok)ok=data->serialize(serializer);data->release();return ok;
+}
+
+static uint64_t tglAuxTraceRead(uint64_t,void *,size_t);
+static bool tglSurfaceReceiptsReady;
+static uint32_t tglSurfaceReceiptCounts[2],tglSurfaceReceiptAttempts[2];
+static TGLSurfaceReceipts::Record tglSurfaceReceipts[2][TGLSurfaceReceipts::Capacity] {};
+static __attribute__((noinline)) void tglSurfaceReceipt(void *,void *,uint32_t *,uint32_t,uint64_t);
+static bool tglSurfaceReceiptSerialize(void *,void *,OSSerialize *serializer){
+ const uint64_t h[]={1,__atomic_load_n(tglSurfaceReceiptCounts,__ATOMIC_ACQUIRE),
+  __atomic_load_n(tglSurfaceReceiptCounts+1,__ATOMIC_ACQUIRE),TGLSurfaceReceipts::Capacity,sizeof(TGLSurfaceReceipts::Record),tglAuxDonorBegin};
+ auto data=OSData::withCapacity(sizeof(h)+sizeof(tglSurfaceReceipts));if(!data)return false;
+ bool ok=data->appendBytes(h,sizeof(h));const TGLSurfaceReceipts::Record empty {};
+ for(unsigned k=0;k<2;++k)for(unsigned i=0;i<TGLSurfaceReceipts::Capacity;++i){const auto &r=tglSurfaceReceipts[k][i];
+  ok=ok && data->appendBytes(__atomic_load_n(r.q+23,__ATOMIC_ACQUIRE)?&r:&empty,sizeof(r));}
+ if(ok)ok=data->serialize(serializer);data->release();return ok;
+}
+static bool tglSurfaceReceiptProgressSerialize(void *,void *,OSSerialize *serializer){
+ const uint64_t q[]={1,__atomic_load_n(tglSurfaceReceiptAttempts,__ATOMIC_RELAXED),
+  __atomic_load_n(tglSurfaceReceiptAttempts+1,__ATOMIC_RELAXED),TGLSurfaceReceipts::Attempts};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
 static uint64_t tglFailureContextVtable,tglFailureBufferVtable,tglFailureResolveVtable;
@@ -8912,6 +8934,14 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentReady",auxAlignOK);
+            tglSurfaceReceiptsReady=auxAlignOK && segmentOK && entriesOK && tglC0FreshReady &&
+             xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-probe") && checkKernelArgument("-wex-edp-routing");
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSurfaceReceiptsReady",tglSurfaceReceiptsReady);
+            if(tglSurfaceReceiptsReady)if(auto live=OSSerializer::forTarget(nullptr,tglSurfaceReceiptSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSurfaceReceipts",live);live->release();}
+            if(tglSurfaceReceiptsReady)if(auto live=OSSerializer::forTarget(nullptr,tglSurfaceReceiptProgressSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSurfaceReceiptProgress",live);live->release();}
+
 			if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
 			}
@@ -11748,11 +11778,36 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
  FunctionCast(wrapTGLHangRingDump,callbackXE->orgTGLHangRingDump)(ring,registers);
 }
 
+// CPU-only observation after the existing native helper and alignment policy.
+// No scratch survives across a native call; stop heavy reads at a fixed budget.
+static __attribute__((noinline)) void tglSurfaceReceipt(void *resource,void *entry,uint32_t *surface,uint32_t intent,uint64_t caller){
+ if(!tglSurfaceReceiptsReady)return;
+ const auto kind=TGLSurfaceReceipts::kind(reinterpret_cast<const uint8_t *>(surface));
+ if(kind>1 || __atomic_load_n(tglSurfaceReceiptCounts+kind,__ATOMIC_RELAXED)>=TGLSurfaceReceipts::Capacity ||
+    __atomic_load_n(tglSurfaceReceiptAttempts+kind,__ATOMIC_RELAXED)>=TGLSurfaceReceipts::Attempts)return;
+ const auto attempt=__atomic_fetch_add(tglSurfaceReceiptAttempts+kind,1U,__ATOMIC_RELAXED);
+ if(attempt>=TGLSurfaceReceipts::Attempts)return;
+ TGLSurfaceReceipts::Record local {};
+ if(!TGLSurfaceReceipts::collect(local,reinterpret_cast<uint64_t>(resource),reinterpret_cast<uint64_t>(entry),
+    reinterpret_cast<uint64_t>(surface),tglSegmentResourceClass,tglResolveMapVtable,tglSegmentTaskClass,tglAuxTableVtable,tglAuxTraceRead))return;
+ local.q[2]=intent;local.q[6]=caller;
+ for(unsigned i=0;i<TGLSurfaceReceipts::Capacity;++i){const auto &r=tglSurfaceReceipts[kind][i];
+  if(__atomic_load_n(r.q+23,__ATOMIC_ACQUIRE) && r.q[3]==local.q[3] && r.q[4]==local.q[4] &&
+     r.q[15]==local.q[15] && r.q[16]==local.q[16] && r.q[18]==local.q[18] && r.q[19]==local.q[19] && r.q[20]==local.q[20] && r.q[21]==local.q[21] &&
+     r.q[2]==local.q[2] && r.q[6]==local.q[6] && r.q[22]==local.q[22] &&
+     !memcmp(r.entry,local.entry,sizeof(r.entry)) && !memcmp(r.surface,local.surface,sizeof(r.surface)))return;}
+ const auto slot=__atomic_fetch_add(tglSurfaceReceiptCounts+kind,1U,__ATOMIC_RELAXED);
+ if(slot>=TGLSurfaceReceipts::Capacity)return;
+ local.q[1]=slot;local.q[2]=intent;local.q[6]=caller;tglHostClock(local.q+7);
+ auto &r=tglSurfaceReceipts[kind][slot];memcpy(&r,&local,sizeof(r));__atomic_store_n(r.q+23,1ULL,__ATOMIC_RELEASE);
+}
+
 void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t intent) {
  FunctionCast(wrapTGLSurfaceAux,callbackXE->orgTGLSurfaceAux)(resource,entry,surface,intent);
  __atomic_fetch_add(&tglCCSAlignmentCounts[0],1,__ATOMIC_RELAXED);
  if ((surface[6]&7U)==5) __atomic_fetch_add(&tglCCSAlignmentCounts[1],1,__ATOMIC_RELAXED);
  if (tglCorrectCCSAlignment(surface)) __atomic_fetch_add(&tglCCSAlignmentCounts[2],1,__ATOMIC_RELAXED);
+ tglSurfaceReceipt(resource,entry,surface,intent,reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 static void tglResolveCodeSnapshot(unsigned phase,void *context,void *pool,void *mapped,void *params,bool result) {
