@@ -130,6 +130,7 @@ static void rightPortPublish() {
 #include "kern_tgl_render_window.hpp"
 #include "kern_edp_compression_capture.hpp"
 #include "kern_edp_auxmap_capture.hpp"
+#include "kern_tgl_sample_aux.hpp"
 #include "kern_edp_auxrange_trace.hpp"
 #include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
@@ -11361,6 +11362,83 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
     refs->q[1]=owned && ctx==c->q[5] && lrc==c->q[10] && table==c->q[8] &&
      id==c->q[6] && root==c->q[11] && !final.status && final.rootPhysical==c->q[12] ? 0 : 2;
     if(refs->q[1]==0){
+     // Observe the compressed source's actual per-task AUX table. This runs
+     // only after the existing first-fault context/reference ownership checks.
+     uint64_t sourceGPU=0;
+     auto reference=[&](uint64_t address,void *to,size_t n){
+      if(!address || address>>47 || (address&4095)>4096-n)return false;
+      for(unsigned i=0;i<refs->q[6] && i<TGLHangRefs::MaxPages;++i){
+       const auto &p=refs->pages[i];
+       if(p.q[0]==(address&~4095ULL) && p.q[2]==4096 && p.q[3]==1 && !p.q[4]){
+        memcpy(to,p.bytes+(address&4095),n);return true;
+       }
+      }
+      return false;
+     };
+     if(refs->q[8]==0 && refs->q[9] && refs->q[12])for(unsigned i=0;i<32 && !sourceGPU;++i){
+      uint32_t offset=0,state[16] {};
+      if(!reference(refs->q[9]+refs->q[12]+4*i,&offset,4) || !offset || (offset&63) ||
+         !reference(refs->q[9]+offset,state,sizeof(state)))continue;
+      if((state[0]>>29)!=1 || ((state[0]>>18)&511)!=0xC0 || ((state[0]>>12)&3)!=3 ||
+         (state[6]&7)!=5 || (state[2]&0x3FFF)!=1919 || ((state[2]>>16)&0x3FFF)!=1199 ||
+         (state[3]&0x3FFFF)!=7679)continue;
+      memcpy(&sourceGPU,state+8,8);
+      if(sourceGPU&65535)sourceGPU=0;
+     }
+     if(sourceGPU && tglAuxTableVtable && tglResolveMapVtable){
+      auto sample=static_cast<TGLSampleAux::Capture *>(IOMalloc(sizeof(TGLSampleAux::Capture)));
+      if(sample){
+       bzero(sample,sizeof(*sample));auto q=sample->q;q[0]=1;q[1]=8;
+       q[2]=sourceGPU;q[3]=sourceGPU+9338880;q[8]=c->q[7];q[9]=c->q[5];q[11]=c->q[12];
+       auto copy=[](uint64_t a,void *to,size_t n)->uint64_t {
+        return (a>>47)==0x1FFFF && a<=UINT64_MAX-n ? tglVM.nofault(a,reinterpret_cast<uint64_t>(to),n):0;
+       };
+       uint64_t vt=0;
+       const bool metadata=tglVMRead(q[8]+0x278,q[6]) && tglVMRead(q[6],vt) && vt==tglAuxTableVtable &&
+        copy(q[6],sample->object,sizeof(sample->object))==sizeof(sample->object);
+       if(metadata){
+        memcpy(q+7,sample->object+0x30,8);memcpy(q+10,sample->object+0x18,8);memcpy(q+12,sample->object+0x10,8);
+        uint32_t flags=0;
+        if(tglVMRead(q[12],vt) && vt==tglResolveMapVtable &&
+           copy(q[12],sample->map,sizeof(sample->map))==sizeof(sample->map)){
+         memcpy(&flags,sample->map+16,4);q[15]=flags;
+         if(!(flags&0x40))memcpy(q+4,sample->map+0x98,8);
+        }
+        q[26]=copy(c->q[10],sample->lrc,sizeof(sample->lrc));
+        if(q[26]==sizeof(sample->lrc))for(unsigned o=0;o+4<=sizeof(sample->lrc);o+=4){
+         const auto h=TGLHangRefs::word(sample->lrc+o);const unsigned n=(h&255)+2;
+         if((h&0xFF800000)!=0x11000000 || !(n&1) || n>(sizeof(sample->lrc)-o)/4)continue;
+         bool lo=false,hi=false;uint32_t l=0,u=0;
+         for(unsigned j=1;j+1<n;j+=2){const auto reg=TGLHangRefs::word(sample->lrc+o+j*4),v=TGLHangRefs::word(sample->lrc+o+(j+1)*4);
+          if(reg==0x4200){lo=true;l=v;}if(reg==0x4204){hi=true;u=v;}}
+         if(lo && hi){const uint64_t root=(uint64_t(u)<<32)|l;
+          if(q[5] && q[5]!=root){q[5]=UINT64_MAX;break;}q[5]=root;}
+        }
+        TGLSampleAux::collect(*sample,pageRead);
+        auto &native=sample->pages[3];native.q[0]=q[10];native.q[1]=0x200;
+        if(q[10] && !(q[10]&4095))native.q[2]=copy(q[10],native.bytes,4096);
+        q[23]=native.q[2]==4096 && sample->pages[0].q[2]==4096 &&
+         sample->pages[0].q[0]==q[4] && !memcmp(native.bytes,sample->pages[0].bytes,4096);
+       }
+       uint64_t ctx=0,task=0,table=0,aux=0,map=0,cpu=0,lrc=0,id=0,root=0,tableOwner=0,gpu=0,finalFlags=0;
+       q[24]=metadata && tglVMRead(actualRing+0x20,ctx) && ctx==q[9] &&
+        tglVMRead(actualRing+0x18,lrc) && lrc==c->q[10] &&
+        tglVMRead(ctx+0x58,task) && task==q[8] && read32(ctx+0x7C,id) && id==c->q[6] &&
+        lrcRoot(lrc,root) && root==q[11] &&
+        tglVMRead(task+0x260,table) && table==c->q[8] &&
+        tglVMRead(task+0x278,aux) && aux==q[6] && tglVMRead(aux,vt) && vt==tglAuxTableVtable &&
+        tglVMRead(aux+0x10,map) && map==q[12] && tglVMRead(map,vt) && vt==tglResolveMapVtable &&
+        tglVMRead(aux+0x18,cpu) && cpu==q[10] &&
+        tglVMRead(aux+0x30,tableOwner) && tableOwner==q[7] &&
+        read32(map+16,finalFlags) && finalFlags==q[15] && !(finalFlags&0x40) &&
+        tglVMRead(map+0x98,gpu) && gpu==q[4];
+       if(q[24]){const auto verify=TGLPPGTT::inspect(table,sourceGPU,tglVMRead);
+        q[24]=!verify.status && verify.rootPhysical==q[11];}
+       q[25]=q[1];if(!q[24])q[1]=9;
+       IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSampleAux0",sample,sizeof(*sample));
+       IOFree(sample,sizeof(*sample));
+      }
+     }
      auto compression=static_cast<EdpCompression::Capture *>(IOMalloc(sizeof(EdpCompression::Capture)));
      if(compression){
       bzero(compression,sizeof(*compression));
