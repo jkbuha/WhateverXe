@@ -11322,7 +11322,6 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
    TGLRenderWindow::collect(*window,c->q[2]&~3ULL,owned,readPage);
    tglHostClock(window->q+9);
    IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRenderWindow0",window,sizeof(*window));
-   IOFree(window,sizeof(*window));
   }
   bool pagesOK=true;
   for(unsigned i=0;i<4;++i) pagesOK=pagesOK && c->stable[i];
@@ -11355,6 +11354,22 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
      haveInherited=true;refs->q[30]=init.q[1];refs->q[31]=0x494E4954;break;
     }
     TGLHangRefs::collect(*refs,c->bytes[0],sizeof(c->bytes),c->q[13],c->q[2]&~3ULL,pageRead,haveInherited?inherited:nullptr);
+    // A state-base anchor can lie outside the four-page legacy receipt.
+    // Only a complete, owned and stable window is eligible; no holes are
+    // silently treated as zero. Heap scratch avoids adding kernel-stack load.
+    // Retained linear state remains a candidate, not proof of GPU execution.
+    if(refs->q[8]==1 && window && !window->q[6] &&
+       window->q[4]==0xFFFFFFFFULL && window->q[5]==0xFFFFFFFFULL) {
+     constexpr unsigned bytes=TGLRenderWindow::Pages*4096;
+     auto raw=static_cast<uint8_t *>(IOMalloc(bytes));
+     if(raw){
+      for(unsigned i=0;i<TGLRenderWindow::Pages;++i)memcpy(raw+i*4096,window->pages[i].bytes,4096);
+      bzero(refs,sizeof(*refs));refs->q[1]=1;tglHostClock(refs->q+2);
+      TGLHangRefs::collect(*refs,raw,bytes,window->q[2],c->q[2]&~3ULL,pageRead);
+      IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRefsWide0",true);
+      IOFree(raw,bytes);
+     }
+    }
     uint64_t ctx=0,lrc=0,table=0,id=0,root=0;
     const bool owned=tglVMRead(actualRing+0x20,ctx) && tglVMRead(actualRing+0x18,lrc) &&
      tglVMRead(c->q[7]+0x260,table) && read32(c->q[5]+0x7C,id) && lrcRoot(c->q[10],root);
@@ -11479,6 +11494,7 @@ void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs
     IOFree(refs,sizeof(*refs));
    }
   }
+  if(window)IOFree(window,sizeof(*window));
  }
  char key[32];snprintf(key,sizeof(key),"TGLHangAddress%u",slot);
  IORegistryEntry::getRegistryRoot()->setProperty(key,c,sizeof(*c));IOFree(c,sizeof(*c));

@@ -31,7 +31,7 @@ inline unsigned length(uint32_t w) {
 // Probe a structural anchor; payload coincidences and unresolved external state
 // still require offline validation. No reference is interpreted as executable.
 inline bool walkable(const uint8_t *b,unsigned n,unsigned begin,unsigned end) {
- for (unsigned o=begin,steps=0;o<=end && steps++<4096;) {
+ for (unsigned o=begin,steps=0;o<=end && steps++<32768;) {
   if (o==end) return true;
   if (o+4>n) return false;
   unsigned dw=length(word(b+o));
@@ -44,7 +44,7 @@ template<class ReadPage>
 void collect(Capture &c,const uint8_t *batch,unsigned n,uint64_t base,uint64_t bb,ReadPage read,const uint64_t *inherited=nullptr) {
  c.q[0]=131;c.q[3]=base;c.q[4]=bb;
  c.q[8]=1;
- if (n>16384 || n<88 || bb<base || bb-base>n-4 || ((bb-base)&3)) return;
+ if (n>131072 || n<88 || bb<base || bb-base>n-4 || ((bb-base)&3)) return;
  const unsigned end=static_cast<unsigned>(bb-base);unsigned anchor=n;
  for (unsigned o=0;o+88<=n && o<=end;o+=4)
   if (word(batch+o)==0x61010014 && walkable(batch,n,o,end)) anchor=o;
