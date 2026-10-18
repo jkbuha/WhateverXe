@@ -134,6 +134,7 @@ static void rightPortPublish() {
 #include "kern_edp_auxrange_trace.hpp"
 #include "kern_tgl_segment_resources.hpp"
 #include "kern_tgl_c0_entry.hpp"
+#include "kern_tgl_c0_fresh.hpp"
 #include "kern_tgl_observation_budget.hpp"
 #include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
@@ -262,7 +263,8 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
 static uint64_t tglFailureContextVtable,tglFailureBufferVtable,tglFailureResolveVtable;
 static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
-static uint32_t tglEntryCount,tglC0EntryCount;
+static uint32_t tglEntryCount,tglC0EntryCount,tglC0FreshCount;
+static bool tglC0FreshReady;
 static bool tglPassThrough(void *,void *,void *,uint32_t,uint8_t,uint8_t);
 static uint32_t tglPassThroughChecks,tglPassThroughEligible,tglPassThroughZero,tglPassThroughSkipped;
 static void tglEntryEnable(void *,void *,uint64_t,void *,void *,uint8_t,uint8_t,bool);
@@ -8813,6 +8815,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              entriesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);}
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEntriesReady",entriesOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0EntriesReady",entriesOK);
+            // Exact native AUX_NONE selection and zero-CCS resolve fast path.
+            tglC0FreshReady=entriesOK && segmentOK &&
+             !memcmp(reinterpret_cast<void *>(address+0x73FC6),"\xF6\x86\x91\x00\x00\x00\x02",7) &&
+             !memcmp(reinterpret_cast<void *>(address+0x73FD2),"\x83\xE0\xF8\x89\x42\x18",6) &&
+             !memcmp(reinterpret_cast<void *>(address+0x73B31),"\x41\x83\x7E\x44\x00",5);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0UncompressedReady",tglC0FreshReady);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPassThroughReady",entriesOK);
             patcher.clearError();
 
@@ -11928,12 +11936,65 @@ static __attribute__((noinline)) unsigned tglC0EntrySlot(void *entry){
  const auto slot=__atomic_fetch_add(&tglC0EntryCount,1U,__ATOMIC_RELAXED);
  return slot<TGLC0Entry::Capacity ? slot : UINT32_MAX;
 }
+// All nofault copies and validation scratch return before native execution.
+static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void *entry,uint64_t gpu,void *task,uint8_t level,uint8_t face){
+ if(!tglC0FreshReady || level || face)return false;
+ uint8_t e[160] {},r[0x108] {},m[0x128] {};
+ const auto rp=reinterpret_cast<uint64_t>(resource),ep=reinterpret_cast<uint64_t>(entry),tp=reinterpret_cast<uint64_t>(task);
+ if(tglAuxTraceRead(ep,e,sizeof(e))!=sizeof(e) || !TGLC0Entry::eligible(e))return false;
+ uint64_t q[16] {1,1,rp,0,ep,tp,gpu};bool changed=false;
+ auto get=[&](uint64_t a,uint64_t &v){return tglAuxTraceRead(a,&v,8)==8;};uint64_t vt=0,memory=0,storageMap=0,later=0;
+ do {
+  if(!TGLC0Fresh::fresh(e))break;
+  q[1]=2;
+  if(!tglSegmentResourceClass || !tglSegmentTaskClass || !tglResolveMapVtable || !tglResolveMemoryVtable ||
+     !get(tp,vt) || vt!=tglSegmentTaskClass ||
+     tglAuxTraceRead(rp,r,sizeof(r))!=sizeof(r) || TGLC0Fresh::pair(r)!=tglSegmentResourceClass)break;
+  q[3]=TGLC0Fresh::storage(rp,r);q[9]=r[0x14];q[1]=3;
+  if(!q[3] || q[3]>UINT64_MAX-0x238 || q[3]+0x180!=ep ||
+     !get(q[3],vt) || vt!=tglSegmentResourceClass ||
+     tglAuxTraceRead(q[3]+0x14,q+10,1)!=1 || (q[10]&15) ||
+     !get(q[3]+0x230,q[11]) || q[11] || !get(q[3]+0x40,storageMap))break;
+  q[7]=TGLC0Fresh::pair(r+0x40);q[1]=4;
+  if(!q[7] || q[7]!=storageMap || !get(q[7],vt) || vt!=tglResolveMapVtable ||
+     tglAuxTraceRead(q[7],m,sizeof(m))!=sizeof(m))break;
+  q[12]=TGLC0Fresh::pair(m+0x90);q[13]=TGLC0Fresh::pair(m+0x98);
+  memory=TGLC0Fresh::pair(m+0x18);q[1]=5;
+  if(!get(memory,vt) || vt!=tglResolveMemoryVtable || !get(memory+0x40,q[8]) ||
+     !TGLC0Fresh::map(m,tp,gpu,q[8]))break;
+  // The base must be the exact address passed by native get_tex_data+offset.
+  // Reject suballocations rather than guessing the view's bounds.
+  if((r[0x14]==0 || r[0x14]==0x80) && TGLC0Fresh::pair(r+0xF8))break;
+  if(r[0x14]==0x82 && TGLC0Entry::word(r+0xFC))break;
+  q[1]=6;uint8_t laterType=0;uint32_t laterOffset=0;
+  if(!get(tp,vt) || vt!=tglSegmentTaskClass ||
+     tglAuxTraceRead(rp+0x14,&laterType,1)!=1 || laterType!=r[0x14] ||
+     tglAuxTraceRead(q[3]+0x14,&laterType,1)!=1 || laterType!=q[10] ||
+     !get(q[3],vt) || vt!=tglSegmentResourceClass ||
+     !get(q[7],vt) || vt!=tglResolveMapVtable ||
+     !get(memory,vt) || vt!=tglResolveMemoryVtable ||
+     !get(q[7]+0x18,later) || later!=memory || !get(q[7]+0x10,later) || (later&0x40) ||
+     ((r[0x14]==0 || r[0x14]==0x80) && (!get(rp+0xF8,later) || later)) ||
+     (r[0x14]==0x82 && (tglAuxTraceRead(rp+0xFC,&laterOffset,4)!=4 || laterOffset)) ||
+     !get(rp,vt) || vt!=tglSegmentResourceClass || !get(rp+0x40,later) || later!=q[7] ||
+     (r[0x14]==0x82 && (!get(rp+0xE0,later) || later!=q[3])) ||
+     !get(q[3]+0x40,later) || later!=q[7] || !get(q[3]+0x230,later) || later ||
+     !get(q[7]+0x90,later) || later!=tp || !get(q[7]+0x98,later) || later!=gpu ||
+     !get(memory+0x40,later) || later!=q[8])break;
+  changed=TGLC0Fresh::disable(static_cast<uint8_t *>(entry),e);q[1]=changed?0:7;
+ }while(false);
+ q[15]=changed;
+ const auto n=__atomic_fetch_add(&tglC0FreshCount,1U,__ATOMIC_RELAXED);
+ if(n<32){char key[48];snprintf(key,sizeof(key),"WXEdpC0Uncompressed%u",n);IORegistryEntry::getRegistryRoot()->setProperty(key,q,sizeof(q));}
+ return changed;
+}
 static void tglEntryEnable(void *resource,void *entry,uint64_t gpu,void *accel,void *task,uint8_t level,uint8_t face,bool skip){
  const auto c0=tglC0EntrySlot(entry);
  tglEntrySnapshot(c0,0,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX,true);
  const auto slot=__atomic_fetch_add(&tglEntryCount,1U,__ATOMIC_RELAXED);
  tglEntrySnapshot(slot,0,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX);
- FunctionCast(tglEntryEnable,tglEntryEnableOriginal)(resource,entry,gpu,accel,task,level,face,skip);
+ if(!tglC0KeepUncompressed(resource,entry,gpu,task,level,face))
+  FunctionCast(tglEntryEnable,tglEntryEnableOriginal)(resource,entry,gpu,accel,task,level,face,skip);
  tglEntrySnapshot(c0,1,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX,true);
  tglEntrySnapshot(slot,1,1,resource,entry,gpu,accel,task,0,level,face,skip,UINT64_MAX);
 }
