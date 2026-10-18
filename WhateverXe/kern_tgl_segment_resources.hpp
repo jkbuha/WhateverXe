@@ -27,11 +27,14 @@ template<class Read> bool collect(Record &r,uint64_t task,uint64_t resource,
     !get(resource+0x230,q[6]))return false;
  if(!q[6])q[6]=resource+0x180;
  if(read(q[6],r.entry,sizeof(r.entry))!=sizeof(r.entry) || !layout(r.entry) ||
-    !get(resource+0x40,q[7]) || !get(q[7],vt) || vt!=mapClass ||
-    read(q[7],r.map,sizeof(r.map))!=sizeof(r.map))return false;
+    !get(resource+0x40,q[7]) || !get(q[7],vt))return false;
+ // Preserve a scoped decline receipt rather than silently losing the target.
+ // Unknown classes retain only their vtable word, never presumed fields.
+ if(vt!=mapClass){memcpy(r.map,&vt,8);q[14]=2;return true;}
+ if(read(q[7],r.map,sizeof(r.map))!=sizeof(r.map)){q[14]=5;return true;}
  q[8]=pair(r.map+0x98);q[9]=pair(r.map+0x18);
- if(!q[8] || q[8]>>47 || (q[8]&65535) || (word(r.map+16)&0x40) ||
-    !get(task+0x278,q[11]) || !get(q[11],vt) || vt!=auxClass)return false;
+ if(!q[8] || q[8]>>47 || (q[8]&65535) || (word(r.map+16)&0x40)){q[14]=3;return true;}
+ if(!get(task+0x278,q[11]) || !get(q[11],vt) || vt!=auxClass){q[14]=4;return true;}
  get(q[9]+0x40,q[10]);get(q[11]+0x20,q[12]);get(q[11]+0x18,q[13]);
  uint64_t ptr=0,map=0,gpu=0,aux=0,owner=0;uint8_t after[160] {};
  const bool current=get(resource+0x230,ptr) && (ptr?ptr:resource+0x180)==q[6] &&

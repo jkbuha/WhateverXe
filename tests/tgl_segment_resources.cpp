@@ -20,8 +20,9 @@ int main(){
  put(0x90000+0x5b0,task);put(task,9);assert(queueTask(0x90000,1,read64)==0);put(task,1);
  Record r{};auto go=[&]{r={};return collect(r,task,res,1,2,3,4,read);};assert(go());assert(r.q[14]==0 && r.q[8]==0x40150000 && r.q[10]==9375744 && r.entry[0x91]==3);
  put(aux+0x30,task+1);assert(go() && r.q[14]==1);put(aux+0x30,task);
- put(map+16,0x40,4);assert(!go());put(map+16,0,4);
+ put(map+16,0x40,4);assert(go() && r.q[14]==3);put(map+16,0,4);
  put(entry+0x10,0xd1,4);assert(!go());put(entry+0x10,0xc0,4);
+ put(map,99);assert(go() && r.q[14]==2);put(map,3);
  put(task,99);assert(!go());put(task,1);
  memory.erase(entry+100);assert(!go());
 }

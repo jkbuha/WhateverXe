@@ -133,6 +133,7 @@ static void rightPortPublish() {
 #include "kern_tgl_sample_aux.hpp"
 #include "kern_edp_auxrange_trace.hpp"
 #include "kern_tgl_segment_resources.hpp"
+#include "kern_tgl_observation_budget.hpp"
 #include "kern_edp_passthrough.hpp"
 #include "kern_tgl_recovery.hpp"
 
@@ -219,7 +220,15 @@ static mach_vm_address_t tglResolveResourceOriginal;
 static uint32_t tglResolveResourceCount;
 static EdpAuxRanges::Trace tglAuxRanges;
 static mach_vm_address_t tglAuxMapOriginal,tglAuxUnmapOriginal;
-static mach_vm_address_t tglSegmentOriginal;
+static mach_vm_address_t tglMetalOriginal;
+static TGLObservationBudget::Budget tglMetalBudget;
+static bool tglMetalBudgetSerialize(void *,void *,OSSerialize *serializer){
+ const uint64_t h[]={1,TGLObservationBudget::Tasks,TGLObservationBudget::Limit};
+ auto data=OSData::withCapacity(sizeof(h)+sizeof(tglMetalBudget.slots));if(!data)return false;
+ bool ok=data->appendBytes(h,sizeof(h));
+ for(const auto &s:tglMetalBudget.slots){const uint64_t q[]={__atomic_load_n(&s.task,__ATOMIC_ACQUIRE),__atomic_load_n(&s.calls,__ATOMIC_RELAXED)};ok=ok && data->appendBytes(q,sizeof(q));}
+ if(ok)ok=data->serialize(serializer);data->release();return ok;
+}
 static uint64_t tglSegmentTaskClass,tglSegmentResourceClass,tglSegmentListClass;
 static TGLSegmentResources::Record tglSegmentRecords[TGLSegmentResources::Capacity];
 static uint32_t tglSegmentCount;
@@ -229,7 +238,7 @@ static bool tglSegmentProgressSerialize(void *,void *,OSSerialize *serializer){
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
-static uint64_t tglSegmentProcess(void *,void *,const void *,const void *);
+static uint64_t tglMetalProcess(uint32_t,void *,void *,const void *,void *,void *,void *,void *,void *);
 static bool tglSegmentSerialize(void *,void *,OSSerialize *serializer){
  const uint64_t h[]={1,__atomic_load_n(&tglSegmentCount,__ATOMIC_ACQUIRE),TGLSegmentResources::Capacity,sizeof(TGLSegmentResources::Record)};
  auto data=OSData::withCapacity(sizeof(h)+sizeof(tglSegmentRecords));if(!data)return false;
@@ -8757,12 +8766,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              rangesOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpAuxRangesReady",rangesOK);
-            const char *segment="__ZN19IGAccelCommandQueue14processSegmentEP26IOAccelSegmentResourceListPK20IOAccelKernelCommandS4_";
-            const uint8_t segmentHead[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18};
+            const char *segment="__ZN23IntelMTLRenderFunctions7executeEN14IntelMTLRender7eTokensER19IGAccelCommandQueueR26IGAccelSegmentResourceListRK20IOAccelKernelCommandR24IGAccelCommandDescriptorR13IGHeapsAccessR22IOGraphicsAccelerator2R17IGHardwareContextR12IOAccelEvent";
+            const uint8_t segmentHead[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0xF8,0,0,0};
             bool segmentOK=rangesOK && xeProfile.identity==0x9A498086U &&
              checkKernelArgument("-wex-edp-probe") && checkKernelArgument("-wex-edp-routing") &&
-             patcher.solveSymbol<mach_vm_address_t>(index,segment,address,size)==address+0x2F3BC &&
-             !memcmp(reinterpret_cast<void *>(address+0x2F3BC),segmentHead,sizeof(segmentHead)) &&
+             patcher.solveSymbol<mach_vm_address_t>(index,segment,address,size)==address+0x4F1F0 &&
+             !memcmp(reinterpret_cast<void *>(address+0x4F1F0),segmentHead,sizeof(segmentHead)) &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK19IOAccelCommandQueue10getGPUTaskEv",address,size)==address+0x30064 &&
              !memcmp(reinterpret_cast<void *>(address+0x30064),"\x55\x48\x89\xE5\x48\x8B\x87\xB0\x05\x00\x00\x5D\xC3",13) &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV11IGAccelTask",address,size)==address+0xCA5E0 &&
@@ -8771,10 +8780,13 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             patcher.clearError();
             if(segmentOK){
              tglSegmentTaskClass=address+0xCA5F0;tglSegmentResourceClass=address+0xD93E0;tglSegmentListClass=address+0xD9168;
-             KernelPatcher::RouteRequest route[] {{segment,tglSegmentProcess,tglSegmentOriginal}};
+             KernelPatcher::RouteRequest route[] {{segment,tglMetalProcess,tglMetalOriginal}};
              segmentOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSegmentResourcesReady",segmentOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpMetalResourcesReady",segmentOK);
+            if(segmentOK)if(auto live=OSSerializer::forTarget(nullptr,tglMetalBudgetSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpMetalBudget",live);live->release();}
             if(segmentOK)if(auto live=OSSerializer::forTarget(nullptr,tglSegmentProgressSerialize)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXEdpSegmentProgress",live);live->release();}
             if(segmentOK)if(auto live=OSSerializer::forTarget(nullptr,tglSegmentSerialize)){
@@ -11776,12 +11788,14 @@ static uint64_t tglAuxTraceRead(uint64_t a,void *to,size_t n){
 
 // Release all observation scratch before the original native call. No extra
 // GPU work, mappings, virtual calls, locks or changes to resource metadata.
-static __attribute__((noinline)) void tglSegmentObserve(void *queue,void *list){
+static __attribute__((noinline)) void tglSegmentObserve(void *queue,void *list,void *context){
  const auto q=reinterpret_cast<uint64_t>(queue),l=reinterpret_cast<uint64_t>(list);
  __atomic_fetch_add(tglSegmentProgress,1ULL,__ATOMIC_RELAXED);
  const auto task=TGLSegmentResources::queueTask(q,tglSegmentTaskClass,tglVMRead);
- if(!task)return;
+ uint64_t contextTask=0;
+ if(!task || !tglVMRead(reinterpret_cast<uint64_t>(context)+0x58,contextTask) || contextTask!=task)return;
  __atomic_fetch_add(tglSegmentProgress+1,1ULL,__ATOMIC_RELAXED);
+ if(!tglMetalBudget.allow(task))return;
  uint64_t vt=0,array=0,count=0;
  if(!tglVMRead(l,vt) || vt!=tglSegmentListClass ||
     !tglVMRead(l+0x10,array) || !tglVMRead(l+8,count))return;
@@ -11806,9 +11820,12 @@ static __attribute__((noinline)) void tglSegmentObserve(void *queue,void *list){
   memcpy(&r,&local,sizeof(r));__atomic_store_n(r.q+15,1ULL,__ATOMIC_RELEASE);
  }
 }
-static uint64_t tglSegmentProcess(void *queue,void *list,const void *begin,const void *end){
- tglSegmentObserve(queue,list);
- return FunctionCast(tglSegmentProcess,tglSegmentOriginal)(queue,list,begin,end);
+// Static native method: six register arguments and three stack arguments.
+// Preserve the original arguments/result; observation scratch returns first.
+static uint64_t tglMetalProcess(uint32_t token,void *queue,void *list,const void *command,
+ void *descriptor,void *heaps,void *accel,void *context,void *event){
+ tglSegmentObserve(queue,list,context);
+ return FunctionCast(tglMetalProcess,tglMetalOriginal)(token,queue,list,command,descriptor,heaps,accel,context,event);
 }
 static uint64_t tglAuxTraceCaller(uint64_t caller){return caller>=tglAuxDonorBegin && caller<tglAuxDonorEnd?caller-tglAuxDonorBegin:0;}
 static bool tglAuxMapRange(void *table,const void *range,uint64_t entry){
