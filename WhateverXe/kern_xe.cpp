@@ -227,6 +227,8 @@ static bool tglAuxRangesSerialize(void *,void *,OSSerialize *serializer){
  if(ok)ok=data->serialize(serializer);data->release();return ok;
 }
 
+static uint64_t tglFailureContextVtable,tglFailureBufferVtable;
+static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount;
 static bool tglPassThrough(void *,void *,void *,uint32_t,uint8_t,uint8_t);
@@ -8926,11 +8928,23 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			const auto pgClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV31IGHardwarePerProcessPageTable64",address,size);
 			hangOK=hangOK && pgClass==address+0xCC220 && tglVM.enabled;
 			if (hangOK) tglPPGTTClass=pgClass+16;
+   const uint8_t contextSize[] {0xB9,0xD8,0,0,0},sharedSize[] {0xB9,0x48,0,0,0};
+   tglFailureRingReady=hangOK && xeProfile.identity==0x9A498086U &&
+    checkKernelArgument("-wex-edp-routing") && checkKernelArgument("-wex-edp-probe") &&
+    patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV17IGHardwareContext",address,size)==address+0xDC380 &&
+    patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV20IGSharedMappedBuffer",address,size)==address+0xCCCC0 &&
+    !memcmp(reinterpret_cast<void *>(address+0x7D9AC),contextSize,sizeof(contextSize)) &&
+    !memcmp(reinterpret_cast<void *>(address+0x10B8D),sharedSize,sizeof(sharedSize));
+   if(tglFailureRingReady){tglFailureContextVtable=address+0xDC390;tglFailureBufferVtable=address+0xCCCD0;}
+   IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRingFailureReady",tglFailureRingReady);
+   patcher.clearError();
 			if (hangOK) {
 				KernelPatcher::RouteRequest hook[] {{hangDump,wrapTGLHangRingDump,orgTGLHangRingDump}};
 				hangOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
+   tglFailureRingReady=tglFailureRingReady && hangOK;
+   IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRingFailureReady",tglFailureRingReady);
    if(xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-edp-routing"))IORegistryEntry::getRegistryRoot()->setProperty("WXEdpHangPersistentLog",hangOK);
 			// r123: the TGL caller loops reset -> extra stamp -> one-second wait
 			// while IOAccel holds its recovery locks. A stopped consumer fills its
@@ -11141,6 +11155,46 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
 }
 
 namespace {
+// Failure-only CPU capture for a native ordinary RCS context. The existing
+// PPGTT batch observer deliberately declines a GGTT/inactive BB address; copy
+// this context's retained CPU ring instead, without reinterpreting that address.
+static void tglCaptureFailureRing(uint64_t actualRing,const uint8_t *regs,const uint8_t *ring){
+ if(!tglFailureRingReady || !tglVM.nofault || regs[0x94] || ring[0x40])return;
+ using namespace TGLSubmitCapture;
+ auto pair=[](const uint8_t *p){uint64_t v;memcpy(&v,p,8);return v;};
+ auto word=[](const uint8_t *p){uint32_t v;memcpy(&v,p,4);return v;};
+ const auto ctx=pair(ring+0x20),owner=pair(ring+0x10);uint64_t vt=0,lrc=0,buffer=0;
+ if(!tglVMRead(ctx,vt) || vt!=tglFailureContextVtable ||
+  !tglVMRead(ctx+0x98,lrc) || !tglVMRead(lrc,vt) || vt!=tglFailureBufferVtable ||
+  !tglVMRead(actualRing+0x80,buffer) || !tglVMRead(buffer,vt) || vt!=tglFailureBufferVtable)return;
+ auto out=static_cast<Record *>(IOMalloc(sizeof(Record)));if(!out)return;bzero(out,sizeof(*out));
+ auto q=out->q;tglHostClock(q+Time);q[Submit]=UINT64_MAX;q[BankSlot]=UINT64_MAX;q[Unknown]=0x48414E47;
+ capture(*out,ctx,owner,tglVMRead,[](uint64_t a,uint8_t *to,uint64_t n)->uint64_t {
+  if(!kernelRange(a,n))return 0;return tglVM.nofault(a,reinterpret_cast<uint64_t>(to),n);
+ });
+ if(!q[Status] && q[Ring]==actualRing && q[LRCClass]==tglFailureBufferVtable){
+  // Keep saved LRC bytes intact; report the native fault's actual head/tail
+  // independently in the header. Every CPU ring page is bounded by the native
+  // retained allocation. Unresident pages stay explicitly unavailable.
+  q[Head]=word(regs);q[Tail]=word(regs+4);q[Control]=word(regs+8);q[RingGPU]=word(regs+12);
+  q[RequestedPages]=q[CopiedPages]=q[RingCopied]=0;bzero(out->ring,sizeof(out->ring));
+  for(uint64_t i=0;i<q[RingLength];i+=4096){
+   q[RequestedPages]|=1ULL<<(i/4096);
+   const auto n=tglVM.nofault(q[RingCPU]+i,reinterpret_cast<uint64_t>(out->ring+i),4096);
+   q[RingCopied]+=n;if(n==4096)q[CopiedPages]|=1ULL<<(i/4096);
+  }
+  uint64_t check=0,cpu=0,descriptor=0,back=0;
+  const bool stable=tglVMRead(actualRing+0x20,check) && check==ctx &&
+   tglVMRead(actualRing+0x80,check) && check==q[RingBuffer] &&
+   tglVMRead(check+0x38,cpu) && cpu==q[RingCPU] &&
+   tglVMRead(ctx+0xB0,back) && back==actualRing &&
+   tglVMRead(ctx+0x89,descriptor) && descriptor==q[DescriptorAfter];
+  q[Stable]=stable;if(!stable)q[Status]=5;
+ }else if(!q[Status]){q[Stable]=0;q[Status]=6;}
+ tglHostClock(q+EndTime);
+ IORegistryEntry::getRegistryRoot()->setProperty("WXEdpRingFailure0",out,sizeof(*out));IOFree(out,sizeof(*out));
+}
+
 void tglCaptureHangAddress(unsigned slot,uint64_t actualRing,const uint8_t *regs,const uint8_t *ring) {
  struct Capture {
   uint64_t q[24],copied[4],stable[4];
@@ -11381,6 +11435,8 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
    }
    char key[32];snprintf(key,sizeof(key),"TGLHangBatch%u",slot);
    IORegistryEntry::getRegistryRoot()->setProperty(key,c,sizeof(*c));
+   if (slot==0 && c->q[3]==sizeof(c->regs) && c->q[4]==sizeof(c->ring))
+    tglCaptureFailureRing(c->q[2],c->regs,c->ring);
    if (c->q[3]==sizeof(c->regs) && c->q[4]==sizeof(c->ring))
     tglCaptureHangAddress(slot,c->q[2],c->regs,c->ring);
    if(slot==0 && callbackXE->tglEdpRoutingReady)EdpHangLog::emit(*c,IOLog);
