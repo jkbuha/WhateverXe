@@ -8840,19 +8840,37 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             // five-argument submit function and all emitter decisions intact.
             const char *copySubmit="__ZN16IntelAccelerator10submitBlitEP15blit3d_params_tRK8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyEP11IGAccelTaskb";
             const uint8_t copyHead[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x38};
-            bool copyTraceOK=entriesOK && segmentOK && xeProfile.identity==0x9A498086U &&
-             patcher.solveSymbol<mach_vm_address_t>(index,copySubmit,address,size)==address+0x2BC8E &&
-             patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IntelAccelerator",address,size)==address+0xD1060 &&
-             !memcmp(reinterpret_cast<void *>(address+0x2BC8E),copyHead,sizeof(copyHead)) &&
-             patcher.solveSymbol<mach_vm_address_t>(index,"__ZN8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyE4growEm",address,size)==address+0x7599C &&
-             !memcmp(reinterpret_cast<void *>(address+0x759B5),"\x48\xC1\xE7\x05",4) &&
-             !memcmp(reinterpret_cast<void *>(address+0x759C6),"\x49\x8B\x7F\x10",4);
+            // Keep every ABI guard, but retain which guard or route failed.
+            // Clear each lookup error so a missing optional symbol cannot hide
+            // the result of subsequent independent checks.
+            auto copyAddress=patcher.solveSymbol<mach_vm_address_t>(index,copySubmit,address,size);
             patcher.clearError();
+            auto copyOwner=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IntelAccelerator",address,size);
+            patcher.clearError();
+            auto copyGrow=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyE4growEm",address,size);
+            patcher.clearError();
+            const bool copyGuards[]={entriesOK,segmentOK,xeProfile.identity==0x9A498086U,
+             copyAddress==address+0x2BC8E,copyOwner==address+0xD1060,
+             !memcmp(reinterpret_cast<void *>(address+0x2BC8E),copyHead,sizeof(copyHead)),
+             copyGrow==address+0x7599C,
+             !memcmp(reinterpret_cast<void *>(address+0x759B5),"\x48\xC1\xE7\x05",4),
+             !memcmp(reinterpret_cast<void *>(address+0x759C6),"\x49\x8B\x7F\x10",4)};
+            uint64_t copySetup[16]={1,0,0x1FF,0,0,UINT64_MAX,
+             copyAddress?copyAddress-address:UINT64_MAX,
+             copyOwner?copyOwner-address:UINT64_MAX,
+             copyGrow?copyGrow-address:UINT64_MAX,xeProfile.identity};
+            for(size_t i=0;i<arrsize(copyGuards);++i)if(copyGuards[i])copySetup[1]|=1ULL<<i;
+            memcpy(&copySetup[10],reinterpret_cast<void *>(address+0x2BC8E),sizeof(copyHead));
+            memcpy(&copySetup[13],reinterpret_cast<void *>(address+0x759B5),4);
+            memcpy(&copySetup[14],reinterpret_cast<void *>(address+0x759C6),4);
+            bool copyTraceOK=copySetup[1]==copySetup[2];
             if(copyTraceOK){
-             tglBlitCopyOwnerClass=address+0xD1070;
+             tglBlitCopyOwnerClass=address+0xD1070;copySetup[3]=1;
              KernelPatcher::RouteRequest route[] {{copySubmit,tglBlitCopy,tglBlitCopyOriginal}};
              copyTraceOK=patcher.routeMultiple(index,route,arrsize(route),address,size);
+             copySetup[4]=copyTraceOK;copySetup[5]=static_cast<uint64_t>(patcher.getError());
             }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXEdpBlitCopySetup",copySetup,sizeof(copySetup));
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpBlitCopiesReady",copyTraceOK);
             if(copyTraceOK)if(auto live=OSSerializer::forTarget(nullptr,tglBlitCopySerialize)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXEdpBlitCopies",live);live->release();}
