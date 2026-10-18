@@ -8786,9 +8786,27 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// Keep the broader new-color-request subtraction in WS/SA unchanged.
 			const uint8_t iosCCSNative[] {0x45,0x88,0xBD,0x74,0x14,0,0,0x45,0x38,0xBD,0x8C,0x12,0,0,
 				0x75,0x0E,0x41,0xF6,0x06,0x20,0x74,0x08,0x41,0xC6,0x85,0x74,0x14,0,0,1};
-			const bool iosCCSOK=size>0x246E1 &&
+			bool iosCCSOK=size>0x246E1 &&
 				!memcmp(reinterpret_cast<void *>(address+0x246C3),iosCCSNative,sizeof(iosCCSNative));
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSNativeReady",iosCCSOK);
+            // Hold the native IOSurface allocation policy at the value observed
+            // in the clean HDMI-connected boot. Change only the conditional
+            // policy-enable immediate before resource allocation can occur.
+            const bool iosCCSTrial=xeProfile.identity==0x9A498086U &&
+             checkKernelArgument("-wex-edp-probe") && checkKernelArgument("-wex-edp-routing");
+            bool iosCCSOff=false;
+            if(iosCCSTrial && iosCCSOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator5startEP9IOService",address,size)==address+0x23ECC){
+             const uint8_t enable[] {0x41,0xC6,0x85,0x74,0x14,0,0,1};
+             const uint8_t disable[] {0x41,0xC6,0x85,0x74,0x14,0,0,0};
+             auto site=reinterpret_cast<uint8_t *>(address+0x246D9);
+             KernelPatcher::LookupPatch policy {currentGraphics,enable,disable,sizeof(enable),1};
+             patcher.applyLookupPatch(&policy,site,sizeof(enable)+1);
+             iosCCSOff=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,disable,sizeof(disable));
+            }
+            patcher.clearError();
+            if(iosCCSTrial)iosCCSOK=iosCCSOK && iosCCSOff;
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSPolicyOffReady",iosCCSOff);
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSNativeReady",iosCCSOK && !iosCCSTrial);
 			// r119: retain native RCS flush -> stamp order and all runtime address/
 			// notification fields. Gen12 flushes HDC before completion; Linux v6.12
 			// gen12_emit_fini_breadcrumb_rcs also requires DepthStall (1409600907).
