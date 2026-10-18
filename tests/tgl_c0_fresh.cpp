@@ -12,4 +12,14 @@ int main(){
  e[0x64]=1;assert(!TGLC0Fresh::disable(e,before));memcpy(e,before,160);assert(TGLC0Fresh::disable(e,before));put(before,0x40,0,4);assert(!memcmp(e,before,160));assert(!TGLC0Fresh::fresh(e));
  assert(TGLC0Fresh::storage(0x1000,r)==0x1000);r[0x14]=0x82;put(r,0xE0,0x2000);assert(TGLC0Fresh::storage(0x1000,r)==0x2000);r[0x14]=1;assert(!TGLC0Fresh::storage(0x1000,r));
  put(m,0x90,0x1234);put(m,0x98,0x45710000);assert(TGLC0Fresh::map(m,0x1234,0x45710000,9375744));assert(!TGLC0Fresh::map(m,0x1235,0x45710000,9375744));assert(!TGLC0Fresh::map(m,0x1234,0x45710001,9375744));assert(!TGLC0Fresh::map(m,0x1234,0x45710000,9379840));m[0x10]=0x40;assert(!TGLC0Fresh::map(m,0x1234,0x45710000,9375744));
+
+ // The exact 24-line strip keeps all pristine, ownership and bounds guards.
+ memset(e,0,sizeof(e));put(e,8,7680,4);put(e,0x10,0xC0,4);put(e,0x14,3,4);
+ put(e,0x3C,245760,4);put(e,0x40,960,4);put(e,0x6C,1920,4);put(e,0x70,24,4);put(e,0x74,1,4);put(e,0x78,1,4);
+ assert(TGLC0Fresh::fresh(e)&&TGLC0Fresh::allocationLength(e)==249856);
+ m[0x10]=0;assert(TGLC0Fresh::map(m,0x1234,0x45710000,249856,TGLC0Fresh::allocationLength(e)));
+ assert(!TGLC0Fresh::map(m,0x1234,0x45710000,9375744,TGLC0Fresh::allocationLength(e)));
+ put(e,0x70,1200,4);assert(!TGLC0Fresh::fresh(e));put(e,0x70,24,4);
+ for(unsigned flags=1;flags<256;++flags){e[0x91]=flags;assert(!TGLC0Fresh::fresh(e));}e[0x91]=0;
+ memcpy(before,e,160);assert(TGLC0Fresh::disable(e,before));put(before,0x40,0,4);assert(!memcmp(e,before,160));
 }

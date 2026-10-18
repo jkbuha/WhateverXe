@@ -12131,7 +12131,7 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
   if(!q[26] || q[26]!=memory)break;
   q[1]=5;
   if(!get(memory,vt) || vt!=tglResolveMemoryVtable || !get(memory+0x40,q[8]) ||
-     !TGLC0Fresh::map(m,tp,gpu,q[8]))break;
+     !TGLC0Fresh::map(m,tp,gpu,q[8],TGLC0Fresh::allocationLength(e)))break;
   // The base must be the exact address passed by native get_tex_data+offset.
   // Reject suballocations rather than guessing the view's bounds.
   if((r[0x14]==0 || r[0x14]==0x80) && TGLC0Fresh::pair(r+0xF8))break;
