@@ -24,5 +24,6 @@ int main(){
  put(entry+0x10,0xd1,4);assert(!go());put(entry+0x10,0xc0,4);
  put(map,99);assert(go() && r.q[14]==2);put(map,3);
  put(task,99);assert(!go());put(task,1);
+ put(entry+0x6c,256,4);assert(!go());r={};assert(collect(r,task,res,1,2,3,4,read,true) && r.q[14]==6);put(entry+0x6c,1920,4);
  memory.erase(entry+100);assert(!go());
 }
