@@ -19,6 +19,8 @@ inline uint64_t storage(uint64_t resource,const uint8_t *r){
  if(!(r[0x14]&15))return resource;
  return r[0x14]==0x82 ? pair(r+0xE0) : 0;
 }
+// Exact IOAccelResource2::map selection: optimized memory wins when present.
+inline uint64_t selectedMemory(uint64_t main,uint64_t optimized){return optimized?optimized:main;}
 inline bool map(const uint8_t *m,uint64_t task,uint64_t gpu,uint64_t length){
  return task && gpu && !(gpu&65535) && gpu<=0x7FFFFFFFFFFFULL-9375744 &&
   !(TGLC0Entry::word(m+0x10)&0x40) && pair(m+0x90)==task &&

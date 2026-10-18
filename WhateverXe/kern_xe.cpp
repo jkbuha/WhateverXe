@@ -265,6 +265,7 @@ static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount,tglC0EntryCount,tglC0FreshCount;
 static bool tglC0FreshReady;
+static bool tglC0StorageABI(uint64_t);
 static bool tglPassThrough(void *,void *,void *,uint32_t,uint8_t,uint8_t);
 static uint32_t tglPassThroughChecks,tglPassThroughEligible,tglPassThroughZero,tglPassThroughSkipped;
 static void tglEntryEnable(void *,void *,uint64_t,void *,void *,uint8_t,uint8_t,bool);
@@ -8816,7 +8817,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpEntriesReady",entriesOK);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0EntriesReady",entriesOK);
             // Exact native AUX_NONE selection and zero-CCS resolve fast path.
-            tglC0FreshReady=entriesOK && segmentOK &&
+            tglC0FreshReady=entriesOK && segmentOK && tglC0StorageABI(address) &&
              !memcmp(reinterpret_cast<void *>(address+0x73FC6),"\xF6\x86\x91\x00\x00\x00\x02",7) &&
              !memcmp(reinterpret_cast<void *>(address+0x73FD2),"\x83\xE0\xF8\x89\x42\x18",6) &&
              !memcmp(reinterpret_cast<void *>(address+0x73B31),"\x41\x83\x7E\x44\x00",5);
@@ -11936,13 +11937,29 @@ static __attribute__((noinline)) unsigned tglC0EntrySlot(void *entry){
  const auto slot=__atomic_fetch_add(&tglC0EntryCount,1U,__ATOMIC_RELAXED);
  return slot<TGLC0Entry::Capacity ? slot : UINT32_MAX;
 }
+// Resolve the already-bound native getStorageResource import, then guard
+// the exact IOAcceleratorFamily2 storage/memory-selection ABI used below.
+static __attribute__((noinline)) bool tglC0StorageABI(uint64_t donor){
+ uint8_t call[5] {},head[16] {},link[7] {},select[53] {};
+ if(tglAuxTraceRead(donor+0x4F97C,call,sizeof(call))!=sizeof(call) || call[0]!=0xE8)return false;
+ int32_t relative=0;memcpy(&relative,call+1,4);
+ const uint64_t target=donor+0x4F981+static_cast<int64_t>(relative);
+ if((target>>47)!=0x1FFFF || target<0x23E50)return false;
+ const auto family=target-0x23E50;
+ const uint8_t nativeHead[] {0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0x89,0xfb,0x44,0x0f,0xb6,0x4f,0x14,0x41};
+ const uint8_t nativeLink[] {0x48,0x8b,0x9b,0xe0,0x00,0x00,0x00};
+ const uint8_t nativeSelect[] {0x4d,0x8b,0xbd,0xe0,0x00,0x00,0x00,0x4d,0x85,0xff,0x0f,0x84,0x0e,0x01,0x00,0x00,0x4d,0x8b,0xa7,0x88,0x00,0x00,0x00,0x4d,0x85,0xe4,0x75,0x19,0x49,0x83,0xef,0x80,0xeb,0x07,0x4d,0x8d,0xbd,0xe0,0x00,0x00,0x00,0x4d,0x8b,0x27,0x4d,0x85,0xe4,0x0f,0x84,0xe9,0x00,0x00,0x00};
+ return tglAuxTraceRead(target,head,sizeof(head))==sizeof(head) && !memcmp(head,nativeHead,sizeof(head)) &&
+  tglAuxTraceRead(family+0x23ED5,link,sizeof(link))==sizeof(link) && !memcmp(link,nativeLink,sizeof(link)) &&
+  tglAuxTraceRead(family+0x27955,select,sizeof(select))==sizeof(select) && !memcmp(select,nativeSelect,sizeof(select));
+}
 // All nofault copies and validation scratch return before native execution.
 static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void *entry,uint64_t gpu,void *task,uint8_t level,uint8_t face){
  if(!tglC0FreshReady || level || face)return false;
  uint8_t e[160] {},r[0x108] {},m[0x128] {};
  const auto rp=reinterpret_cast<uint64_t>(resource),ep=reinterpret_cast<uint64_t>(entry),tp=reinterpret_cast<uint64_t>(task);
  if(tglAuxTraceRead(ep,e,sizeof(e))!=sizeof(e) || !TGLC0Entry::eligible(e))return false;
- uint64_t q[24] {2,1,rp,0,ep,tp,gpu};bool changed=false;
+ uint64_t q[32] {3,1,rp,0,ep,tp,gpu};bool changed=false;
  auto get=[&](uint64_t a,uint64_t &v){return tglAuxTraceRead(a,&v,8)==8;};uint64_t vt=0,memory=0,storageMap=0,later=0;
  do {
   if(!TGLC0Fresh::fresh(e))break;
@@ -11953,19 +11970,19 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
   q[3]=TGLC0Fresh::storage(rp,r);q[9]=r[0x14];q[1]=3;
   if(!q[3] || q[3]>UINT64_MAX-0x238 || q[3]+0x180!=ep ||
      !get(q[3],vt) || vt!=tglSegmentResourceClass ||
-     tglAuxTraceRead(q[3]+0x14,q+10,1)!=1 || (q[10]&15) ||
+     tglAuxTraceRead(q[3]+0x14,q+10,1)!=1 || q[9]!=0x82 || q[10]!=0xC0 ||
      !get(q[3]+0x230,q[11]) || q[11] || !get(q[3]+0x40,storageMap))break;
   q[7]=TGLC0Fresh::pair(r+0x40);q[16]=storageMap;q[1]=4;
-  // View and storage may own distinct namespace maps. Compare their typed
-  // backing memory instead of requiring map-object identity.
-  if(!q[7] || !get(q[7],q[17]))break;
-  if(storageMap)get(storageMap,q[18]);
-  if(q[17]!=tglResolveMapVtable || q[18]!=tglResolveMapVtable ||
+  // Native IOAccelResource2::map uses view+E0 -> storage, selecting
+  // storage+88 when nonzero, otherwise storage+80. The C0 storage descriptor
+  // need not own any map itself. Compare this actual selected memory object.
+  if(!q[7] || !get(q[7],q[17]) || q[17]!=tglResolveMapVtable ||
      tglAuxTraceRead(q[7],m,sizeof(m))!=sizeof(m))break;
   q[12]=TGLC0Fresh::pair(m+0x90);q[13]=TGLC0Fresh::pair(m+0x98);
   memory=TGLC0Fresh::pair(m+0x18);q[20]=memory;q[1]=8;
-  get(storageMap+0x98,q[21]);get(storageMap+0x90,q[22]);
-  if(!get(storageMap+0x18,q[19]) || q[19]!=memory)break;
+  if(!get(q[3]+0x80,q[24]) || !get(q[3]+0x88,q[25]))break;
+  q[26]=TGLC0Fresh::selectedMemory(q[24],q[25]);q[27]=q[25]?1:2;q[19]=q[26];
+  if(!q[26] || q[26]!=memory)break;
   q[1]=5;
   if(!get(memory,vt) || vt!=tglResolveMemoryVtable || !get(memory+0x40,q[8]) ||
      !TGLC0Fresh::map(m,tp,gpu,q[8]))break;
@@ -11986,8 +12003,8 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
      !get(rp,vt) || vt!=tglSegmentResourceClass || !get(rp+0x40,later) || later!=q[7] ||
      (r[0x14]==0x82 && (!get(rp+0xE0,later) || later!=q[3])) ||
      !get(q[3]+0x40,later) || later!=storageMap ||
-     !get(storageMap,vt) || vt!=tglResolveMapVtable ||
-     !get(storageMap+0x18,later) || later!=memory ||
+     !get(q[3]+0x80,later) || later!=q[24] ||
+     !get(q[3]+0x88,later) || later!=q[25] ||
      !get(q[3]+0x230,later) || later ||
      !get(q[7]+0x90,later) || later!=tp || !get(q[7]+0x98,later) || later!=gpu ||
      !get(memory+0x40,later) || later!=q[8])break;
