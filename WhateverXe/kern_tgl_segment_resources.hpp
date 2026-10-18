@@ -19,14 +19,16 @@ inline bool layout(const uint8_t *e){return word(e+0x10)==0xC0 && word(e+8)==768
  word(e+0x14)==3 && word(e+0x3C)==9338880 && word(e+0x40)==36480 &&
  word(e+0x44)==0 && word(e+0x6C)==1920 && word(e+0x70)==1200;}
 template<class Read> bool collect(Record &r,uint64_t task,uint64_t resource,
- uint64_t taskClass,uint64_t resourceClass,uint64_t mapClass,uint64_t auxClass,Read read){
+ uint64_t taskClass,uint64_t resourceClass,uint64_t mapClass,uint64_t auxClass,Read read,bool broad=false){
  auto q=r.q;q[0]=1;q[4]=task;q[5]=resource;
  auto get=[&](uint64_t a,uint64_t &v){return read(a,&v,8)==8;};uint64_t vt=0;
  if(!taskClass || !resourceClass || !mapClass || !auxClass ||
     !get(task,vt) || vt!=taskClass || !get(resource,vt) || vt!=resourceClass ||
     !get(resource+0x230,q[6]))return false;
  if(!q[6])q[6]=resource+0x180;
- if(read(q[6],r.entry,sizeof(r.entry))!=sizeof(r.entry) || !layout(r.entry) ||
+ if(read(q[6],r.entry,sizeof(r.entry))!=sizeof(r.entry))return false;
+ const bool target=layout(r.entry);
+ if((!target && (!broad || word(r.entry+0x10)!=0xC0)) ||
     !get(resource+0x40,q[7]) || !get(q[7],vt))return false;
  // Preserve a scoped decline receipt rather than silently losing the target.
  // Unknown classes retain only their vtable word, never presumed fields.
@@ -41,7 +43,7 @@ template<class Read> bool collect(Record &r,uint64_t task,uint64_t resource,
   get(resource+0x40,map) && map==q[7] && get(map+0x98,gpu) && gpu==q[8] &&
   get(task+0x278,aux) && aux==q[11] && get(aux+0x30,owner) && owner==task &&
   read(q[6],after,sizeof(after))==sizeof(after) && !memcmp(after,r.entry,sizeof(after));
- q[14]=current?0:1;return true;
+ q[14]=current?(target?0:6):1;return true;
 }
 }
 #endif

@@ -223,10 +223,10 @@ static mach_vm_address_t tglAuxMapOriginal,tglAuxUnmapOriginal;
 static mach_vm_address_t tglMetalOriginal;
 static TGLObservationBudget::Budget tglMetalBudget;
 static bool tglMetalBudgetSerialize(void *,void *,OSSerialize *serializer){
- const uint64_t h[]={1,TGLObservationBudget::Tasks,TGLObservationBudget::Limit};
+ const uint64_t h[]={2,TGLObservationBudget::Tasks,TGLObservationBudget::Limit,TGLObservationBudget::IntervalNS};
  auto data=OSData::withCapacity(sizeof(h)+sizeof(tglMetalBudget.slots));if(!data)return false;
  bool ok=data->appendBytes(h,sizeof(h));
- for(const auto &s:tglMetalBudget.slots){const uint64_t q[]={__atomic_load_n(&s.task,__ATOMIC_ACQUIRE),__atomic_load_n(&s.calls,__ATOMIC_RELAXED)};ok=ok && data->appendBytes(q,sizeof(q));}
+ for(const auto &s:tglMetalBudget.slots){const uint64_t q[]={__atomic_load_n(&s.task,__ATOMIC_ACQUIRE),__atomic_load_n(&s.calls,__ATOMIC_RELAXED),__atomic_load_n(&s.admitted,__ATOMIC_RELAXED),__atomic_load_n(&s.nextNS,__ATOMIC_RELAXED)};ok=ok && data->appendBytes(q,sizeof(q));}
  if(ok)ok=data->serialize(serializer);data->release();return ok;
 }
 static uint64_t tglSegmentTaskClass,tglSegmentResourceClass,tglSegmentListClass;
@@ -11795,7 +11795,8 @@ static __attribute__((noinline)) void tglSegmentObserve(void *queue,void *list,v
  uint64_t contextTask=0;
  if(!task || !tglVMRead(reinterpret_cast<uint64_t>(context)+0x58,contextTask) || contextTask!=task)return;
  __atomic_fetch_add(tglSegmentProgress+1,1ULL,__ATOMIC_RELAXED);
- if(!tglMetalBudget.allow(task))return;
+ uint64_t now=0;tglHostClock(&now);
+ if(!tglMetalBudget.allow(task,now))return;
  uint64_t vt=0,array=0,count=0;
  if(!tglVMRead(l,vt) || vt!=tglSegmentListClass ||
     !tglVMRead(l+0x10,array) || !tglVMRead(l+8,count))return;
@@ -11806,7 +11807,7 @@ static __attribute__((noinline)) void tglSegmentObserve(void *queue,void *list,v
   __atomic_fetch_add(tglSegmentProgress+3,1ULL,__ATOMIC_RELAXED);
   TGLSegmentResources::Record local {};
   if(!TGLSegmentResources::collect(local,task,resource,tglSegmentTaskClass,tglSegmentResourceClass,
-       tglResolveMapVtable,tglAuxTableVtable,tglAuxTraceRead))continue;
+       tglResolveMapVtable,tglAuxTableVtable,tglAuxTraceRead,__atomic_load_n(&tglSegmentCount,__ATOMIC_RELAXED)<16))continue;
   __atomic_fetch_add(tglSegmentProgress+4,1ULL,__ATOMIC_RELAXED);
   bool seen=false;
   for(unsigned j=0;j<TGLSegmentResources::Capacity;++j){const auto &r=tglSegmentRecords[j];
