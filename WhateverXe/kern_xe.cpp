@@ -11942,7 +11942,7 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
  uint8_t e[160] {},r[0x108] {},m[0x128] {};
  const auto rp=reinterpret_cast<uint64_t>(resource),ep=reinterpret_cast<uint64_t>(entry),tp=reinterpret_cast<uint64_t>(task);
  if(tglAuxTraceRead(ep,e,sizeof(e))!=sizeof(e) || !TGLC0Entry::eligible(e))return false;
- uint64_t q[16] {1,1,rp,0,ep,tp,gpu};bool changed=false;
+ uint64_t q[24] {2,1,rp,0,ep,tp,gpu};bool changed=false;
  auto get=[&](uint64_t a,uint64_t &v){return tglAuxTraceRead(a,&v,8)==8;};uint64_t vt=0,memory=0,storageMap=0,later=0;
  do {
   if(!TGLC0Fresh::fresh(e))break;
@@ -11955,11 +11955,18 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
      !get(q[3],vt) || vt!=tglSegmentResourceClass ||
      tglAuxTraceRead(q[3]+0x14,q+10,1)!=1 || (q[10]&15) ||
      !get(q[3]+0x230,q[11]) || q[11] || !get(q[3]+0x40,storageMap))break;
-  q[7]=TGLC0Fresh::pair(r+0x40);q[1]=4;
-  if(!q[7] || q[7]!=storageMap || !get(q[7],vt) || vt!=tglResolveMapVtable ||
+  q[7]=TGLC0Fresh::pair(r+0x40);q[16]=storageMap;q[1]=4;
+  // View and storage may own distinct namespace maps. Compare their typed
+  // backing memory instead of requiring map-object identity.
+  if(!q[7] || !get(q[7],q[17]))break;
+  if(storageMap)get(storageMap,q[18]);
+  if(q[17]!=tglResolveMapVtable || q[18]!=tglResolveMapVtable ||
      tglAuxTraceRead(q[7],m,sizeof(m))!=sizeof(m))break;
   q[12]=TGLC0Fresh::pair(m+0x90);q[13]=TGLC0Fresh::pair(m+0x98);
-  memory=TGLC0Fresh::pair(m+0x18);q[1]=5;
+  memory=TGLC0Fresh::pair(m+0x18);q[20]=memory;q[1]=8;
+  get(storageMap+0x98,q[21]);get(storageMap+0x90,q[22]);
+  if(!get(storageMap+0x18,q[19]) || q[19]!=memory)break;
+  q[1]=5;
   if(!get(memory,vt) || vt!=tglResolveMemoryVtable || !get(memory+0x40,q[8]) ||
      !TGLC0Fresh::map(m,tp,gpu,q[8]))break;
   // The base must be the exact address passed by native get_tex_data+offset.
@@ -11978,7 +11985,10 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
      (r[0x14]==0x82 && (tglAuxTraceRead(rp+0xFC,&laterOffset,4)!=4 || laterOffset)) ||
      !get(rp,vt) || vt!=tglSegmentResourceClass || !get(rp+0x40,later) || later!=q[7] ||
      (r[0x14]==0x82 && (!get(rp+0xE0,later) || later!=q[3])) ||
-     !get(q[3]+0x40,later) || later!=q[7] || !get(q[3]+0x230,later) || later ||
+     !get(q[3]+0x40,later) || later!=storageMap ||
+     !get(storageMap,vt) || vt!=tglResolveMapVtable ||
+     !get(storageMap+0x18,later) || later!=memory ||
+     !get(q[3]+0x230,later) || later ||
      !get(q[7]+0x90,later) || later!=tp || !get(q[7]+0x98,later) || later!=gpu ||
      !get(memory+0x40,later) || later!=q[8])break;
   changed=TGLC0Fresh::disable(static_cast<uint8_t *>(entry),e);q[1]=changed?0:7;
