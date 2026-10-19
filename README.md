@@ -8,12 +8,44 @@ Intel Xe-LP integrated GPUs. It is derived from WhateverGreen.
 This project is experimental and requires the Xe root patch provided by the
 [OpenCore Legacy Patcher fork](https://github.com/b00t0x/OpenCore-Legacy-Patcher).
 
-This fork includes experimental internal-display changes for physical Tiger Lake
-`9A49` on Big Sur `20G1443`. Internal 1920×1200 output currently requires an
-HDMI display connected at boot and during use. The external display remains
-blank in this mode; cable-free startup, hotplug and long-term stability are
-unresolved. This is a conditional development baseline, not general internal-panel
-support. The upstream release links below do not contain these fork changes.
+This fork adds experimental Dell XPS 9310 display support for physical Tiger Lake
+`9A49` revision 1 on Big Sur `20G1443`. The tested setup now supports the internal
+1920×1200 panel, simultaneous external 1920×1080 output through a USB-C-to-HDMI
+adapter on the **right USB-C port**, cable-free boot, and unplug/reconnect tests.
+These are initial hardware results; long-term stability and system sleep/wake
+remain unqualified. The upstream release ZIPs below do not contain these fork changes.
+
+## XPS 9310 display changes
+
+The working display path combines three groups of changes:
+
+1. **External HDMI output instead of VNC-only operation.** The HDMI adapter uses
+   DisplayPort Alt Mode over USB-C. The Tiger Lake path gained scoped Type-C power
+   handling, the measured two-lane pin-D route, and corrections to pipe/transcoder
+   routing and negotiated DisplayPort enhanced framing. This brought up physical
+   external output; initially it required selecting the external display during
+   firmware startup with Fn+F8.
+2. **Internal laptop panel output.** The eDP path gained native panel identification
+   through powered AUX/EDID reads, internal pipe/DDI routing, panel clock and power
+   sequencing corrections, and matching SST enhanced framing during link training.
+   Rendering fixes also release large diagnostic scratch buffers before native
+   driver calls and validate the actual backing storage behind texture views.
+   A guarded first-use C0 texture compression bypass addressed rendering corruption;
+   the first usable panel setup still depended on an attached HDMI display.
+3. **Panel plus external output, including cable-free use.** The right-port lane
+   getter now reads modular **FIA2 / TC3** rather than the donor's FIA1 location.
+   At the exact native signal-programming call site, both DKL transmitter banks
+   are initialized, allowing the external link to train alongside the panel without
+   Fn+F8. For cable-free rendering, the C0 bypass now handles bounded native texture
+   layouts instead of a fixed size list, and includes the native **192-byte auxiliary
+   allocation trailer** before page rounding. It only changes unused CCS size before
+   first compression enable, with pristine-state, ownership, shared-storage and exact
+   allocation checks; it does not reinterpret already-compressed textures.
+
+The tested configuration passed connected boot, Safari use, HDMI unplug/reconnect,
+and boot without HDMI. Other adapters, monitors, resolutions and the left USB-C
+port need separate qualification. These changes retain physical-device and native
+Apple-driver guards; they do not add Raptor Lake-P/XPS 9320 support.
 
 ## Compatibility
 
@@ -32,7 +64,8 @@ Dual external 1920×1080 at 60 Hz output, Metal/OpenGL, hardware HEVC and displa
 sleep/wake have been tested on Tiger Lake and Alder Lake-N. Hardware H.264
 encode/decode has also been tested on Tiger Lake. Three simultaneous displays,
 system sleep, higher resolutions and other connector layouts require further
-validation. USB-C and internal display support are planned below.
+validation. The XPS 9310 results above qualify only its tested internal/USB-C paths;
+broader USB-C and internal display support remain roadmap items.
 
 Download the **RELEASE** ZIP from [Releases](https://github.com/b00t0x/WhateverXe/releases). The DEBUG ZIP is for troubleshooting.
 
