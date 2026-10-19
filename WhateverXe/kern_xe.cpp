@@ -325,6 +325,12 @@ static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount,tglC0EntryCount,tglC0FreshCount;
 static bool tglC0FreshReady;
+alignas(8) static uint64_t tglC0MenuStats[16]={1};
+static bool tglC0MenuSerialize(void *,void *,OSSerialize *serializer){
+ uint64_t q[16];for(unsigned i=0;i<16;i++)q[i]=__atomic_load_n(tglC0MenuStats+i,__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 static bool tglC0StorageABI(uint64_t);
 static mach_vm_address_t tglBlitCopyOriginal;
 static uint64_t tglBlitCopyOwnerClass,tglBlitCopyCalls;
@@ -8957,6 +8963,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              !memcmp(reinterpret_cast<void *>(address+0x73FD2),"\x83\xE0\xF8\x89\x42\x18",6) &&
              !memcmp(reinterpret_cast<void *>(address+0x73B31),"\x41\x83\x7E\x44\x00",5);
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0UncompressedReady",tglC0FreshReady);
+            if(tglC0FreshReady)if(auto live=OSSerializer::forTarget(nullptr,tglC0MenuSerialize)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpC0MenuStats",live);live->release();}
+
             IORegistryEntry::getRegistryRoot()->setProperty("WXEdpPassThroughReady",entriesOK);
             patcher.clearError();
 
@@ -12179,7 +12188,9 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
  if(!tglC0FreshReady || level || face)return false;
  uint8_t e[160] {},r[0x108] {},m[0x128] {};
  const auto rp=reinterpret_cast<uint64_t>(resource),ep=reinterpret_cast<uint64_t>(entry),tp=reinterpret_cast<uint64_t>(task);
- if(tglAuxTraceRead(ep,e,sizeof(e))!=sizeof(e) || !TGLC0Entry::eligible(e))return false;
+ if(tglAuxTraceRead(ep,e,sizeof(e))!=sizeof(e) || !TGLC0Fresh::candidate(e))return false;
+ const bool small=TGLC0Fresh::smallEligible(e);
+ if(small)__atomic_fetch_add(tglC0MenuStats+1,1ULL,__ATOMIC_RELAXED);
  uint64_t q[32] {3,1,rp,0,ep,tp,gpu};bool changed=false;
  auto get=[&](uint64_t a,uint64_t &v){return tglAuxTraceRead(a,&v,8)==8;};uint64_t vt=0,memory=0,storageMap=0,later=0;
  do {
@@ -12231,6 +12242,11 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
      !get(memory+0x40,later) || later!=q[8])break;
   changed=TGLC0Fresh::disable(static_cast<uint8_t *>(entry),e);q[1]=changed?0:7;
  }while(false);
+ if(small){
+  if(q[1]<=8)__atomic_fetch_add(tglC0MenuStats+2+q[1],1ULL,__ATOMIC_RELAXED);
+  const unsigned offsets[]={0x6C,0x70,8,0x3C,0x40};
+  for(unsigned i=0;i<5;i++)__atomic_store_n(tglC0MenuStats+11+i,uint64_t(TGLC0Entry::word(e+offsets[i])),__ATOMIC_RELAXED);
+ }
  q[15]=changed;
  const auto n=__atomic_fetch_add(&tglC0FreshCount,1U,__ATOMIC_RELAXED);
  if(n<32){char key[48];snprintf(key,sizeof(key),"WXEdpC0Uncompressed%u",n);IORegistryEntry::getRegistryRoot()->setProperty(key,q,sizeof(q));}
