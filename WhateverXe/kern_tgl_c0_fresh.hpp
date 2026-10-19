@@ -6,8 +6,39 @@ namespace TGLC0Fresh {
 inline uint64_t pair(const uint8_t *p){uint64_t v;memcpy(&v,p,8);return v;}
 // Exact compressed C0 shapes observed in a failing boot, with matching
 // uncompressed shapes in the clean comparator. No format/type conversion.
-constexpr uint32_t SmallLayouts[][3]={{157,157,1024},{920,693,4096},{40,24,512},{30,24,512},
- {130,24,1024},{31,24,512},{245,245,1024},{34,24,512},{134,113,1024},{161,24,1024},{105,105,512},{242,285,1024}};
+constexpr uint32_t SmallLayouts[][3]={{157,157,1024},
+ {920,693,4096},
+ {40,24,512},
+ {30,24,512},
+ {130,24,1024},
+ {31,24,512},
+ {245,245,1024},
+ {34,24,512},
+ {134,113,1024},
+ {161,24,1024},
+ {105,105,512},
+ {242,285,1024},
+ {152,24,1024},
+ {1394,790,5632},
+ {370,278,1536},
+ {512,278,2048},
+ {370,512,1536},
+ {512,512,2048},
+ {370,256,1536},
+ {512,256,2048},
+ {1394,738,5632},
+ {109,109,512},
+ {15,738,512},
+ {1379,42,5632},
+ {729,90,3072},
+ {363,512,1536},
+ {1387,512,5632},
+ {1379,177,5632},
+ {1379,320,5632},
+ {309,296,1536},
+ {309,174,1536},
+ {47,47,512},
+ {640,640,2560}};
 inline uint64_t backing(uint32_t pitch,uint32_t height){const uint64_t main=uint64_t(pitch)*((uint64_t(height)+31)&~31ULL);return (main+main/256+4095)&~4095ULL;}
 inline bool smallEligible(const uint8_t *e){
  if(!e || TGLC0Entry::word(e+0x10)!=0xC0 || TGLC0Entry::word(e+0x14)!=3 || TGLC0Entry::word(e+0x44))return false;
