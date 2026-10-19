@@ -10,6 +10,12 @@ struct RightConfiguredLanes {
  }
  // The native getter returns an unpacked nibble. Its old FIA1 extraction
  // shifted TC3 by8; FIA2 TC3 is index0, so no shift belongs in this return.
+ // Diagnostic signal selector only: initialize both DKL banks as Linux does.
+ // This is never written to FIA and is restricted to the exact native call site.
+ static uint32_t signalMask(uint32_t raw,uintptr_t caller,uintptr_t expected) {
+  const auto lanes=result(raw);
+  return expected && caller==expected && (lanes==1 || lanes==3) ? 15U : lanes;
+ }
  static uint32_t result(uint32_t raw){return raw==UINT32_MAX?0:raw&15U;}
 };
 #endif

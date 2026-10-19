@@ -15,9 +15,9 @@
 namespace {
 RightDKLTrace wxRightDKLTrace;
 bool wxRightDKLTraceEnabled=false;
-alignas(8) uint64_t wxRightConfiguredStats[7]={1,0,0,0,0,0,0};
+alignas(8) uint64_t wxRightConfiguredStats[8]={2,0,0,0,0,0,0,0};
 static bool wxRightConfiguredSerialize(void *,void *,OSSerialize *serializer) {
- uint64_t q[7];for(unsigned i=0;i<7;i++)q[i]=__atomic_load_n(&wxRightConfiguredStats[i],__ATOMIC_RELAXED);
+ uint64_t q[8];for(unsigned i=0;i<8;i++)q[i]=__atomic_load_n(&wxRightConfiguredStats[i],__ATOMIC_RELAXED);
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -10160,6 +10160,11 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
      KernelPatcher::RouteRequest configured("__ZN17AppleIntelPortHAL29getConfiguredDklPhyLaneConfigEv",wrapTGLConfiguredLanes,orgTGLConfiguredLanes);
      tglRightConfiguredLanesReady=patcher.routeMultiple(index,&configured,1,address,size);patcher.clearError();
     }
+    const uint8_t signalCaller[]={0x48,0x8b,0x5d,0xc8,0x48,0x8b,0x03,0x48,0x89,0xdf,0xff,0x90,0xa0,0x01,0x00,0x00};
+    if(tglRightConfiguredLanesReady && size>0x60d2e &&
+       !memcmp(reinterpret_cast<const void *>(address+0x60d1e),signalCaller,sizeof(signalCaller)))
+     tglRightSignalLaneCaller=address+0x60d2e;
+    IORegistryEntry::getRegistryRoot()->setProperty("WXRightSignalBanksReady",tglRightSignalLaneCaller!=0);
     IORegistryEntry::getRegistryRoot()->setProperty("WXRightConfiguredLaneReady",tglRightConfiguredLanesReady);
    }
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGFixedDPLaneMaskRouted", laneOK);
@@ -13523,7 +13528,10 @@ uint32_t XE::wrapTGLConfiguredLanes(void *port) {
   auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
   raw=*reinterpret_cast<volatile uint32_t *>(base+RightConfiguredLanes::Register);
  }
- const auto result=RightConfiguredLanes::result(raw);
+ const auto result=RightConfiguredLanes::signalMask(raw,
+  reinterpret_cast<uintptr_t>(__builtin_return_address(0)),self->tglRightSignalLaneCaller);
+ if(result==15 && RightConfiguredLanes::result(raw)!=15)
+  __atomic_add_fetch(&wxRightConfiguredStats[7],1,__ATOMIC_RELAXED);
  IORecursiveLockUnlock(self->tglModeTransitionLock);
  __atomic_add_fetch(&wxRightConfiguredStats[2],1,__ATOMIC_RELAXED);
  if(raw==UINT32_MAX)__atomic_add_fetch(&wxRightConfiguredStats[3],1,__ATOMIC_RELAXED);
