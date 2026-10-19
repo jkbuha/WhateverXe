@@ -373,6 +373,7 @@ private:
  mach_vm_address_t orgTGLSetFIALanes {};
  mach_vm_address_t orgTGLConfiguredLanes {};
  bool tglRightConfiguredLanesReady {};
+ uintptr_t tglRightSignalLaneCaller {};
  static uint32_t wrapTGLConfiguredLanes(void *port);
 	bool tglAUXParentReady {false};
 	void *tglAUXParentOwner {};
