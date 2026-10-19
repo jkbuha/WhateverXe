@@ -371,6 +371,9 @@ private:
 	mach_vm_address_t tglEnablePG {}, tglDisablePG {}, tglPortByDDI {};
 	mach_vm_address_t orgTGLEnableAUXPower {}, orgTGLDisableAUXPower {};
  mach_vm_address_t orgTGLSetFIALanes {};
+ mach_vm_address_t orgTGLConfiguredLanes {};
+ bool tglRightConfiguredLanesReady {};
+ static uint32_t wrapTGLConfiguredLanes(void *port);
 	bool tglAUXParentReady {false};
 	void *tglAUXParentOwner {};
 	// Qualified PHY backends only; immutable while AUX references are live.
