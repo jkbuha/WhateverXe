@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <string.h>
 namespace TGLLayoutReceipts {
-constexpr unsigned Capacity=256;
+constexpr unsigned Capacity=1024;
 struct Record {uint64_t q[6];uint32_t surface[16];uint8_t entry[160];};
 static_assert(sizeof(Record)==272,"layout receipt ABI");
 // First immutable receipt for each descriptor layout. GPU base-address words
