@@ -11,9 +11,16 @@
 #include "kern_right_port_observer.hpp"
 #include "kern_right_alt.hpp"
 #include "kern_right_dkl_trace.hpp"
+#include "kern_right_configured_lanes.hpp"
 namespace {
 RightDKLTrace wxRightDKLTrace;
 bool wxRightDKLTraceEnabled=false;
+alignas(8) uint64_t wxRightConfiguredStats[7]={1,0,0,0,0,0,0};
+static bool wxRightConfiguredSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[7];for(unsigned i=0;i<7;i++)q[i]=__atomic_load_n(&wxRightConfiguredStats[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool wxRightDKLSerialize(void *,void *,OSSerialize *serializer) {
  // Allocates only for an explicit registry read, never from native DKL IO.
  constexpr size_t bytes=(8+RightDKLTrace::Capacity*RightDKLTrace::Words)*sizeof(uint32_t);
@@ -3302,6 +3309,9 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	selectProfile(XELP::deviceProfile(physicalGPU));
  if(xeProfile.identity==0x9a498086U && physicalGPU && physicalGPU->configRead8(8)==1) {
   wxRightDKLTraceEnabled=true;
+  if(auto live=OSSerializer::forTarget(nullptr,wxRightConfiguredSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WXRightConfiguredLaneStats",live);live->release();
+  }
   if(auto live=OSSerializer::forTarget(nullptr,wxRightDKLSerialize)) {
    IORegistryEntry::getRegistryRoot()->setProperty("WXRightDKLTrace",live);live->release();
   }
@@ -10138,6 +10148,19 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
     tglRightAltRoutingReady=qualified && laneOK && tglNativeFiaReady && tglDekelReady &&
      patcher.routeMultiple(index,&laneSet,1,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WXRightAltRoutingReady",tglRightAltRoutingReady);
+    const auto getter=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17AppleIntelPortHAL29getConfiguredDklPhyLaneConfigEv",address,size);
+    const uint8_t getterEntry[]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53};
+    const uint8_t getterRead[]={0x48,0x89,0xdf,0xbe,0xc0,0x38,0x16,0x0,0xe8,0x67,0xfb,0xfb,0xff};
+    bool getterKnown=tglRightAltRoutingReady && xeProfile.identity==0x9a498086U && xeProfile.revision==1 &&
+     size>0x603ce && getter==address+0x602cc &&
+     !memcmp(reinterpret_cast<const void *>(getter),getterEntry,sizeof(getterEntry)) &&
+     !memcmp(reinterpret_cast<const void *>(address+0x6031a),getterRead,sizeof(getterRead));
+    patcher.clearError();
+    if(getterKnown) {
+     KernelPatcher::RouteRequest configured("__ZN17AppleIntelPortHAL29getConfiguredDklPhyLaneConfigEv",wrapTGLConfiguredLanes,orgTGLConfiguredLanes);
+     tglRightConfiguredLanesReady=patcher.routeMultiple(index,&configured,1,address,size);patcher.clearError();
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("WXRightConfiguredLaneReady",tglRightConfiguredLanesReady);
    }
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGFixedDPLaneMaskRouted", laneOK);
 			patcher.clearError();
@@ -13480,6 +13503,35 @@ uint32_t XE::tglRightAltProbe(void *port) {
  rightPortRecord(port,10,live,ready,pin,buffer);
  return RightAlt::accept(self->xeProfile.identity,5,cold,powered,first,live,ready,pin,buffer,binding.nativeMode())?3:0;
 }
+uint32_t XE::wrapTGLConfiguredLanes(void *port) {
+ auto self=callbackXE;auto p=static_cast<uint8_t *>(port);
+ auto config=p?*reinterpret_cast<uint32_t **>(p+0x548):nullptr;
+ const auto ddi=config?config[0]:9;
+ const auto mode=p?*reinterpret_cast<uint32_t *>(p+0x550):UINT32_MAX;
+ __atomic_add_fetch(&wxRightConfiguredStats[1],1,__ATOMIC_RELAXED);
+ if(!RightConfiguredLanes::target(self->xeProfile.identity,self->xeProfile.revision,ddi,mode,
+    self->tglRightAltEligible(ddi),self->tglRightConfiguredLanesReady,self->tglModeTransitionLock!=nullptr)) {
+  __atomic_add_fetch(&wxRightConfiguredStats[4],1,__ATOMIC_RELAXED);
+  return FunctionCast(wrapTGLConfiguredLanes,self->orgTGLConfiguredLanes)(port);
+ }
+ uint32_t raw=UINT32_MAX;
+ IORecursiveLockLock(self->tglModeTransitionLock);
+ // The existing probe binds the exact native controller/map and verifies
+ // whole-boot TC-cold/PG3 ownership, live DP-alt pinD and readable BAR bounds.
+ if(*reinterpret_cast<uint32_t *>(p+0x550)==3 && tglRightAltProbe(port)==3) {
+  auto access=*reinterpret_cast<uint8_t **>(p+0x578);
+  auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
+  raw=*reinterpret_cast<volatile uint32_t *>(base+RightConfiguredLanes::Register);
+ }
+ const auto result=RightConfiguredLanes::result(raw);
+ IORecursiveLockUnlock(self->tglModeTransitionLock);
+ __atomic_add_fetch(&wxRightConfiguredStats[2],1,__ATOMIC_RELAXED);
+ if(raw==UINT32_MAX)__atomic_add_fetch(&wxRightConfiguredStats[3],1,__ATOMIC_RELAXED);
+ __atomic_store_n(&wxRightConfiguredStats[5],raw,__ATOMIC_RELAXED);
+ __atomic_store_n(&wxRightConfiguredStats[6],result,__ATOMIC_RELAXED);
+ return result;
+}
+
 void XE::wrapTGLSetFIALanes(void *port,uint32_t lanes) {
  auto self=callbackXE;auto bytes=static_cast<uint8_t *>(port);
  auto config=bytes?*reinterpret_cast<uint32_t **>(bytes+0x548):nullptr;
