@@ -39,24 +39,25 @@ constexpr uint32_t SmallLayouts[][3]={{157,157,1024},
  {309,174,1536},
  {47,47,512},
  {640,640,2560}};
-inline uint64_t backing(uint32_t pitch,uint32_t height){const uint64_t main=uint64_t(pitch)*((uint64_t(height)+31)&~31ULL);return (main+main/256+4095)&~4095ULL;}
-inline bool smallEligible(const uint8_t *e){
+// Native fillTextureData rounds pitch to512, height to32, and derives
+// CCS bytes as main/256. Its allocation tail rounds aux+192 to4096.
+inline uint64_t backing(uint32_t pitch,uint32_t height){
+ const uint64_t main=uint64_t(pitch)*((uint64_t(height)+31)&~31ULL);
+ return ((main+4095)&~4095ULL)+((main/256+192+4095)&~4095ULL);
+}
+inline bool nativeEligible(const uint8_t *e){
  if(!e || TGLC0Entry::word(e+0x10)!=0xC0 || TGLC0Entry::word(e+0x14)!=3 || TGLC0Entry::word(e+0x44))return false;
  const auto w=TGLC0Entry::word(e+0x6C),h=TGLC0Entry::word(e+0x70),pitch=TGLC0Entry::word(e+8);
- for(const auto &l:SmallLayouts)if(w==l[0] && h==l[1] && pitch==l[2]) {
-  const uint64_t main=uint64_t(pitch)*((uint64_t(h)+31)&~31ULL);
-  return TGLC0Entry::word(e+0x3C)==main && TGLC0Entry::word(e+0x40)==main/256;
- }
- return false;
+ if(!w || !h || w>4096 || h>4096 || pitch!=((w*4U+511U)&~511U))return false;
+ const uint64_t main=uint64_t(pitch)*((uint64_t(h)+31)&~31ULL);
+ return TGLC0Entry::word(e+0x3C)==main && TGLC0Entry::word(e+0x40)==main/256;
 }
-inline bool candidate(const uint8_t *e){return TGLC0Entry::eligible(e)||smallEligible(e);}
+inline bool smallEligible(const uint8_t *e){return nativeEligible(e) && !TGLC0Entry::eligible(e);}
+inline bool candidate(const uint8_t *e){return TGLC0Entry::eligible(e)||nativeEligible(e);}
 inline bool fresh(const uint8_t *e){
- if(!candidate(e) || pair(e) || pair(e+0x98) || e[0x91] || (e[0x4B]&8) ||
+ if(!nativeEligible(e) || pair(e) || pair(e+0x98) || e[0x91] || (e[0x4B]&8) ||
     TGLC0Entry::word(e+0x64) || TGLC0Entry::word(e+0x68) ||
     TGLC0Entry::word(e+0x74)!=1 || TGLC0Entry::word(e+0x78)!=1)return false;
- if(!smallEligible(e) && (TGLC0Entry::word(e+0x6C)!=1920 ||
-    !((TGLC0Entry::word(e+0x70)==1200 && TGLC0Entry::word(e+0x3C)==9338880) ||
-      (TGLC0Entry::word(e+0x70)==24 && TGLC0Entry::word(e+0x3C)==245760))))return false;
  for(unsigned o=0x4C;o<0x64;o+=4)if(TGLC0Entry::word(e+o))return false;
  return true;
 }
@@ -72,7 +73,8 @@ inline uint64_t selectedMemory(uint64_t main,uint64_t optimized){return optimize
 // Keep the bound coupled to a pristine exact observed layout.
 inline uint64_t allocationLength(const uint8_t *e){
  if(!fresh(e))return 0;
- return (uint64_t(TGLC0Entry::word(e+0x3C))+TGLC0Entry::word(e+0x40)+4095)&~4095ULL;
+ return ((uint64_t(TGLC0Entry::word(e+0x3C))+4095)&~4095ULL)+
+        ((uint64_t(TGLC0Entry::word(e+0x40))+192+4095)&~4095ULL);
 }
 inline bool knownBacking(uint64_t length){
  if(length==9375744 || length==249856)return true;
@@ -83,6 +85,13 @@ inline bool map(const uint8_t *m,uint64_t task,uint64_t gpu,uint64_t length,uint
  return knownBacking(expected) && task && gpu && !(gpu&65535) && gpu<=0x7FFFFFFFFFFFULL-expected &&
   !(TGLC0Entry::word(m+0x10)&0x40) && pair(m+0x90)==task &&
   pair(m+0x98)==gpu && length==expected;
+}
+// Production bound is derived from the same pristine entry being modified;
+// callers cannot supply an unrelated expected allocation length.
+inline bool mapForEntry(const uint8_t *m,uint64_t task,uint64_t gpu,uint64_t length,const uint8_t *e){
+ const auto expected=allocationLength(e);
+ return expected && task && gpu && !(gpu&65535) && gpu<=0x7FFFFFFFFFFFULL-expected &&
+  !(TGLC0Entry::word(m+0x10)&0x40) && pair(m+0x90)==task && pair(m+0x98)==gpu && length==expected;
 }
 // Never reinterpret an already compressed surface. The only changed word is
 // its unused CCS size, before first native compression enable or any dirty use.
