@@ -325,7 +325,7 @@ static bool tglFailureRingReady;
 static mach_vm_address_t tglEntryEnableOriginal,tglEntryResolveOriginal;
 static uint32_t tglEntryCount,tglC0EntryCount,tglC0FreshCount;
 static bool tglC0FreshReady;
-alignas(8) static uint64_t tglC0MenuStats[16]={1};
+alignas(8) static uint64_t tglC0MenuStats[16]={2};
 static bool tglC0MenuSerialize(void *,void *,OSSerialize *serializer){
  uint64_t q[16];for(unsigned i=0;i<16;i++)q[i]=__atomic_load_n(tglC0MenuStats+i,__ATOMIC_RELAXED);
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;const bool ok=data->serialize(serializer);data->release();return ok;
@@ -12217,7 +12217,7 @@ static __attribute__((noinline)) bool tglC0KeepUncompressed(void *resource,void 
   if(!q[26] || q[26]!=memory)break;
   q[1]=5;
   if(!get(memory,vt) || vt!=tglResolveMemoryVtable || !get(memory+0x40,q[8]) ||
-     !TGLC0Fresh::map(m,tp,gpu,q[8],TGLC0Fresh::allocationLength(e)))break;
+     !TGLC0Fresh::mapForEntry(m,tp,gpu,q[8],e))break;
   // The base must be the exact address passed by native get_tex_data+offset.
   // Reject suballocations rather than guessing the view's bounds.
   if((r[0x14]==0 || r[0x14]==0x80) && TGLC0Fresh::pair(r+0xF8))break;
