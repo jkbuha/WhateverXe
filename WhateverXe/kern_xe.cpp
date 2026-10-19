@@ -10,6 +10,20 @@
 #include "kern_xe.hpp"
 #include "kern_right_port_observer.hpp"
 #include "kern_right_alt.hpp"
+#include "kern_right_dkl_trace.hpp"
+namespace {
+RightDKLTrace wxRightDKLTrace;
+bool wxRightDKLTraceEnabled=false;
+static bool wxRightDKLSerialize(void *,void *,OSSerialize *serializer) {
+ // Allocates only for an explicit registry read, never from native DKL IO.
+ constexpr size_t bytes=(8+RightDKLTrace::Capacity*RightDKLTrace::Words)*sizeof(uint32_t);
+ auto copy=static_cast<uint32_t *>(IOMalloc(bytes));if(!copy)return false;
+ const auto used=wxRightDKLTrace.snapshot(copy,bytes/sizeof(uint32_t));
+ auto data=used?OSData::withBytesNoCopy(copy,static_cast<unsigned>(used*sizeof(uint32_t))):nullptr;
+ bool ok=data && data->serialize(serializer);if(data)data->release();IOFree(copy,bytes);return ok;
+}
+}
+
 #include "kern_edp_hang_log.hpp"
 #include "kern_edp_pll_fraction.hpp"
 #include "kern_edp_combo_scaling.hpp"
@@ -3286,6 +3300,13 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+ if(xeProfile.identity==0x9a498086U && physicalGPU && physicalGPU->configRead8(8)==1) {
+  wxRightDKLTraceEnabled=true;
+  if(auto live=OSSerializer::forTarget(nullptr,wxRightDKLSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WXRightDKLTrace",live);live->release();
+  }
+ }
+
  tglRightAltRequested=xeProfile.identity==0x9A498086U && checkKernelArgument("-wex-tc-bootstrap");
     if(!xeProfile.admitted())return;
     xelpSelectedGPU=physicalGPU;xelpSelectedProfile=xeProfile;
@@ -16684,6 +16705,15 @@ bool XE::tglDekelAccess(void *port, uint32_t index, bool write, uint32_t &value)
 		after = *reg;
 	} else value = *reg;
 	IOSimpleLockUnlockEnableInterrupt(callbackXE->tglDekelLock, irq);
+ // Record values already obtained by the native write path, including when
+ // intrusive training diagnostics are suppressed. No additional MMIO/AUX,
+ // HIP-bank selection, allocation or registry publication is performed.
+ if(wxRightDKLTraceEnabled && write) {
+  uint64_t ticks,ns;clock_get_uptime(&ticks);absolutetime_to_nanoseconds(ticks,&ns);
+  wxRightDKLTrace.record(callbackXE->xeProfile.identity,config[0],write,index,offset,bank,mode,
+   requested,value,before,after,suspendBefore,suspendAfter,(pllMask?1U:0U)|(signalWrite?2U:0U),
+   reinterpret_cast<uintptr_t>(current_thread()),ns);
+ }
 	if (tglQuietTraining()) return true;
 	if (signalWrite) {
 		uint32_t record[] = {index, bank, suspendBefore, suspendAfter};

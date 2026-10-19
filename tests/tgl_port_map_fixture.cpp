@@ -7,6 +7,13 @@ static void rightPortPublish() {}
 #include <cassert>
 #include <vector>
 #include "kern_tgl_port_map.hpp"
+#include "kern_right_dkl_trace.hpp"
+static RightDKLTrace wxRightDKLTrace;
+static bool wxRightDKLTraceEnabled=true;
+static uint64_t fakeClock=0;
+static void clock_get_uptime(uint64_t *p){*p=++fakeClock;}
+static void absolutetime_to_nanoseconds(uint64_t ticks,uint64_t *ns){*ns=ticks;}
+static void *current_thread(){return reinterpret_cast<void *>(0x12345678ULL);}
 #include "kern_tgl_tc_boot.hpp"
 struct IOService;
 bool quiet;
@@ -20,6 +27,7 @@ struct IORegistryEntry {
  void *getProperty(const char *) { return nullptr; }
 };
 struct XE {
+ struct {uint32_t identity=0x9a498086U;} xeProfile;
  // FIELDS
  IOSimpleLock *tglDekelLock;
  uintptr_t orgTGLReadDekel,orgTGLWriteDekel;
@@ -134,6 +142,7 @@ int main() {
   XE::wrapTGLWriteDekel(alt.port,0x38,0xcc000000);
   assert(alt.mmio[0x46038/4]==0xcc000000);
   assert(nativeReads==r && nativeWrites==w);
+  assert(wxRightDKLTrace.count==1 && wxRightDKLTrace.entries[0][4]==0x46038 && wxRightDKLTrace.entries[0][10]==0xcc000000);
   // TC1's PLL, all unrelated slots and unsupported mode0 remain untouched.
   assert(alt.mmio[0x46030/4]==0xA5FABCDF);
   auto before=alt.mmio;*reinterpret_cast<uint32_t *>(alt.port+0x550)=0;
@@ -144,6 +153,19 @@ int main() {
   XE::wrapTGLWriteDekel(alt.port,0x38,7);assert(alt.mmio==before);
   object.tglRightAltFault=false;
  }
+ // Toggle only the observer around actual production native accesses.
+ // Compare the complete mocked hardware image, not just the selected register.
+ unsigned traceComparisons=0;
+ for(bool q:{false,true})for(unsigned rate:{6U,10U,20U})for(unsigned index=0x34;index<=0x49;index++)for(bool write:{false,true}) {
+  quiet=q;PortFixture a(5),b(5);
+  *reinterpret_cast<uint32_t *>(a.port+0x550)=*reinterpret_cast<uint32_t *>(b.port+0x550)=3;
+  *reinterpret_cast<uint32_t *>(a.port+0x128)=*reinterpret_cast<uint32_t *>(b.port+0x128)=rate;
+  uint32_t av=0x12500,bv=av;auto n=wxRightDKLTrace.count;
+  wxRightDKLTraceEnabled=false;assert(XE::tglDekelAccess(a.port,index,write,av));
+  wxRightDKLTraceEnabled=true;assert(XE::tglDekelAccess(b.port,index,write,bv));
+  assert(av==bv && a.mmio==b.mmio && wxRightDKLTrace.count==n+unsigned(write));++traceComparisons;
+ }
+ printf("PASS: %u right-mode3 actual DKL accesses produce identical full MMIO/value results with trace enabled or disabled, including quiet training.\n",traceComparisons);
  object.tglRightAltReady=false;object.tglTCWiring.legacy|=1u<<5;
  PortFixture p(4);uint32_t value=7;auto before=p.mmio;
  assert(!XE::tglDekelAccess(nullptr,0x34,true,value));
