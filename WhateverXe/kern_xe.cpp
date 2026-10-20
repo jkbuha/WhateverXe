@@ -65,6 +65,7 @@
 #include "kern_edp_aux_lease.hpp"
 #include "kern_tgl_panel_power.hpp"
 #include "kern_tgl_tahoe_resolve_scratch.hpp"
+#include "kern_tgl_tahoe_compression.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -746,6 +747,35 @@ struct TGLVMBoundary {
 bool tglVMRead(uint64_t address,uint64_t &value) {
  return (address>>47)==0x1FFFF && tglVM.nofault &&
   tglVM.nofault(address,reinterpret_cast<uint64_t>(&value),sizeof(value))==sizeof(value);
+}
+
+// Finite read-only compression receipts, before the untouched native method.
+static uintptr_t tglTahoeCompressionOriginal,tglTahoeCompressionResource,tglTahoeCompressionTask;
+static uint32_t tglTahoeCompressionCount;
+static __attribute__((noinline)) void tglTahoeCompressionObserve(void *resource,void *entry,uint64_t gpu,
+ void *accel,void *task,uint8_t level,uint8_t face,bool skip) {
+ if(!tglVM.nofault || __atomic_load_n(&tglTahoeCompressionCount,__ATOMIC_RELAXED)>=TGLTahoeCompression::Capacity)return;
+ uint32_t type=0;const auto ep=reinterpret_cast<uint64_t>(entry);
+ if(!TGLTahoeCompression::kernel(ep,160) ||
+    tglVM.nofault(ep+0x10,reinterpret_cast<uint64_t>(&type),4)!=4 || type!=0xC0)return;
+ uint32_t slot=__atomic_load_n(&tglTahoeCompressionCount,__ATOMIC_RELAXED);
+ do {if(slot>=TGLTahoeCompression::Capacity)return;}
+ while(!__atomic_compare_exchange_n(&tglTahoeCompressionCount,&slot,slot+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
+ TGLTahoeCompression::Receipt receipt{};
+ auto read=[](uint64_t a,void *out,size_t n)->size_t {
+  return tglVM.nofault(a,reinterpret_cast<uint64_t>(out),n);
+ };
+ TGLTahoeCompression::collect(receipt,reinterpret_cast<uint64_t>(resource),reinterpret_cast<uint64_t>(entry),
+  gpu,reinterpret_cast<uint64_t>(accel),reinterpret_cast<uint64_t>(task),level,face,skip,
+  tglTahoeCompressionResource,tglTahoeCompressionTask,read);
+ receipt.q[23]=slot;
+ char key[48];snprintf(key,sizeof(key),"WXTahoeCompression%u",slot);
+ IORegistryEntry::getRegistryRoot()->setProperty(key,&receipt,sizeof(receipt));
+}
+static void tglTahoeCompressionEnable(void *resource,void *entry,uint64_t gpu,
+ void *accel,void *task,uint8_t level,uint8_t face,bool skip) {
+ tglTahoeCompressionObserve(resource,entry,gpu,accel,task,level,face,skip);
+ FunctionCast(tglTahoeCompressionEnable,tglTahoeCompressionOriginal)(resource,entry,gpu,accel,task,level,face,skip);
 }
 
 // One diagnostic allocation on the real kernel task, after native start has
@@ -9162,6 +9192,26 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				ccsReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsSite,ccsReplace,sizeof(ccsReplace));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSPageReservationReady",ccsReady);
+            // Read-only receipts on the exact native compression-enable ABI.
+            // Family storage semantics were independently checked in Tahoe's KC;
+            // no metadata is changed and the original always receives all args.
+            const char *compressionName="__ZN15IGAccelResource36enableRenderCompressionWithAccelTaskEPNS_17ResourceInfoEntryEyR16IntelAcceleratorP11IGAccelTaskhhb";
+            const auto compressionEntry=patcher.solveSymbol<mach_vm_address_t>(index,compressionName,address,size);
+            const auto compressionResource=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV15IGAccelResource",address,size);
+            const auto compressionTask=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV11IGAccelTask",address,size);
+            bool compressionReady=TGLTahoeTiming::requested(xeProfile.identity,xeProfile.revision,xeProfile.overridden(),
+             XELP::kernelOS(version)==XELP::OS::Tahoe) && tglVM.nofault &&
+             compressionEntry>=address && compressionResource>=address && compressionTask>=address &&
+             TGLTahoeCompression::matches(reinterpret_cast<const uint8_t *>(address),size,
+              compressionEntry-address,compressionResource-address,compressionTask-address);
+            patcher.clearError();
+            if(compressionReady){
+             tglTahoeCompressionResource=compressionResource+16;tglTahoeCompressionTask=compressionTask+16;
+             KernelPatcher::RouteRequest route[] {{compressionName,tglTahoeCompressionEnable,tglTahoeCompressionOriginal}};
+             compressionReady=patcher.routeMultiple(index,route,arrsize(route),address,size);
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionReady",compressionReady);
+            patcher.clearError();
             // Port only the owned synchronization-slot correction; panel routing
             // and native draw/shader/rectangle operations remain unchanged.
             const auto resolveSymbol=patcher.solveSymbol<mach_vm_address_t>(index,
