@@ -3,8 +3,9 @@
 #ifndef kern_tgl_hang_detail_hpp
 #define kern_tgl_hang_detail_hpp
 #include "kern_tgl_hang_graph.hpp"
+#include "kern_tgl_hang_active.hpp"
 namespace TGLHangDetail {
-constexpr uint64_t Schema=2;
+constexpr uint64_t Schema=3;
 using TGLHangPending::kernelRange;
 enum Field {Context,Owner,Task,Table,TableClass,LRCBuffer,LRCCPU,LRCSize,LRCClass,
  RingBuffer,RingCPU,RingSize,RingLength,Descriptor,ContextID,Stamps,StampGPU,
@@ -18,6 +19,7 @@ struct Capture {
  TGLHangPending::Capture pending;
  TGLHangGraph::Capture graph;
  uint8_t scratch[16384];
+ TGLHangActive::Capture activeGGTT; // schema3 tail; prior fields retain offsets
 };
 static_assert(sizeof(Capture)<1048576,"first-failure property must remain below 1MiB");
 template<class Read>

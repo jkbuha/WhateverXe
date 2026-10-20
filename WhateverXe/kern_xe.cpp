@@ -12153,9 +12153,19 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
      }
      uint64_t stampPhysical=0;const bool known=physical(o[Stamps],stampPhysical);
      TGLHangGGTT::page(g,2,0,o[Stamps],o[StampGPU],stampPhysical,known,physical,pte);
+     // The reported BB may be a GGTT context/driver batch outside the
+     // pending per-process command graph. Preserve it as a separate candidate.
+     if(tglTahoeTimingRequired) {
+      const auto raw=TGLHangPending::u64(c->regs+0x70);
+      TGLHangActive::collect(c->activeGGTT,true,raw,tglVM.directBase,tglVM.directEnd,pte,physical,read);
+     }
      uint64_t finalOwner[Fields]{};
      g.q[1]=ownership(finalOwner,c->q[4],tglPPGTTClass,read) &&
        !memcmp(finalOwner,o,sizeof(finalOwner)) ? 0:2;
+     if(c->activeGGTT.q[0] && g.q[1])c->activeGGTT.q[1]=5;
+     uint64_t rootAfter=0;
+     if(c->activeGGTT.q[0] && (!tglVMRead(tglVM.kernelPmap+0x50,rootAfter) || rootAfter!=cpuRoot))
+      c->activeGGTT.q[1]=5;
     }
     tglHostClock(g.q+3);root->setProperty("TGLHangGGTT0",&g,sizeof(g));
    }
