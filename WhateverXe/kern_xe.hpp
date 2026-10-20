@@ -437,6 +437,9 @@ private:
 	static void tglObserveResource(void *fb, void *path, uint32_t event, bool done, uint32_t result, uint64_t arg0, uint64_t arg1, void *caller);
 	static void tglObservePath(void *port, void *path, uint32_t event, bool done, uint32_t result, uint64_t arg, void *caller);
 	static void wrapTGLPowerDDIState(void *power, bool enable, uint32_t requested);
+ static void wrapTGLPanelDDIGet(void *power,uint32_t ddi);
+ static void wrapTGLPanelDDIPut(void *power,uint32_t ddi);
+ mach_vm_address_t orgTGLPanelDDIGet {},orgTGLPanelDDIPut {};
 	static void tglObserveActivation(void *controller, void *port, void *path, uint32_t phase, bool done, uint32_t result);
 
 	IOSimpleLock *tglDekelLock {};

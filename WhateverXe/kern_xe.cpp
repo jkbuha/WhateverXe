@@ -63,6 +63,7 @@
 #include "kern_edp_training_packet.hpp"
 #include "kern_edp_handoff.hpp"
 #include "kern_edp_aux_lease.hpp"
+#include "kern_tgl_panel_power.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -88,6 +89,20 @@ extern "C" __attribute__((naked,used)) void wxTahoeTimingBridge() {
  asm volatile(WEX_TAHOE_TIMING_BRIDGE);
 }
 static bool tglTahoeTimingRequired=false,tglTahoeTimingReady=false;
+static bool tglPanelPowerReady=false;
+static TGLPanelPower::Lease tglPanelPowerLease;
+struct TGLPanelPowerIO {
+ uint8_t *power;const TGLTCNativeFunctions &native;
+ uint32_t ddiRefs(){return *reinterpret_cast<uint32_t *>(power+0x30);}
+ uint32_t pgRefs(unsigned i){return *reinterpret_cast<uint32_t *>(power+0x20+4*i);}
+ void getPG3(){native.getPG(power,3);}void putPG3(){native.putPG(power,3);}
+};
+static void tglPublishPanelPower() {
+ const auto &s=tglPanelPowerLease;
+ uint32_t q[]={1,tglPanelPowerReady,s.held,s.gets,s.puts,s.inheritedPuts,s.errors,s.fault};
+ IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelPower",q,sizeof(q));
+}
+
 extern "C" {
  uintptr_t wxTahoeHpdResume {},wxTahoeHpdNext {},wxTahoeHpdCounter {};
 }
@@ -10628,6 +10643,21 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
     }
     IORegistryEntry::getRegistryRoot()->setProperty("TGLTCNativeABIReady",f.complete());
     patcher.clearError();
+    const auto getDDI=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN19AppleIntelPowerWell18enablePowerWellDDIEj",address,size);
+    const auto putDDI=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN19AppleIntelPowerWell19disablePowerWellDDIEj",address,size);
+    const bool panelScope=TGLTahoeTiming::requested(xeProfile.identity,xeProfile.revision,xeProfile.overridden(),XELP::kernelOS(version)==XELP::OS::Tahoe);
+    const bool panelABI=panelScope && tglTahoeRoutingReady && f.complete() && getDDI>=address && putDDI>=address &&
+     TGLPanelPower::matches(reinterpret_cast<const uint8_t *>(address),size,getDDI-address,putDDI-address);
+    patcher.clearError();
+    if(panelABI) {
+     KernelPatcher::RouteRequest routes[] {
+      {"__ZN19AppleIntelPowerWell18enablePowerWellDDIEj",wrapTGLPanelDDIGet,orgTGLPanelDDIGet},
+      {"__ZN19AppleIntelPowerWell19disablePowerWellDDIEj",wrapTGLPanelDDIPut,orgTGLPanelDDIPut}
+     };
+     tglPanelPowerReady=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+     patcher.clearError();
+    }
+    tglPublishPanelPower();
    }
    if(checkKernelArgument("-wex-tc-bootstrap")) {
     const uint8_t initBytes[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18,0x48,0xff,0x05,0xe8,0x76,0x08,0x00},getBytes[] {0x55,0x48,0x89,0xe5,0x53,0x50,0x48,0x89,0xfb,0x48,0xff,0x05,0xac,0x5e,0x08,0x00,0x85,0xf6,0x74,0x18,0xb8,0x01,0x00,0x00},putBytes[] {0x55,0x48,0x89,0xe5,0x53,0x50,0x48,0x89,0xfb,0x48,0xff,0x05,0x5a,0x67,0x08,0x00,0x85,0xf6,0x74,0x23,0xb8,0x01,0x00,0x00};
@@ -16111,6 +16141,35 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 	}
 	tglObserveActivation(callbackXE->tglObservationController, port, path, 1, true, result);
 	return result;
+}
+
+void XE::wrapTGLPanelDDIGet(void *power,uint32_t ddi) {
+ auto self=callbackXE;auto p=static_cast<uint8_t *>(power);
+ auto &f=self->tglTCNativeFunctions;
+ auto ctl=p?*reinterpret_cast<uint8_t **>(p+0x10):nullptr;
+ auto access=p?*reinterpret_cast<void **>(p+0x78):nullptr;
+ bool admitted=tglPanelPowerReady && ddi==0 && p && !p[0x18] && f.complete() && ctl &&
+  ctl==self->tglObservationController && *f.controllerSlot==ctl &&
+  *reinterpret_cast<void **>(ctl+0xC8)==power && access && *reinterpret_cast<void **>(ctl+0xC40)==access;
+ if(admitted) {
+  auto port=static_cast<uint8_t *>(f.portByDDI(0));
+  auto cfg=port?*reinterpret_cast<uint32_t **>(port+0x548):nullptr;
+  admitted=cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 &&
+   *reinterpret_cast<uint32_t *>(port+0x550)==1 && *reinterpret_cast<void **>(port+0x578)==access;
+ }
+ TGLPanelPowerIO io{p,f};
+ tglPanelPowerLease.enable(admitted,reinterpret_cast<uintptr_t>(power),io,[&] {
+  FunctionCast(wrapTGLPanelDDIGet,self->orgTGLPanelDDIGet)(power,ddi);
+ });
+ if(ddi==0)tglPublishPanelPower();
+}
+void XE::wrapTGLPanelDDIPut(void *power,uint32_t ddi) {
+ auto self=callbackXE;TGLPanelPowerIO io{static_cast<uint8_t *>(power),self->tglTCNativeFunctions};
+ if(ddi==0)tglPanelPowerLease.disable(reinterpret_cast<uintptr_t>(power),io,[&] {
+  FunctionCast(wrapTGLPanelDDIPut,self->orgTGLPanelDDIPut)(power,ddi);
+ });
+ else FunctionCast(wrapTGLPanelDDIPut,self->orgTGLPanelDDIPut)(power,ddi);
+ if(ddi==0)tglPublishPanelPower();
 }
 
 void XE::wrapTGLPowerDDIState(void *power, bool enable, uint32_t requested) {
