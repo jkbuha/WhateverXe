@@ -687,6 +687,58 @@ bool tglRCSTLBSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+// Base (BCS/video) TLB invalidation needs the same Gen12 pre-parser barrier.
+// Keep the donor's MI_FLUSH_DW workaround branch and scratch address intact.
+uintptr_t tglOrigBaseTLBSpace {}, tglOrigBaseTLBWrite {};
+uint32_t tglBaseTLBSpace(void *ring) {
+ return FunctionCast(tglBaseTLBSpace,tglOrigBaseTLBSpace)(ring)+2;
+}
+void tglBaseTLBWrite(void *ring) {
+ const uint32_t disable=0x02800101,enable=0x02800100;
+ auto write=reinterpret_cast<bool (*)(void *,const uint32_t *,uint32_t)>(tglRCSWriteBuffer);
+ write(ring,&disable,1);
+ FunctionCast(tglBaseTLBWrite,tglOrigBaseTLBWrite)(ring);
+ write(ring,&enable,1);
+}
+// getBuffer can clone/map the semaphore batch AFTER waitForSpace. Reserve an
+// extra native invalidation up front; otherwise writeBuffer ignores a newly
+// raised pending bit when ring+0x6d is clear. This also covers an earlier flush
+// consumed by serializeSubmission. Native code still owns clearing the bit,
+// emitting the invalidation, and the batch's lifetime/completion semantics.
+uintptr_t tglCanUseSemaphore {}, tglOrigSemaphoreCommand {};
+uint32_t tglSemaphoreCounters[6][3] {}; // commands, late pending, consumed
+uint32_t tglSemaphoreSpace(void *ring,int engine) {
+ // The exact donor space method is 9 * canUseSemaphoreWaitPoll. Its prologue
+ // contains a rel32 CALL which Lilu copies without relocation; do not request
+ // an original trampoline. Call the untouched predicate directly instead.
+ if (!reinterpret_cast<bool (*)(void *,int)>(tglCanUseSemaphore)(ring,engine)) return 0;
+ const uint32_t words=9;
+ auto methods=*reinterpret_cast<uintptr_t **>(ring);
+ return words+reinterpret_cast<uint32_t (*)(void *)>(methods[0x150/8])(ring);
+}
+void tglSemaphoreCommand(void *ring,const void *descriptor) {
+ auto r=static_cast<uint8_t *>(ring);
+ auto owner=*reinterpret_cast<uint8_t **>(r+0x10);
+ const unsigned engine=r[0x40];
+ const uint64_t mask=1ULL<<(engine%64);
+ auto pending=reinterpret_cast<uint64_t *>(owner+0x1340)+(engine/64);
+ const bool late=(*pending&mask) && !r[0x6d];
+ if (late) r[0x6d]=1;
+ if (engine<6) {
+  __atomic_fetch_add(&tglSemaphoreCounters[engine][0],1,__ATOMIC_RELAXED);
+  if(late) __atomic_fetch_add(&tglSemaphoreCounters[engine][1],1,__ATOMIC_RELAXED);
+ }
+ FunctionCast(tglSemaphoreCommand,tglOrigSemaphoreCommand)(ring,descriptor);
+ if (engine<6 && late && !(*pending&mask) && !r[0x6d])
+  __atomic_fetch_add(&tglSemaphoreCounters[engine][2],1,__ATOMIC_RELAXED);
+}
+bool tglSemaphoreSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[19] {1};
+ for(unsigned e=0;e<6;++e) for(unsigned i=0;i<3;++i)
+  out[1+e*3+i]=__atomic_load_n(&tglSemaphoreCounters[e][i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 // r104: first RCS submission's CPU mapping and existing engine prerequisites.
 // No correction/forcewake/write. These extra reads can change timing; compare
 // the same candidate on both OSes, never treat a successful boot as a fix.
@@ -9159,6 +9211,42 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			if(auto live=OSSerializer::forTarget(nullptr,tglRCSTLBSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSTLBPreparserLive",live);live->release();
 			}
+            const char *baseSpace="__ZN20IGHardwareRingBuffer16getFlushTLBSpaceEv";
+            const char *baseWrite="__ZN20IGHardwareRingBuffer13writeFlushTLBEv";
+            const char *semCanUse="__ZN20IGHardwareRingBuffer23canUseSemaphoreWaitPollEi";
+            const char *semSpace="__ZN20IGHardwareRingBuffer25getSemaphoreWaitPollSpaceEi";
+            const char *semCommand="__ZN20IGHardwareRingBuffer30insertSemaphoreWaitPollCommandEPKN26IGSemaphoreWaitBufferQueue29SemaphoreWaitBufferDescriptorE";
+            const uint8_t baseSpaceBody[] {0x55,0x48,0x89,0xe5,0x48,0x8b,0x47,0x10,0x8b,0x80,0xd6,0x0f,0,0,0xc1,0xe8,0x10,0x83,0xe0,1,0x8d,0x0c,0x80,0xb8,5,0,0,0,1,0xc8,0x5d,0xc3};
+            const uint8_t semSpaceBody[] {0x55,0x48,0x89,0xe5,0xe8,0x3f,0xfe,0xff,0xff,0x0f,0xb6,0xc0,0x8d,0x04,0xc0,0x5d,0xc3};
+            const uint8_t semCommandHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30};
+            const uint8_t semMapCall[] {0xe8,0xcf,0x41,1,0,0x48,0x85,0xc0,0x74,0x0f,0x48,0x89,0xdf,0x48,0x89,0xc6,0xe8,0x45,0xfe,0xff,0xff};
+            bool semaphoreTLBOK=tlbPreparserOK &&
+             patcher.solveSymbol<mach_vm_address_t>(index,baseSpace,address,size)==address+0x428EC &&
+             patcher.solveSymbol<mach_vm_address_t>(index,baseWrite,address,size)==address+0x4290C &&
+             patcher.solveSymbol<mach_vm_address_t>(index,semCanUse,address,size)==address+0x42440 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,semSpace,address,size)==address+0x425F8 &&
+             patcher.solveSymbol<mach_vm_address_t>(index,semCommand,address,size)==address+0x4249E &&
+             !memcmp(reinterpret_cast<void *>(address+0x428EC),baseSpaceBody,sizeof(baseSpaceBody)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x4290C),tlbWriteHead,sizeof(tlbWriteHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x425F8),semSpaceBody,sizeof(semSpaceBody)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x4249E),semCommandHead,sizeof(semCommandHead)) &&
+             !memcmp(reinterpret_cast<void *>(address+0x42644),semMapCall,sizeof(semMapCall));
+            patcher.clearError();
+            if(semaphoreTLBOK) {
+             tglCanUseSemaphore=address+0x42440;
+             KernelPatcher::RouteRequest routes[] {
+              {baseSpace,tglBaseTLBSpace,tglOrigBaseTLBSpace},
+              {baseWrite,tglBaseTLBWrite,tglOrigBaseTLBWrite},
+              {semSpace,tglSemaphoreSpace},
+              {semCommand,tglSemaphoreCommand,tglOrigSemaphoreCommand}
+             };
+             semaphoreTLBOK=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+            }
+            patcher.clearError();
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBReady",semaphoreTLBOK);
+            if(auto live=OSSerializer::forTarget(nullptr,tglSemaphoreSerialize)) {
+             IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBLive",live);live->release();
+            }
 			// r120: failure-path capture only. Native dumpBatchBuffer is a stub;
 			// reuse the native pending resource cache and saved debug registers.
 			const char *hangDump="__ZN20IGHardwareRingBuffer14dumpRingBufferER14debugRegisters";
@@ -9230,7 +9318,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
-			tglAcceleratorReady = adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && hangOK && recoveryOK;
+			tglAcceleratorReady = adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && semaphoreTLBOK && hangOK && recoveryOK;
 			// r201: resource/copy diagnostics are absent, not admission requirements.
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLResourceDiagnosticsRemoved",true);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLAcceleratorAdmissionReady", tglAcceleratorReady);

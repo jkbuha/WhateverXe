@@ -9,7 +9,7 @@ python_tests=['xelp_forcewake_irq','boot_arguments','tgl_display_observers','tgl
 jobs=[(p.stem,['clang++','-std=c++17','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-I'+str(R/'WhateverXe'),str(p),'-o',str(O/p.stem)],[str(O/p.stem)]) for p in sorted((R/'tests').glob('*.cpp')) if not p.stem.endswith('_fixture')]
 jobs += [(n,[sys.executable,str(R/'tests'/(n+'.py'))],None) for n in python_tests]
 if a.donor:jobs += [(n,[sys.executable,str(R/'tests'/(n+'.py')),str(a.donor.resolve())],None) for n in ['tgl_tc_native','tgl_tc_mode','tgl_mode_native']]
-if a.accelerator:jobs += [('xelp_forcewake_irq_native',[sys.executable,str(R/'tests/xelp_forcewake_irq.py'),'--donor',str(a.accelerator.resolve())],None)]
+if a.accelerator:jobs += [('xelp_forcewake_irq_native',[sys.executable,str(R/'tests/xelp_forcewake_irq.py'),'--donor',str(a.accelerator.resolve())],None),('tgl_tlb_preparser',[sys.executable,str(R/'tests/tgl_tlb_preparser.py'),str(a.accelerator.resolve())],None),('tgl_semaphore_tlb',[sys.executable,str(R/'tests/tgl_semaphore_tlb.py'),str(a.accelerator.resolve())],None)]
 def check(job):
  n,compile,execute=job
  with (O/(n+'.log')).open('w') as log:
