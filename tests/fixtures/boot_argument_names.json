@@ -107,20 +107,13 @@
     "-display13trace",
     "-n97displaytrace"
   ],
-  "-wex-tgl-off": [
-    "-igfxtgloff"
-  ],
-  "-wex-nopanel": [
-    "-tglnopanel"
-  ],
-  "-wex-tgl-prog-off": [
-    "-tglprogoff"
-  ],
+  "-wex-edp-routing": [],
   "-wex-no-host-rps": [
     "-tglnohostrps"
   ],
-  "-wex-tgl-hold-render-wake": [
-    "-tglholdrenderwake"
+  "-wex-noaccel": [],
+  "-wex-nopanel": [
+    "-tglnopanel"
   ],
   "-wex-tc-aux": [
     "-tgltc-aux"
@@ -128,14 +121,22 @@
   "-wex-tc-bootstrap": [
     "-tgltc-bootstrap"
   ],
-  "-wexoff": [
-    "-wxeoff"
+  "-wex-tgl-hold-render-wake": [
+    "-tglholdrenderwake"
   ],
-  "-wexdbg": [
-    "-wxedbg"
+  "-wex-tgl-off": [
+    "-igfxtgloff"
+  ],
+  "-wex-tgl-prog-off": [
+    "-tglprogoff"
   ],
   "-wexbeta": [
     "-wxebeta"
   ],
-  "-wex-noaccel": []
+  "-wexdbg": [
+    "-wxedbg"
+  ],
+  "-wexoff": [
+    "-wxeoff"
+  ]
 }

@@ -53,6 +53,7 @@
 #include "kern_tgl_recovery.hpp"
 #include "kern_tgl_aux_call.hpp"
 #include "kern_tgl_tahoe_timing.hpp"
+#include "kern_tgl_tahoe_routing.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -78,6 +79,14 @@ extern "C" __attribute__((naked,used)) void wxTahoeTimingBridge() {
  asm volatile(WEX_TAHOE_TIMING_BRIDGE);
 }
 static bool tglTahoeTimingRequired=false,tglTahoeTimingReady=false;
+extern "C" {
+ uintptr_t wxTahoeHpdResume {},wxTahoeHpdNext {},wxTahoeHpdCounter {};
+}
+extern "C" __attribute__((naked,used)) void wxTahoeHpdBridge() {
+ asm volatile(WEX_TAHOE_HPD_BRIDGE);
+}
+static bool tglTahoeRoutingRequired=false,tglTahoeRoutingReady=false;
+
 
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
 extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
@@ -9815,6 +9824,33 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
                 // The framebuffer start wrapper below refuses admission if this guard failed.
             }
 
+            tglTahoeRoutingRequired=tglTahoeTimingRequired && checkKernelArgument("-wex-edp-routing");
+            if(tglTahoeRoutingRequired) {
+                const char *symbol="__ZN31AppleIntelFramebufferController9InjectHPDEP21AppleIntelFramebuffer";
+                patcher.clearError();
+                const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+                auto base=reinterpret_cast<uint8_t *>(address);
+                bool ok=tglTahoeTimingReady && fn>=address && TGLTahoeRouting::matches(base,size,fn-address);
+                if(ok) {
+                    wxTahoeHpdResume=address+0x75F6D;wxTahoeHpdNext=address+0x75FA6;
+                    wxTahoeHpdCounter=address+0xE7160;
+                    const auto target=reinterpret_cast<uintptr_t>(wxTahoeHpdBridge);
+                    uint8_t jump[sizeof(TGLTahoeRouting::hpdSite)];
+                    memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;
+                    memset(jump+2,0,4);memcpy(jump+6,&target,sizeof(target));
+                    ok=TGLTahoeRouting::install(base,size,fn-address,[&](size_t offset,const uint8_t *bytes,size_t length) {
+                        patcher.clearError();patcher.routeBlock(address+offset,const_cast<uint8_t *>(bytes),length);
+                        return patcher.getError()==KernelPatcher::Error::NoError;
+                    });
+                    if(ok) {
+                        patcher.clearError();patcher.routeBlock(address+0x75F59,jump,sizeof(jump));
+                        ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(base+0x75F59,jump,sizeof(jump));
+                    }
+                }
+                tglTahoeRoutingReady=ok;
+                IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelRoutingReady",ok);
+                patcher.clearError();
+            }
 			tglSonomaSurfaceFramebufferReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,true);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceFramebufferReady",tglSonomaSurfaceFramebufferReady);
 			if (modDVMTCalcFix.enabled && modDVMTCalcFix.available)
@@ -10709,7 +10745,8 @@ bool XE::tglLoadHDMIWiring(IOService *provider) {
 }
 
 bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
- if(tglTahoeTimingRequired && !tglTahoeTimingReady) return false;
+ if((tglTahoeTimingRequired && !tglTahoeTimingReady) ||
+    (tglTahoeRoutingRequired && !tglTahoeRoutingReady)) return false;
  tglRecordStartOrder(3,that);
  if(auto live=OSSerializer::forTarget(nullptr,tglTransitionSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeTransitionLive",live);live->release();
