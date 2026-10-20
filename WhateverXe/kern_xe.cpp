@@ -62,6 +62,7 @@
 #include "kern_edp_framing.hpp"
 #include "kern_edp_training_packet.hpp"
 #include "kern_edp_handoff.hpp"
+#include "kern_edp_aux_lease.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -15202,6 +15203,40 @@ void XE::tglObservePath(void *port, void *path, uint32_t event, bool done, uint3
 }
 
 uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
+ // Keep the donor's AUX reference across one qualified internal training call.
+ // Native get/put own power transitions and reference accounting. Never replay
+ // PHY initialization or transfer ownership of a firmware reference here.
+ auto self=callbackXE;auto ctl=static_cast<uint8_t *>(self->tglObservationController);
+ auto pb=static_cast<uint8_t *>(port);auto cfg=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ auto access=pb?*reinterpret_cast<uint8_t **>(pb+0x578):nullptr;
+ auto power=ctl?*reinterpret_cast<uint8_t **>(ctl+0xC8):nullptr;
+ auto &f=self->tglTCNativeFunctions;const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+ bool eligible=tglTahoeTimingRequired && tglTahoeRoutingReady && f.complete() && ctl &&
+  *f.controllerSlot==ctl && !ctl[0x918] && power && !power[0x18] &&
+  *reinterpret_cast<void **>(power+0x10)==ctl && *reinterpret_cast<void **>(power+0x78)==access &&
+  access && *reinterpret_cast<void **>(ctl+0xC40)==access && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 &&
+  pb[0x11]==2 && *reinterpret_cast<uint32_t *>(pb+0x550)==1 &&
+  *reinterpret_cast<uint32_t *>(pb+0x124)==2 && *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+  f.portByDDI(0)==port &&
+  __atomic_load_n(&tglTahoePLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+  __atomic_load_n(&tglTahoePLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(access);
+ if(eligible) {
+  auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
+  eligible=base && *reinterpret_cast<uint32_t *>(access+0x60)>=0x164294;
+  if(eligible) {
+   const auto main=*reinterpret_cast<volatile uint32_t *>(base+0x45404);
+   const auto io=*reinterpret_cast<volatile uint32_t *>(base+0x45454);
+   eligible=main!=UINT32_MAX && io!=UINT32_MAX && (main&0x3FU)==0x3FU && (io&3U)==3U;
+  }
+ }
+ uint64_t lease[8] {1};
+ const auto result=EdpAuxLease::run(eligible,[&] {
+  lease[1]=*reinterpret_cast<uint32_t *>(power+0x54);f.getAux(port);
+  lease[2]=*reinterpret_cast<uint32_t *>(power+0x54);
+ },[&] {
+  lease[3]=*reinterpret_cast<uint32_t *>(power+0x54);f.putAux(port);
+  lease[4]=*reinterpret_cast<uint32_t *>(power+0x54);
+ },[&]()->uint32_t {
  tglAUXRecord(port,10,false,0,0,0);
 	SYSLOG("igfx", "TGL330 port-training enter");
 	auto caller = __builtin_return_address(0);
@@ -15217,6 +15252,12 @@ uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
 	tglObservePath(port, nullptr, 0, true, r, request ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(request) + 0x38) : 0, caller);
 	tglDPCDPublish();
 	return r;
+ });
+ if(eligible) {
+  lease[5]=result;lease[7]=0x4C454153;
+  IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeTrainingAuxLease",lease,sizeof(lease));
+ }
+ return result;
 }
 
 void *XE::wrapTGLPathLookup(void *port) {

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <sys/mman.h>
 #include "kern_tgl_tc_native.hpp"
+#include "kern_edp_aux_lease.hpp"
 using Binding=TGLTCNativeBinding;using Status=Binding::Status;
 TGLTCNativeFunctions functions;uintptr_t vtable[64] {};unsigned auxGets {},auxPuts {},zeroCalls {};
 template<class T> T &at(void *p,unsigned off){return *reinterpret_cast<T *>(static_cast<uint8_t *>(p)+off);}
@@ -18,9 +19,9 @@ void nativeBzero(void *p,size_t n){++zeroCalls;memset(p,0,n);}
 // DDI from port+548. Only its lower hardware AUX operation is mocked. Preserve
 // the existing parent's extra PG3 reference so the separate Mode hold can be
 // distinguished from the AUX hold rather than accidentally borrowing it.
-void auxGet(void *power,uint32_t ddi){assert(power==at<void *>(*functions.controllerSlot,0xC8));assert(ddi>=3&&ddi<=8);
+void auxGet(void *power,uint32_t ddi){assert(power==at<void *>(*functions.controllerSlot,0xC8));assert(ddi<=8);
  ++auxGets;++at<uint32_t>(power,0x54+4*ddi);functions.getPG(power,3);}
-void auxPut(void *power,uint32_t ddi){assert(power==at<void *>(*functions.controllerSlot,0xC8));assert(ddi>=3&&ddi<=8);
+void auxPut(void *power,uint32_t ddi){assert(power==at<void *>(*functions.controllerSlot,0xC8));assert(ddi<=8);
  ++auxPuts;assert(at<uint32_t>(power,0x54+4*ddi)>1);--at<uint32_t>(power,0x54+4*ddi);functions.putPG(power,3);}
 void *ports[9] {};void *lookup(uint32_t d){return d<9?ports[d]:nullptr;}
 struct Bus {
@@ -128,6 +129,19 @@ int main(int argc,char **argv){
   for(auto i:order){auto &io=ios[i];assert(modes[i].disconnect(io,b.cold,b.owner(),(uintptr_t)io.binding.port,io.binding.ddi).ok());}
   assert(at<uint32_t>(b.power,0x28)==2&&b.cold.total==0&&b.unblocks==1);++orders;
  }while(std::next_permutation(order,order+3));
+ // DDI-A training uses these same real AUX wrapper instructions. The
+ // lower hardware operation remains mocked; inherited refs are never spent.
+ for(unsigned inherited : {1U,3U})for(uint32_t result : {0U,0xE00002BCU,0xE00002D6U}) {
+  Bus b;alignas(8) uint8_t panel[0x600]{};uint32_t config[8]{};
+  at<void *>(panel,0x548)=config;at<uint32_t>(b.power,0x54)=inherited;
+  const auto before=at<uint32_t>(b.power,0x28);const auto gets=auxGets,puts=auxPuts;
+  auto actual=EdpAuxLease::run(true,[&]{functions.getAux(panel);},[&]{functions.putAux(panel);},[&]{
+   assert(at<uint32_t>(b.power,0x54)==inherited+1);
+   assert(at<uint32_t>(b.power,0x28)==before+1);return result;
+  });
+  assert(actual==result && auxGets==gets+1 && auxPuts==puts+1);
+  assert(at<uint32_t>(b.power,0x54)==inherited && at<uint32_t>(b.power,0x28)==before);
+ }
  assert(zeroCalls);munmap(image,0x400000);
- printf("PASS native ABI bridge: %u TC1..6 firmware/adoption/AUX cases; 10 identity rejections; 4 power failures retained/retried; %u three-port release orders. Real base/reset, port-AUX and PG1..3 accounting. Hardware transitions/lifecycle exclusion mocked.\n",cases,orders);
+ printf("PASS native ABI bridge: %u TC1..6 firmware/adoption/AUX cases; 10 identity rejections; 4 power failures retained/retried; %u three-port release orders. Six DDI-A training leases preserve native errors and inherited refs. Real base/reset, port-AUX and PG1..3 accounting. Hardware transitions/lifecycle exclusion mocked.\n",cases,orders);
 }

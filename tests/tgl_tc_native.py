@@ -4,7 +4,8 @@ from pathlib import Path
 import argparse,hashlib,re,subprocess,tempfile
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('donor',type=Path);a=p.parse_args()
 b=a.donor.read_bytes()
-if hashlib.sha256(b).hexdigest()!='c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731':p.error('unqualified donor SHA256')
+if hashlib.sha256(b).hexdigest() not in {'c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731',
+ '8470f7edc677352a19193c005b6dcdece2e3283262d5a8ec891bf9360d755c6e'}:p.error('unqualified donor SHA256')
 r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_xe.cpp').read_text()
 for name,offset in [('tcBaseEntry',0x1b4c8),('tcAuxGetEntry',0x1d23e),('tcAuxPutEntry',0x1d27a),('tcPGGetEntry',0x5bedc),('tcPGPutEntry',0x5b366)]:
  v=re.search(r'const uint8_t '+name+r'\[\] \{([^}]+)\}',s).group(1)
