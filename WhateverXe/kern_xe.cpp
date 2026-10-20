@@ -13277,13 +13277,23 @@ uint32_t XE::wrapTGLSetPortMode(void *port, uint32_t mode) {
  }
  rightPortRecord(port,1,mode,self->tglTCModeAllowed(traceDDI,mode),self->tglLegacyTCEligible(traceDDI));
  if(!self->tglTCModeAllowed(traceDDI,mode))return kIOReturnNotReady;
- if(self->tglRightAltEligible(traceDDI) && mode==3 && tglRightAltProbe(port)!=3)return kIOReturnNotReady;
+ const bool rightAltMode=self->tglRightAltEligible(traceDDI) && mode==3;
+ if(rightAltMode && (!self->tglNativeFiaReady || !self->tglModeResultReady || !self->tglModeTransitionLock))return kIOReturnNotReady;
  auto transitionLock=self->tglModeResultReady && traceDDI>=3 && traceDDI<=8 ? self->tglModeTransitionLock : nullptr;
  if(transitionLock) {
   tglAUXRecord(port,8,false,0,mode,0);
   IORecursiveLockLock(transitionLock);
   tglAUXRecord(port,8,true,0,mode,0);
   tglRecordNativeModeBinding(port,traceDDI,mode);
+ }
+ // First insertion after a cable-free boot can enter this mode setter
+ // without wrapTGLProbePort. Reuse its powered physical/pin-D proof under
+ // the shared mode lock before allowing native FIA2 coordinate translation.
+ // This is monotonic backend qualification, not a connection/power lease.
+ if(rightAltMode) {
+  if(tglRightAltProbe(port)!=3){IORecursiveLockUnlock(transitionLock);return kIOReturnNotReady;}
+  const auto qualified=__atomic_or_fetch(&self->tglModularProbed,1U<<traceDDI,__ATOMIC_RELEASE);
+  IORegistryEntry::getRegistryRoot()->setProperty("WXRightHotplugModularProbed",qualified,32);
  }
  tglRecordStartOrder(10,port,traceDDI,mode,*reinterpret_cast<uint32_t *>(traceBytes+0x550));
 
