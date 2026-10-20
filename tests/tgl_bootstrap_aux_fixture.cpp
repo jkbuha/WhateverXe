@@ -8,6 +8,10 @@
 #include <sys/mman.h>
 #include "kern_tgl_tc_cold.hpp"
 #include "kern_tgl_pcode_gate.hpp"
+#include "kern_edp_training_packet.hpp"
+static bool tglTahoeRoutingReady=false;
+static EdpPLLFrac::Scope tglTahoePLLFracScope;
+static uint32_t tglTahoeTrainingStartCombined=0,tglTahoeLaneWriteShortened=0;
 struct IOService {};struct IOMemoryMap {};using IOLock=std::mutex;
 thread_local unsigned held;thread_local char threadIdentity;
 void IOLockLock(IOLock *p){assert(!held);p->lock();++held;}

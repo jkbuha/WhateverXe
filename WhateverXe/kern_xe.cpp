@@ -59,6 +59,8 @@
 #include "kern_edp_pll_fraction.hpp"
 #include "kern_edp_combo_profile.hpp"
 #include "kern_edp_combo_scaling.hpp"
+#include "kern_edp_framing.hpp"
+#include "kern_edp_training_packet.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -93,6 +95,7 @@ extern "C" __attribute__((naked,used)) void wxTahoeHpdBridge() {
 static bool tglTahoeRoutingRequired=false,tglTahoeRoutingReady=false;
 static EdpPLLFrac::Scope tglTahoePLLFracScope;
 static uint32_t tglTahoeComboScalingApplied=0,tglTahoePLLRewrite[4]{};
+static uint32_t tglTahoeTrainingStartCombined=0,tglTahoeLaneWriteShortened=0;
 static bool tglTahoePLLHookReady=false,tglTahoeRegisterWriteReady=false;
 
 
@@ -15226,6 +15229,8 @@ uint32_t XE::wrapTGLLightUpEdp(void *controller,void *fb,void *path,const void *
     if(scoped)EdpPLLFrac::end(tglTahoePLLFracScope,thread);
     root->setProperty("WXTahoePLLFracApplied",__atomic_load_n(&tglTahoePLLFracScope.applied,__ATOMIC_RELAXED),32);
     root->setProperty("WXTahoeComboScalingApplied",__atomic_load_n(&tglTahoeComboScalingApplied,__ATOMIC_RELAXED),32);
+    root->setProperty("WXTahoeTrainingStartCombined",__atomic_load_n(&tglTahoeTrainingStartCombined,__ATOMIC_RELAXED),32);
+    root->setProperty("WXTahoeLaneWriteShortened",__atomic_load_n(&tglTahoeLaneWriteShortened,__ATOMIC_RELAXED),32);
     if(scoped && tglTahoePLLRewrite[0])root->setProperty("WXTahoePLLFracRewrite",tglTahoePLLRewrite,sizeof(tglTahoePLLRewrite));
     root->setProperty("WXTahoeLightUpEdpResult",result,32);
     tglObservePath(nullptr,path,3,true,result,0,__builtin_return_address(0));
@@ -15805,6 +15810,20 @@ uint32_t XE::wrapTGLReadAUX(void *port, uint32_t address, void *data, uint32_t l
 }
 
 uint32_t XE::wrapTGLWriteAUX(void *port, uint32_t address, void *data, uint32_t length) {
+    uint8_t trainingStart[3]{};
+    if(tglTahoeRoutingReady) {
+    auto pb=static_cast<uint8_t *>(port);auto cfg=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+    const bool qualified=tglTahoeRoutingReady && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 &&
+        pb[0x11]==2 && *reinterpret_cast<uint32_t *>(pb+0x550)==1 &&
+        *reinterpret_cast<uint32_t *>(pb+0x124)==2 && *reinterpret_cast<uint32_t *>(pb+0x128)==10;
+    const auto access=pb?reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(pb+0x578)):0;
+    const auto changed=EdpTrainingPacket::prepare(tglTahoePLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),
+        access,qualified,address,data,length,trainingStart);
+    if(changed==1)__atomic_add_fetch(&tglTahoeTrainingStartCombined,1U,__ATOMIC_RELAXED);
+    if(changed==2)__atomic_add_fetch(&tglTahoeLaneWriteShortened,1U,__ATOMIC_RELAXED);
+
+    }
+
 	auto caller = __builtin_return_address(0);
 	tglDPCDRecord(port, address, data, length, true, false, 0, caller);
 	const auto r = tglInvokeBootstrapAUX(callbackXE->tglBootstrapAUXReady, 1, port, [&] {
@@ -15931,6 +15950,33 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 		}
 	}
 	const auto result = FunctionCast(wrapTGLTrainingPattern, callbackXE->orgTGLTrainingPattern)(path, pattern);
+    // SST counterpart of the upstream TC framing correction. Native pattern
+    // programming retains ownership of power and all unrelated register bits.
+    if(!result && pattern<=5 && port && tglTahoeRoutingReady) {
+        auto pb=static_cast<uint8_t *>(port);auto cfg=*reinterpret_cast<uint32_t **>(pb+0x548);
+        auto access=*reinterpret_cast<uint8_t **>(pb+0x578);
+        const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+        const bool qualified=cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 && !pb[0x117] && pb[0x11A]<=1 &&
+            *reinterpret_cast<uint32_t *>(pb+0x550)==1 && *reinterpret_cast<uint32_t *>(pb+0x124)==2 &&
+            *reinterpret_cast<uint32_t *>(pb+0x128)==10 &&
+            *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640)==0 && access &&
+            __atomic_load_n(&tglTahoePLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+            __atomic_load_n(&tglTahoePLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(access) &&
+            *reinterpret_cast<uint32_t *>(access+0x60)>=0x60544;
+        if(qualified) {
+            const auto main=wrapTGLRegisterRead(access,0x45404),io=wrapTGLRegisterRead(access,0x45454);
+            if(main!=UINT32_MAX && io!=UINT32_MAX && (main&0x3F)==0x3F && (io&3)==3) {
+                const auto before=wrapTGLRegisterRead(access,0x60540);
+                const auto wanted=EdpFraming::value(tglTahoePLLFracScope,thread,reinterpret_cast<uintptr_t>(access),0x60540,before,pb[0x11A]);
+                if(wanted!=before)wrapTGLRegisterWrite(access,0x60540,wanted);
+                const auto after=wrapTGLRegisterRead(access,0x60540);
+                uint32_t record[]={1,pattern,pb[0x11A],before,wanted,after,before!=wanted,0x4652414D};
+                char key[64];snprintf(key,sizeof(key),"WXTahoeFramingPattern%u",pattern);
+                IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));
+            }
+        }
+    }
+
 	// The donor constructs DP_TP_CTL from enable/MST/pattern only, losing bit18.
 	// Its own normal and fast training write port+11a to DPCD101 bit7. Use that
 	// same negotiated field, not an unconditional enhanced-framing override.
