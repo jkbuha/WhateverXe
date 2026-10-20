@@ -52,6 +52,7 @@
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
 #include "kern_tgl_aux_call.hpp"
+#include "kern_tgl_tahoe_timing.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -70,6 +71,14 @@
 #include <libkern/c++/OSData.h>
 
 extern "C" const char version[];
+extern "C" {
+ uintptr_t wxTahoeTimingResume {},wxTahoeTimingEmpty {};
+}
+extern "C" __attribute__((naked,used)) void wxTahoeTimingBridge() {
+ asm volatile(WEX_TAHOE_TIMING_BRIDGE);
+}
+static bool tglTahoeTimingRequired=false,tglTahoeTimingReady=false;
+
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
 extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
  // Exact haltCommandStreamer keeps engine in r14d, scheduler in r15.
@@ -9782,6 +9791,30 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 	if (tglRequested) {
 		if (!tglActive) return false;
 		if (currentFramebuffer->loadIndex == index) {
+            tglTahoeTimingRequired=TGLTahoeTiming::requested(xeProfile.identity,xeProfile.revision,
+                xeProfile.overridden(),XELP::kernelOS(version)==XELP::OS::Tahoe);
+            if(tglTahoeTimingRequired) {
+                const char *symbol="__ZN31AppleIntelFramebufferController35hwCRTCToIODetailedTimingInformationEP21AppleIntelFramebufferP29IODetailedTimingInformationV2";
+                patcher.clearError();
+                const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+                bool ok=fn>=address && TGLTahoeTiming::matches(reinterpret_cast<const uint8_t *>(address),size,fn-address);
+                if(ok) {
+                    wxTahoeTimingResume=address+TGLTahoeTiming::resume;
+                    wxTahoeTimingEmpty=address+TGLTahoeTiming::empty;
+                    const auto target=reinterpret_cast<uintptr_t>(wxTahoeTimingBridge);
+                    uint8_t jump[sizeof(TGLTahoeTiming::timingMath)];
+                    memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;
+                    memset(jump+2,0,4);memcpy(jump+6,&target,sizeof(target));
+                    patcher.routeBlock(address+TGLTahoeTiming::site,jump,sizeof(jump));
+                    ok=patcher.getError()==KernelPatcher::Error::NoError &&
+                        !memcmp(reinterpret_cast<const void *>(address+TGLTahoeTiming::site),jump,sizeof(jump));
+                }
+                tglTahoeTimingReady=ok;
+                IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeTimingGuardReady",ok);
+                patcher.clearError();
+                // The framebuffer start wrapper below refuses admission if this guard failed.
+            }
+
 			tglSonomaSurfaceFramebufferReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,true);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceFramebufferReady",tglSonomaSurfaceFramebufferReady);
 			if (modDVMTCalcFix.enabled && modDVMTCalcFix.available)
@@ -10676,6 +10709,7 @@ bool XE::tglLoadHDMIWiring(IOService *provider) {
 }
 
 bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
+ if(tglTahoeTimingRequired && !tglTahoeTimingReady) return false;
  tglRecordStartOrder(3,that);
  if(auto live=OSSerializer::forTarget(nullptr,tglTransitionSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeTransitionLive",live);live->release();
