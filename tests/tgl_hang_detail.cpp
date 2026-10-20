@@ -116,5 +116,18 @@ int main(int argc,char **argv) {
  {Fixture f;f.root();f.put(LRC+0x1024,uint32_t(0));auto c=f.run();assert(c->q[29]==5 && !c->graph.q[2]);}
  {Fixture f;f.root();f.mutateCache=true;auto c=f.run();assert(c->q[1]==8 && c->q[29]==4);}
  {Fixture f;f.root();f.partial=true;auto c=f.run();assert(c->graph.q[5]&TGLHangGraph::ReadHole);assert(!c->graph.q[2]);}
+ // Saved BB is outside the pending submission root. Capture its PPGTT
+ // page separately, including explicit missing-mapping evidence.
+ for(bool mapped:{false,true}) {
+  Fixture f;const uint64_t raw=Main+0x72D5;memcpy(f.regs+0x70,&raw,8);
+  if(mapped){f.leaf(Main+0x7000,0x80000);f.put(K+0x802D4,uint32_t(0x7A000004));}
+  auto c=f.run();assert(!c->q[1]);bool found=false;
+  for(unsigned i=0;i<c->graph.q[1];++i)if(c->graph.pages[i].q[0]==Main+0x7000) {
+   const auto &p=c->graph.pages[i];found=true;assert(p.q[7]==4);
+   if(mapped)assert(!p.q[4] && p.q[2]==4096 && p.q[3] && p.q[5] && !p.q[6] && TGLHangGraph::word(p.bytes+0x2D4)==0x7A000004);
+   else assert(p.q[4] && !p.q[2]);
+  }
+  assert(found && c->graph.q[2]==1);
+ }
  printf("detail bytes=%zu graph offset=%zu pending offset=%zu tests passed\n",sizeof(Capture),offsetof(Capture,graph),offsetof(Capture,pending));
 }

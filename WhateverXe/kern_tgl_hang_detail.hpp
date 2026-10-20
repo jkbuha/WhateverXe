@@ -150,6 +150,13 @@ void collect(Capture &c,const TGLHangPending::Capture &pending,const uint8_t *re
  auto pageReader=[&](TGLHangGraph::Page &p){mappedPage(p,b,directBase,directEnd,read,physical);};
  TGLHangGraph::Walker<decltype(pageReader)> walker{c.graph,pageReader};
  ringRoot(c,read,walker);if(c.q[1]==8)return;
+ // Preserve the saved BB page under the selected context's PPGTT as a
+ // separate address-space hypothesis. Do not parse it as a pending request.
+ // Provenance bit2 distinguishes this page from native submission graphs.
+ const auto activeBB=TGLHangPending::u64(regs+0x70);
+ if((activeBB&1) && !(activeBB>>47) && (activeBB&~4095ULL)) {
+  walker.provenance=4;walker.page(activeBB&~4095ULL,TGLHangGraph::Command);walker.provenance=1;
+ }
  // Prioritize the candidate nearest the saved ring head, then the smallest
  // positive retired delta. Header search is a ranking hint, not an execution claim.
  uint64_t score[4];unsigned order[4];
