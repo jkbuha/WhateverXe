@@ -61,6 +61,7 @@
 #include "kern_edp_combo_scaling.hpp"
 #include "kern_edp_framing.hpp"
 #include "kern_edp_training_packet.hpp"
+#include "kern_edp_handoff.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -96,6 +97,33 @@ static bool tglTahoeRoutingRequired=false,tglTahoeRoutingReady=false;
 static EdpPLLFrac::Scope tglTahoePLLFracScope;
 static uint32_t tglTahoeComboScalingApplied=0,tglTahoePLLRewrite[4]{};
 static uint32_t tglTahoeTrainingStartCombined=0,tglTahoeLaneWriteShortened=0;
+static EdpHandoff::Evidence tglTahoePanelSnapshots {};
+static TGLTahoePanelClock::Report tglTahoePanelClockReport {};
+static void tglTahoeCapturePanelState(void *access,void *controller,unsigned phase,bool qualified) {
+    auto manager=static_cast<uint8_t *>(access);auto ctl=static_cast<uint8_t *>(controller);
+    if(!qualified || !manager || !ctl || *reinterpret_cast<void **>(ctl+0xC40)!=access ||
+        *reinterpret_cast<uint32_t *>(manager+0x60)<0x164294)return;
+    auto base=*reinterpret_cast<volatile uint8_t **>(manager+0x50);if(!base)return;
+    uint32_t software[]={*reinterpret_cast<uint32_t *>(ctl+0xC5C),*reinterpret_cast<uint32_t *>(ctl+0xD48),
+        *reinterpret_cast<uint32_t *>(ctl+0x1548),*reinterpret_cast<uint32_t *>(ctl+0x154C),
+        *reinterpret_cast<uint32_t *>(ctl+0x1550),*reinterpret_cast<uint32_t *>(ctl+0x1554),
+        *reinterpret_cast<uint32_t *>(ctl+0x1558),*reinterpret_cast<uint32_t *>(ctl+0xCE4)};
+    EdpHandoff::capture(tglTahoePanelSnapshots,phase,true,0,0,0,software,
+        [&](uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(base+reg);});
+}
+static void tglTahoePublishPanelState() {
+    // Version 3: 12 clock-report words followed by four (state + 160-word)
+    // powered snapshots. Heap storage avoids adding 2.6 KB to modeset stacks.
+    constexpr size_t words=12+4*161;
+    auto data=static_cast<uint32_t *>(IOMalloc(words*sizeof(uint32_t)));if(!data)return;
+    memset(data,0,words*sizeof(uint32_t));memcpy(data,&tglTahoePanelClockReport,12*sizeof(uint32_t));data[0]=3;
+    for(unsigned i=0;i<4;++i)if(__atomic_load_n(&tglTahoePanelSnapshots.slots[i].state,__ATOMIC_ACQUIRE)==2) {
+        data[12+i*161]=2;memcpy(data+13+i*161,tglTahoePanelSnapshots.slots[i].q,160*sizeof(uint32_t));
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelClockRoute",data,words*sizeof(uint32_t));
+    IOFree(data,words*sizeof(uint32_t));
+}
+
 static bool tglTahoePLLHookReady=false,tglTahoeRegisterWriteReady=false;
 
 
@@ -15224,9 +15252,13 @@ uint32_t XE::wrapTGLLightUpEdp(void *controller,void *fb,void *path,const void *
     const auto thread=reinterpret_cast<uintptr_t>(current_thread());
     const bool scoped=target && EdpPLLFrac::begin(tglTahoePLLFracScope,thread,reinterpret_cast<uintptr_t>(access));
     auto root=IORegistryEntry::getRegistryRoot();root->setProperty("WXTahoePLLScoped",scoped);
+    tglTahoeCapturePanelState(access,controller,0,scoped);
+    tglTahoePublishPanelState();
     tglObservePath(nullptr,path,3,false,0,0,__builtin_return_address(0));
     const auto result=FunctionCast(wrapTGLLightUpEdp,self->orgTGLLightUpEdp)(controller,fb,path,timing);
+    tglTahoeCapturePanelState(access,controller,3,scoped);
     if(scoped)EdpPLLFrac::end(tglTahoePLLFracScope,thread);
+    tglTahoePublishPanelState();
     root->setProperty("WXTahoePLLFracApplied",__atomic_load_n(&tglTahoePLLFracScope.applied,__ATOMIC_RELAXED),32);
     root->setProperty("WXTahoeComboScalingApplied",__atomic_load_n(&tglTahoeComboScalingApplied,__ATOMIC_RELAXED),32);
     root->setProperty("WXTahoeTrainingStartCombined",__atomic_load_n(&tglTahoeTrainingStartCombined,__ATOMIC_RELAXED),32);
@@ -15869,7 +15901,9 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
         TGLTahoePanelClock::Report report;
         TGLTahoePanelClock::apply(io,admitted,pipe,*reinterpret_cast<uint32_t *>(pb+0x124),
             *reinterpret_cast<uint32_t *>(pb+0x128),*pathClock,pathFunction,report);
-        IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelClockRoute",&report,sizeof(report));
+        tglTahoePanelClockReport=report;
+        tglTahoeCapturePanelState(access,ctl,1,admitted);
+        tglTahoePublishPanelState();
     }
 
 	// TGL needs the transcoder clock and DDI route before enabling DP_TP_CTL.
@@ -15966,6 +16000,8 @@ uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
         if(qualified) {
             const auto main=wrapTGLRegisterRead(access,0x45404),io=wrapTGLRegisterRead(access,0x45454);
             if(main!=UINT32_MAX && io!=UINT32_MAX && (main&0x3F)==0x3F && (io&3)==3) {
+                tglTahoeCapturePanelState(access,callbackXE->tglObservationController,2,true);
+                tglTahoePublishPanelState();
                 const auto before=wrapTGLRegisterRead(access,0x60540);
                 const auto wanted=EdpFraming::value(tglTahoePLLFracScope,thread,reinterpret_cast<uintptr_t>(access),0x60540,before,pb[0x11A]);
                 if(wanted!=before)wrapTGLRegisterWrite(access,0x60540,wanted);
