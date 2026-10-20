@@ -64,6 +64,7 @@
 #include "kern_edp_handoff.hpp"
 #include "kern_edp_aux_lease.hpp"
 #include "kern_tgl_panel_power.hpp"
+#include "kern_tgl_tahoe_resolve_scratch.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -101,6 +102,21 @@ static void tglPublishPanelPower() {
  const auto &s=tglPanelPowerLease;
  uint32_t q[]={1,tglPanelPowerReady,s.held,s.gets,s.puts,s.inheritedPuts,s.errors,s.fault};
  IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelPower",q,sizeof(q));
+}
+
+extern "C" {
+ uint32_t wxTahoeResolveScratchEnabled=0,wxTahoeResolveScratchFixes=0;
+ uintptr_t wxTahoeResolveScratchResume=0;
+}
+extern "C" __attribute__((naked,used)) void wxTahoeResolveScratchBridge() {
+ asm volatile(WEX_TAHOE_RESOLVE_SCRATCH_BRIDGE);
+}
+static bool wxTahoeResolveScratchStats(void *,void *,OSSerialize *serializer) {
+ // CPU-only counters; this serializer never accesses GPU state.
+ const uint32_t q[]={1,__atomic_load_n(&wxTahoeResolveScratchEnabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&wxTahoeResolveScratchFixes,__ATOMIC_RELAXED),0x5000};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
 extern "C" {
@@ -9146,6 +9162,32 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				ccsReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ccsSite,ccsReplace,sizeof(ccsReplace));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSPageReservationReady",ccsReady);
+            // Port only the owned synchronization-slot correction; panel routing
+            // and native draw/shader/rectangle operations remain unchanged.
+            const auto resolveSymbol=patcher.solveSymbol<mach_vm_address_t>(index,
+             "__Z11resolve_ccsP25IOAccelCommandBufferPool2P14IGMappedBufferP22color_resolve_params_tbRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyE",address,size);
+            const auto scratchSymbol=patcher.solveSymbol<mach_vm_address_t>(index,"_g7_resolve_scratch_space_size",address,size);
+            const bool scratchScope=TGLTahoeTiming::requested(xeProfile.identity,xeProfile.revision,xeProfile.overridden(),
+             XELP::kernelOS(version)==XELP::OS::Tahoe) && checkKernelArgument("-disablegfxfirmware");
+            bool scratchReady=scratchScope && ccsReady && resolveSymbol>=address && scratchSymbol>=address &&
+             TGLTahoeResolveScratch::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address,scratchSymbol-address);
+            patcher.clearError();
+            if(scratchReady) {
+             auto site=reinterpret_cast<uint8_t *>(address+TGLTahoeResolveScratch::Site);
+             wxTahoeResolveScratchResume=address+TGLTahoeResolveScratch::Resume;
+             uint8_t jump[sizeof(TGLTahoeResolveScratch::Original)];memset(jump,0x90,sizeof(jump));
+             jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(wxTahoeResolveScratchBridge);memcpy(jump+6,&target,8);
+             patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(site),jump,sizeof(jump));
+             scratchReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,jump,sizeof(jump));
+            }
+            __atomic_store_n(&wxTahoeResolveScratchEnabled,scratchReady?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveScratchReady",scratchReady);
+            if(scratchReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveScratchStats)) {
+             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveScratchStats",stats);stats->release();
+            }
+            patcher.clearError();
+
 			patcher.clearError();
 			// r287: HiZ resolve lays out commands/state relative to cursor+4096,
 			// but requests only the *remaining* pool space, so the pool never
