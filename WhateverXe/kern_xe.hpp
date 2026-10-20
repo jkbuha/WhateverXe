@@ -405,13 +405,14 @@ private:
 	mach_vm_address_t orgTGLTrainingPattern {}, orgTGLPowerDDIState {};
 	static uint32_t wrapTGLTrainingPattern(void *path, uint32_t pattern);
 	mach_vm_address_t orgTGLPortTraining {}, orgTGLPathLookup {}, orgTGLFreePath {};
-	mach_vm_address_t orgTGLLightUpDP {}, orgTGLDisableDisplay {}, orgTGLEnablePipe {};
+	mach_vm_address_t orgTGLLightUpEdp {}, orgTGLLightUpDP {}, orgTGLDisableDisplay {}, orgTGLEnablePipe {};
 	mach_vm_address_t orgTGLReadAUX {}, orgTGLWriteAUX {}, orgTGLI2CAUX {};
 	bool tglBootstrapAUXReady {};
 	static uint32_t wrapTGLPortTraining(void *port, void *request);
 	static void *wrapTGLPathLookup(void *port);
 	static void wrapTGLFreePath(void *path);
 	static uint32_t wrapTGLLightUpDP(void *controller, void *fb, void *path, const void *timing);
+	static uint32_t wrapTGLLightUpEdp(void *controller, void *fb, void *path, const void *timing);
 	static uint32_t wrapTGLDisableDisplay(void *controller, void *fb, void *path, uint8_t flag);
 	static void wrapTGLEnablePipe(void *controller, void *fb, void *path, const void *timing);
 	static uint32_t wrapTGLReadAUX(void *port, uint32_t address, void *data, uint32_t length);

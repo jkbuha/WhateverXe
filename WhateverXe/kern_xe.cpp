@@ -56,6 +56,7 @@
 #include "kern_tgl_tahoe_routing.hpp"
 #include "kern_tgl_tahoe_panel_clock.hpp"
 #include "kern_edp_aux_auto.hpp"
+#include "kern_edp_pll_fraction.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -88,6 +89,8 @@ extern "C" __attribute__((naked,used)) void wxTahoeHpdBridge() {
  asm volatile(WEX_TAHOE_HPD_BRIDGE);
 }
 static bool tglTahoeRoutingRequired=false,tglTahoeRoutingReady=false;
+static EdpPLLFrac::Scope tglTahoePLLFracScope;
+static bool tglTahoePLLHookReady=false,tglTahoeRegisterWriteReady=false;
 
 
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
@@ -9860,6 +9863,18 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
                         });
                     IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeAuxAutoReady",ok);
                 }
+                if(ok) {
+                    const char *edp="__ZN31AppleIntelFramebufferController10LightUpEDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2";
+                    patcher.clearError();const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,edp,address,size);
+                    bool known=fn>=address && EdpPLLFrac::donorMatches(base,size,fn-address);
+                    if(known) {
+                        KernelPatcher::RouteRequest hook(edp,wrapTGLLightUpEdp,orgTGLLightUpEdp);
+                        known=patcher.routeMultiple(index,&hook,1,address,size);
+                    }
+                    tglTahoePLLHookReady=known;
+                    IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePLLHookReady",known);
+                    patcher.clearError();
+                }
                 tglTahoeRoutingReady=ok;
                 IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelRoutingReady",ok);
                 patcher.clearError();
@@ -10256,6 +10271,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 					{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32Emj", wrapTGLRegisterWrite, orgTGLRegisterWrite}
 				};
 				const bool routed = patcher.routeMultiple(index, routes, arrsize(routes), address, size);
+                tglTahoeRegisterWriteReady=routed;
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGRouteGammaWrites", routed);
 				patcher.clearError();
 			}
@@ -15186,6 +15202,31 @@ void XE::wrapTGLFreePath(void *path) {
 	tglObservePath(port, path, 2, true, 0, 0, caller);
 }
 
+uint32_t XE::wrapTGLLightUpEdp(void *controller,void *fb,void *path,const void *timing) {
+    auto self=callbackXE;auto ctl=static_cast<uint8_t *>(controller);
+    auto pb=path?*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
+    auto cfg=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+    auto access=ctl?*reinterpret_cast<void **>(ctl+0xC40):nullptr;
+    bool target=tglTahoeRoutingReady && tglTahoePLLHookReady && tglTahoeRegisterWriteReady &&
+        ctl && ctl==self->tglObservationController && fb && fb==*reinterpret_cast<void **>(ctl+0xD60) &&
+        path && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 &&
+        *reinterpret_cast<uint32_t *>(pb+0x550)==1 && *reinterpret_cast<uint32_t *>(pb+0x124)==2 &&
+        *reinterpret_cast<uint32_t *>(pb+0x128)==10 && access &&
+        *reinterpret_cast<void **>(pb+0x578)==access &&
+        *reinterpret_cast<void **>(static_cast<uint8_t *>(fb)+0x4A40)==access &&
+        *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640)==0;
+    const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+    const bool scoped=target && EdpPLLFrac::begin(tglTahoePLLFracScope,thread,reinterpret_cast<uintptr_t>(access));
+    auto root=IORegistryEntry::getRegistryRoot();root->setProperty("WXTahoePLLScoped",scoped);
+    tglObservePath(nullptr,path,3,false,0,0,__builtin_return_address(0));
+    const auto result=FunctionCast(wrapTGLLightUpEdp,self->orgTGLLightUpEdp)(controller,fb,path,timing);
+    if(scoped)EdpPLLFrac::end(tglTahoePLLFracScope,thread);
+    root->setProperty("WXTahoePLLFracApplied",__atomic_load_n(&tglTahoePLLFracScope.applied,__ATOMIC_RELAXED),32);
+    root->setProperty("WXTahoeLightUpEdpResult",result,32);
+    tglObservePath(nullptr,path,3,true,result,0,__builtin_return_address(0));
+    return result;
+}
+
 uint32_t XE::wrapTGLLightUpDP(void *controller, void *fb, void *path, const void *timing) {
  auto port=path?*reinterpret_cast<void **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
  tglAUXRecord(port,11,false,0,0,0);
@@ -15530,6 +15571,14 @@ void XE::tglObserveScanout(void *fb, void *plane, uint32_t event, bool done, uin
 // Per-thread slots span the synchronous gamma call; publication is after it has
 // returned and released its native register lock. Upload and readback stay separate.
 void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
+    const auto original=value;
+    value=EdpPLLFrac::writeValue(tglTahoePLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),
+        reinterpret_cast<uintptr_t>(access),reg,value);
+    if(value!=original) {
+        uint32_t record[]={1,static_cast<uint32_t>(reg),original,value};
+        IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePLLFracRewrite",record,sizeof(record));
+    }
+
 	auto &tx = tglClockOffTransaction;
 	if (callbackXE->tglClockOffCaller && reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == callbackXE->tglClockOffCaller &&
 		reg == tx.clockReg && !(value & 0xF0000000U) &&
