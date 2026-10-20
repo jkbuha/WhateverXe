@@ -54,6 +54,7 @@
 #include "kern_tgl_aux_call.hpp"
 #include "kern_tgl_tahoe_timing.hpp"
 #include "kern_tgl_tahoe_routing.hpp"
+#include "kern_tgl_tahoe_panel_clock.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -15749,6 +15750,36 @@ uint32_t XE::wrapTGLI2CAUX(void *port, uint32_t command, uint32_t *packet, uint3
 uint32_t XE::wrapTGLTrainingPattern(void *path, uint32_t pattern) {
 	auto port = *reinterpret_cast<void **>(static_cast<uint8_t *>(path) + 0x3648);
 	tglObserveActivation(callbackXE->tglObservationController, port, path, 1, false, pattern);
+    // DDI A uses the same (port+1) clock/route encoding as the TC backend.
+    // Keep this correction confined to the captured physical panel path.
+    if(pattern==1 && path && port && tglTahoeRoutingReady) {
+        auto self=callbackXE;auto pb=static_cast<uint8_t *>(port);
+        auto cfg=*reinterpret_cast<uint32_t **>(pb+0x548);
+        auto fb=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x32B0);
+        auto ctl=fb?*reinterpret_cast<uint8_t **>(fb+0x1D0):nullptr;
+        auto access=ctl?*reinterpret_cast<uint8_t **>(ctl+0xC40):nullptr;
+        const auto pipe=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640);
+        bool admitted=tglTahoeTimingRequired && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0 &&
+            *reinterpret_cast<uint32_t *>(pb+0x550)==1 && ctl && ctl==self->tglObservationController &&
+            *reinterpret_cast<void **>(ctl+0xD60)==fb && access &&
+            *reinterpret_cast<void **>(pb+0x578)==access &&
+            *reinterpret_cast<void **>(fb+0x4A40)==access;
+        auto base=admitted?*reinterpret_cast<volatile uint8_t **>(access+0x50):nullptr;
+        const auto length=admitted?*reinterpret_cast<uint32_t *>(access+0x60):0;
+        admitted=admitted && base && length>=0x64004;
+        struct IO {
+            volatile uint8_t *base;
+            uint32_t read(uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(base+reg);}
+            void write(uint32_t reg,uint32_t value){*reinterpret_cast<volatile uint32_t *>(base+reg)=value;}
+        } io {base};
+        auto pathClock=reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x128);
+        const auto pathFunction=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x12C);
+        TGLTahoePanelClock::Report report;
+        TGLTahoePanelClock::apply(io,admitted,pipe,*reinterpret_cast<uint32_t *>(pb+0x124),
+            *reinterpret_cast<uint32_t *>(pb+0x128),*pathClock,pathFunction,report);
+        IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelClockRoute",&report,sizeof(report));
+    }
+
 	// TGL needs the transcoder clock and DDI route before enabling DP_TP_CTL.
 	// Donor LightUpDP writes TRANS_CLK_SEL only after linkTraining returns.
 	// Apply only to a qualified legacy SST backend with an inactive output;
