@@ -57,6 +57,8 @@
 #include "kern_tgl_tahoe_panel_clock.hpp"
 #include "kern_edp_aux_auto.hpp"
 #include "kern_edp_pll_fraction.hpp"
+#include "kern_edp_combo_profile.hpp"
+#include "kern_edp_combo_scaling.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -90,6 +92,7 @@ extern "C" __attribute__((naked,used)) void wxTahoeHpdBridge() {
 }
 static bool tglTahoeRoutingRequired=false,tglTahoeRoutingReady=false;
 static EdpPLLFrac::Scope tglTahoePLLFracScope;
+static uint32_t tglTahoeComboScalingApplied=0,tglTahoePLLRewrite[4]{};
 static bool tglTahoePLLHookReady=false,tglTahoeRegisterWriteReady=false;
 
 
@@ -15222,6 +15225,8 @@ uint32_t XE::wrapTGLLightUpEdp(void *controller,void *fb,void *path,const void *
     const auto result=FunctionCast(wrapTGLLightUpEdp,self->orgTGLLightUpEdp)(controller,fb,path,timing);
     if(scoped)EdpPLLFrac::end(tglTahoePLLFracScope,thread);
     root->setProperty("WXTahoePLLFracApplied",__atomic_load_n(&tglTahoePLLFracScope.applied,__ATOMIC_RELAXED),32);
+    root->setProperty("WXTahoeComboScalingApplied",__atomic_load_n(&tglTahoeComboScalingApplied,__ATOMIC_RELAXED),32);
+    if(scoped && tglTahoePLLRewrite[0])root->setProperty("WXTahoePLLFracRewrite",tglTahoePLLRewrite,sizeof(tglTahoePLLRewrite));
     root->setProperty("WXTahoeLightUpEdpResult",result,32);
     tglObservePath(nullptr,path,3,true,result,0,__builtin_return_address(0));
     return result;
@@ -15571,12 +15576,19 @@ void XE::tglObserveScanout(void *fb, void *plane, uint32_t event, bool done, uin
 // Per-thread slots span the synchronous gamma call; publication is after it has
 // returned and released its native register lock. Upload and readback stay separate.
 void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
+    const auto scaled=EdpComboScaling::writeValue(tglTahoePLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),
+        reinterpret_cast<uintptr_t>(access),reg,value);
+    if(scaled!=value) {
+        __atomic_add_fetch(&tglTahoeComboScalingApplied,1U,__ATOMIC_RELAXED);
+        value=scaled;
+    }
+
     const auto original=value;
     value=EdpPLLFrac::writeValue(tglTahoePLLFracScope,reinterpret_cast<uintptr_t>(current_thread()),
         reinterpret_cast<uintptr_t>(access),reg,value);
     if(value!=original) {
-        uint32_t record[]={1,static_cast<uint32_t>(reg),original,value};
-        IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePLLFracRewrite",record,sizeof(record));
+        tglTahoePLLRewrite[0]=1;tglTahoePLLRewrite[1]=static_cast<uint32_t>(reg);
+        tglTahoePLLRewrite[2]=original;tglTahoePLLRewrite[3]=value;
     }
 
 	auto &tx = tglClockOffTransaction;
@@ -16016,6 +16028,30 @@ void XE::tglSnapshotTransmitter(void *port, bool done, uint32_t result) {
 // Linux v6.12 tgl_dkl_phy_trans_dp_hbr2. Use its synchronous PortDriveConfig
 // override, keeping the native lane mask, RMW, PMD hook and return value.
 uint32_t XE::wrapTGLSignalLevels(void *port, uint32_t swing, uint32_t emphasis, void *overrideConfig) {
+    auto comboAccess=port?*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(port)+0x578):nullptr;
+    const auto thread=reinterpret_cast<uintptr_t>(current_thread());
+    bool scoped=tglTahoeRoutingReady && tglTahoePLLHookReady && tglTahoeRegisterWriteReady && comboAccess &&
+        __atomic_load_n(&tglTahoePLLFracScope.thread,__ATOMIC_ACQUIRE)==thread &&
+        __atomic_load_n(&tglTahoePLLFracScope.access,__ATOMIC_RELAXED)==reinterpret_cast<uintptr_t>(comboAccess) &&
+        *reinterpret_cast<uint32_t *>(comboAccess+0x60)>=0x162BA0;
+    if(scoped) {
+        const auto main=wrapTGLRegisterRead(comboAccess,0x45404);
+        const auto io=wrapTGLRegisterRead(comboAccess,0x45454);
+        scoped=main!=UINT32_MAX && io!=UINT32_MAX && (main&0x3F)==0x3F && (io&3)==3;
+    }
+    EdpComboProfile::Report comboReport;
+    if(scoped && EdpComboProfile::apply(tglTahoePLLFracScope,thread,port,swing,emphasis,overrideConfig,
+        [&](uint32_t reg){return wrapTGLRegisterRead(comboAccess,reg);},
+        [&](uint32_t reg,uint32_t value){wrapTGLRegisterWrite(comboAccess,reg,value);},
+        [&](void *selected){return FunctionCast(wrapTGLSignalLevels,callbackXE->orgTGLSignalLevels)(port,swing,emphasis,selected);},comboReport)) {
+        static uint32_t sequence=0;const auto n=__atomic_add_fetch(&sequence,1U,__ATOMIC_RELAXED);
+        uint32_t record[]={1,n,swing,emphasis,comboReport.level,comboReport.result,comboReport.applied,0x434F4D42};
+        if(n<=32) {char key[64];snprintf(key,sizeof(key),"WXTahoeComboProfileFirst%u",n);
+            IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(record));}
+        IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeComboProfileCalls",n,32);
+        return comboReport.result;
+    }
+
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = bytes ? *reinterpret_cast<uint32_t **>(bytes + 0x548) : nullptr;
 	const auto rate = bytes ? *reinterpret_cast<uint32_t *>(bytes + 0x128) : 0;
