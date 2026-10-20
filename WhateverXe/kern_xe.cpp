@@ -55,6 +55,7 @@
 #include "kern_tgl_tahoe_timing.hpp"
 #include "kern_tgl_tahoe_routing.hpp"
 #include "kern_tgl_tahoe_panel_clock.hpp"
+#include "kern_edp_aux_auto.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -9847,6 +9848,17 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
                         patcher.clearError();patcher.routeBlock(address+0x75F59,jump,sizeof(jump));
                         ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(base+0x75F59,jump,sizeof(jump));
                     }
+                }
+                if(ok) {
+                    const auto aux=patcher.solveSymbol<mach_vm_address_t>(index,
+                        "__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",address,size);
+                    patcher.clearError();
+                    ok=EdpAuxAuto::install(base,size,aux>=address?aux-address:0,
+                        tglTahoeTimingRequired,[&](size_t offset,const uint8_t *bytes,size_t length) {
+                            patcher.clearError();patcher.routeBlock(address+offset,const_cast<uint8_t *>(bytes),length);
+                            return patcher.getError()==KernelPatcher::Error::NoError;
+                        });
+                    IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeAuxAutoReady",ok);
                 }
                 tglTahoeRoutingReady=ok;
                 IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelRoutingReady",ok);

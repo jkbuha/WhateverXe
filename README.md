@@ -137,7 +137,7 @@ Alder Lake-N / Twin Lake.
 | `-wexbeta` | Bypass the plugin's OS-version check. Exact kernel/driver checks still apply. |
 | `-wex-tgl-off` | Disable the Tiger Lake path. |
 | `-wex-noaccel` | Tiger Lake framebuffer-only mode; blocks accelerator probing. |
-| `-wex-edp-routing` | Experimental panel-port routing, pre-training clock selection and null hotplug-path protection on Tahoe for physical Tiger Lake 9A49 revision 1, with exact donor instruction checks. This does not establish complete internal-display support. |
+| `-wex-edp-routing` | Experimental panel-port routing, pre-training clock selection, native AUX power control and null hotplug-path protection on Tahoe for physical Tiger Lake 9A49 revision 1, with exact donor instruction checks. This does not establish complete internal-display support. |
 
 ## Tested features and known issues
 

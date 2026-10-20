@@ -98,7 +98,7 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wexbeta` | プラグインのOSバージョンチェックを回避する。kernel／driverの一致条件は維持する。 |
 | `-wex-tgl-off` | Tiger Lakeの処理を無効にする。 |
 | `-wex-noaccel` | Tiger LakeのFramebuffer単独モード。Acceleratorのprobeを停止します。 |
-| `-wex-edp-routing` | Tahoe上の物理Tiger Lake 9A49 revision 1向けの実験的なパネルポート経路、トレーニング前のクロック選択、null hotplugパスの保護。donor命令の完全一致を確認します。内蔵ディスプレイの完全な動作を保証するものではありません。 |
+| `-wex-edp-routing` | Tahoe上の物理Tiger Lake 9A49 revision 1向けの実験的なパネルポート経路、トレーニング前のクロック選択、native AUX電源制御、null hotplugパスの保護。donor命令の完全一致を確認します。内蔵ディスプレイの完全な動作を保証するものではありません。 |
 
 ## 動作確認済みの機能と既知の問題
 
