@@ -17,7 +17,7 @@ int main(int argc,char **argv){
  std::cout<<"],\"selected_task\":"<<c->q[18]<<",\"resolve_context\":"<<c->q[19]<<",\"selected_mapped\":"<<c->q[20]<<",\"association_status\":"<<c->q[23]<<",\"scratch_aliases\":[";
  TGLSyncAudit::Target t{TGLSyncAudit::Decode::Write,TGLSyncAudit::Space::PPGTT,c->q[5],0,0,1,8};auto e=TGLSyncAudit::mapping(t,c->q[13],*graph);
  for(unsigned i=0;i<5;++i){auto&s=i<4?c->scratch[i]:c->selected;if(i)std::cout<<',';const char *alias="unknown";const bool ownerQualified=!c->q[1] && c->q[13] && c->q[13]==c->q[14] && c->q[15] && c->q[15]==c->q[16] && c->q[0]==2 && s.q[0]==2 && c->q[18] && s.q[8]==c->q[18] && (i<4 || (!c->q[23] && c->q[20]==s.q[3]));
-  if(!c->q[1] && c->q[13]==c->q[14] && c->q[15] && c->q[15]==c->q[16] && (s.q[0]==1 || s.q[0]==2) && !s.q[1] && s.q[6]==0x5100 && t.address>=s.q[4] && t.address-s.q[4]<=s.q[6]-8){
+  if(!c->q[1] && c->q[13]==c->q[14] && c->q[15] && c->q[15]==c->q[16] && (s.q[0]==1 || s.q[0]==2) && !s.q[1] && (s.q[6]==0x5100 || s.q[6]==0x6000) && t.address>=s.q[4] && t.address-s.q[4]<=s.q[6]-8){
    const auto offset=t.address-s.q[4];const auto index=offset/4096;
    if(index<6 && s.pages[index][0]==s.q[5]+index*4096 && s.pages[index][3]==7 && s.pages[index][1]==s.pages[index][2]){
     const auto a=TGLSyncAudit::alias(e,s.pages[index][1]+(offset&4095));

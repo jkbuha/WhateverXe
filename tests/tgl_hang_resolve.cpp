@@ -52,6 +52,9 @@ int main(){
  put(map,0x98,uint64_t(0));scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);put(map,0x98,Base);++cases;
  r->q[13]=0;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);++cases;
 
+put(live,0x20,uint64_t(0x6000));put(r->mapped,0x20,uint64_t(0x6000));r->q[13]=TGLTahoeResolveReceipt::ScratchSize;
+ scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(!s.q[1] && s.q[6]==0x6000);++cases;
+ put(live,0x20,uint64_t(TGLTahoeResolveReceipt::ScratchSize));put(r->mapped,0x20,uint64_t(TGLTahoeResolveReceipt::ScratchSize));
  // Current task -> exact resolve context -> current mapped scratch, with a
  // second ownership walk after all six GPU-page observations.
  const uint64_t task=K+0x20000,context=K+0x21000,taskClass=K+0x22000,contextClass=K+0x23000,pool=K+0x24000;

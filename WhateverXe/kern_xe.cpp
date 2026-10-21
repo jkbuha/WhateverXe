@@ -66,6 +66,7 @@
 #include "kern_tgl_panel_power.hpp"
 #include "kern_tgl_tahoe_resolve_scratch.hpp"
 #include "kern_tgl_hang_resolve.hpp"
+#include "kern_tgl_tahoe_resolve_allocation.hpp"
 #include "kern_tgl_tahoe_compression.hpp"
 #include "kern_tgl_tahoe_resolve_alignment.hpp"
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
@@ -9467,6 +9468,33 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              !memcmp(reinterpret_cast<void *>(address+TGLHangResolve::GPUAccessor),TGLHangResolve::GPUAccessorBytes,sizeof(TGLHangResolve::GPUAccessorBytes));
             tglHangResolveContextClass=tglHangResolveReady?resolveContextClass+16:0;
             IORegistryEntry::getRegistryRoot()->setProperty("TGLHangResolveReady",tglHangResolveReady);
+            // The selected task's first five scratch pages agree across CPU
+            // and PPGTT; the partial sixth does not. Keep offsets/payloads and
+            // ask the native allocator for six complete pages. Patch both the
+            // source constant and its constructor-copied context parameter.
+            const auto extentParams=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareResolveContext17ExtendedCtxParamsE",address,size);
+            patcher.clearError();
+            const auto extentAllocator=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGSharedMappedBuffer11withOptionsEP11IGAccelTaskmjj",address,size);
+            patcher.clearError();
+            TGLTahoeResolveAllocation::Plan extent{};
+            if(scratchScope && scratchReady && normalReady && receiptReady && tglHangResolveReady &&
+               scratchSymbol>=address && extentParams>=address && extentAllocator>=address)
+             extent=TGLTahoeResolveAllocation::plan(reinterpret_cast<const uint8_t *>(address),size,
+              scratchSymbol-address,extentParams-address,extentAllocator-address);
+            bool extentReady=false;
+            const uint64_t extentNew=TGLTahoeResolveAllocation::RoundedSize;
+            auto setExtent=[&](size_t offset,uint64_t before,uint64_t after){
+             const auto at=address+offset;
+             KernelPatcher::LookupPatch patch {currentGraphics,reinterpret_cast<const uint8_t *>(&before),reinterpret_cast<const uint8_t *>(&after),8,1};
+             patcher.applyLookupPatch(&patch,reinterpret_cast<uint8_t *>(at),9);
+             const bool ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(at),&after,8);
+             patcher.clearError();return ok;
+            };
+            if(extent.valid)extentReady=TGLTahoeResolveAllocation::apply(reinterpret_cast<uint8_t *>(address),extent,setExtent);
+            uint64_t extentReport[]={1,extent.valid,extentReady,extent.constant,extent.params,extentNew};
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAllocation",extentReport,sizeof(extentReport));
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAllocationReady",extentReady);
+
             patcher.clearError();
 
 			patcher.clearError();

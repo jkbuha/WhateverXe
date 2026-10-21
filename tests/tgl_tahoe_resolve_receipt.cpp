@@ -37,6 +37,7 @@ int main(int argc,char**argv){
  for(uint64_t capacity:{0ULL,4097ULL}){put(v,8,capacity);before=data;run();assert(!o->q[12]);}put(v,8,4);
  put(v,0,64);put(v,8,64);before=data;run();assert(o->q[12]==64);put(v,0,1);put(v,8,4);
  for(uint64_t length:{0ULL,0x50ffULL,0x5101ULL,UINT64_MAX}){put(m,0x20,length);before=data;run();assert(!o->q[13]);}put(m,0x20,ScratchSize);
+ put(m,0x20,0x6000);before=data;run();assert(o->q[13]==ScratchSize && o->q[15]==0x6000);put(m,0x20,ScratchSize);
  put(m,0,vt+8);before=data;run();assert(!o->q[13]);put(m,0,vt);
  for(uint64_t ptr:{0ULL,0x1000ULL,UINT64_MAX-1}){put(m,0x38,ptr);before=data;run();assert(!o->q[13]);}
  if(argc>1){std::ifstream f(argv[1],std::ios::binary);assert(f.good());std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)),{});assert(TGLTahoeResolveReceipt::matches(b.data(),b.size(),Entry,MappedClass));puts("PASS exact native resolve entry");}

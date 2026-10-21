@@ -45,7 +45,7 @@ void inspectScratch(Scratch &o,unsigned slot,uint64_t mapped,const uint8_t *snap
  o.q[11]=TGLHangPending::u32(m+0x10);o.q[8]=TGLTahoeResolveReceipt::pair(m+0x90);
  if((o.q[11]&0x40) || !gpuABI(mapClass,o.q[10],read))return;
  auto cpu=TGLTahoeResolveReceipt::pair(b+0x38),gpu=TGLTahoeResolveReceipt::pair(m+0x98),size=TGLTahoeResolveReceipt::pair(b+0x20);
- if(size!=TGLTahoeResolveReceipt::ScratchSize || (cpu&4095) || (gpu&4095) || !gpu || gpu>>47 || size>(1ULL<<47)-gpu || !TGLHangPending::kernelRange(cpu,size))return;
+ if((size!=TGLTahoeResolveReceipt::ScratchSize && size!=0x6000) || (cpu&4095) || (gpu&4095) || !gpu || gpu>>47 || size>(1ULL<<47)-gpu || !TGLHangPending::kernelRange(cpu,size))return;
  o.q[4]=gpu;o.q[5]=cpu;o.q[6]=size;o.q[7]=mappedClass;o.q[1]=2;
  for(unsigned i=0;i<6;++i){auto row=o.pages[i];row[0]=cpu+i*4096;
   if(physical(row[0],row[1]))row[3]|=1;

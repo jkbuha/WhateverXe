@@ -40,7 +40,8 @@ template<class Read>void collect(Receipt &o,uint64_t pool,uint64_t mapped,uint64
  if(o.q[10]!=sizeof(o.mapped))return;
  o.q[14]=pair(o.mapped+0x28);o.q[15]=pair(o.mapped+0x20);
  o.q[16]=pair(o.mapped+0x38);o.q[17]=pair(o.mapped);
- if(o.q[17]!=mappedClass || o.q[15]!=ScratchSize)return;
+ // Preserve the bounded 0x5100-byte prefix capture for either admitted extent.
+ if(o.q[17]!=mappedClass || (o.q[15]!=ScratchSize && o.q[15]!=0x6000))return;
  o.q[13]=copy(o.q[16],o.scratch,sizeof(o.scratch));
 }
 }
