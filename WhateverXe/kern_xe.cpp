@@ -9333,8 +9333,10 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             patcher.clearError();
             const auto policyDispatch=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator20callPlatformFunctionEPK8OSSymbolbPvS3_S3_S3_",address,size);
             patcher.clearError();
+            const auto policyCompare=patcher.solveSymbol(KernelPatcher::KernelID,"_strncmp");
+            patcher.clearError();
             const bool policyPlan=scratchScope && compressionReady && policyStart>=address && policyDispatch>=address &&
-             TGLTahoeCompressionPolicy::matches(reinterpret_cast<const uint8_t *>(address),size,policyStart-address,policyDispatch-address);
+             TGLTahoeCompressionPolicy::matches(reinterpret_cast<const uint8_t *>(address),size,policyStart-address,policyDispatch-address,address,policyCompare);
             auto setPolicy=[&](size_t offset,const uint8_t *before,const uint8_t *after,size_t bytes){
              auto at=reinterpret_cast<uint8_t *>(address+offset);
              KernelPatcher::LookupPatch patch {currentGraphics,before,after,bytes,1};
@@ -9343,10 +9345,20 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              patcher.clearError();return ok;
             };
             const bool policyReady=policyPlan && TGLTahoeCompressionPolicy::apply(reinterpret_cast<uint8_t *>(address),size,
-             policyStart-address,policyDispatch-address,setPolicy);
+             policyStart-address,policyDispatch-address,setPolicy,address,policyCompare);
             uint64_t policyReport[]={1,policyPlan,policyReady,0x1474,0};
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicy",policyReport,sizeof(policyReport));
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicyReady",policyReady);
+            uint64_t policyGuard[]={1,scratchScope,compressionReady,policyStart-address,policyDispatch-address,policyCompare,address};
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicyGuard",policyGuard,sizeof(policyGuard));
+            if(size>TGLTahoeCompressionPolicy::Selector+18){
+             uint8_t policyBytes[80]{};
+             memcpy(policyBytes,reinterpret_cast<void *>(address+TGLTahoeCompressionPolicy::Zero),3);
+             memcpy(policyBytes+8,reinterpret_cast<void *>(address+TGLTahoeCompressionPolicy::Startup),30);
+             memcpy(policyBytes+40,reinterpret_cast<void *>(address+TGLTahoeCompressionPolicy::Select),28);
+             memcpy(policyBytes+68,reinterpret_cast<void *>(address+TGLTahoeCompressionPolicy::Setter),12);
+             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicyBytes",policyBytes,sizeof(policyBytes));
+            }
             bool alignmentReady=scratchScope && ccsReady && resolveSymbol>=address &&
              TGLTahoeResolveAlignment::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address);
             patcher.clearError();

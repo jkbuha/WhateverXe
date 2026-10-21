@@ -14,17 +14,24 @@ constexpr uint8_t SetterBytes[]={0x41,0x8A,0x07,0x41,0x88,0x86,0x74,0x14,0,0,0xE
 // MOV AL,0; NOP retains instruction extent and flags. The native store and
 // success continuation stay intact; the caller's byte is never modified.
 constexpr uint8_t SetterOff[]={0xB0,0,0x90};
-inline bool matches(const uint8_t *image,size_t size,size_t start,size_t dispatch){
+inline bool matches(const uint8_t *image,size_t size,size_t start,size_t dispatch,uint64_t liveBase=0,uint64_t compareTarget=0){
+ if(!image || size<Selector+18)return false;
+ int32_t displacement=0;memcpy(&displacement,image+Select+16,4);
+ // This is an external BRANCH relocation to _strncmp in the exact donor.
+ // Offline accepts its zero addend; live admission requires the resolved
+ // kernel target, rather than ignoring the relocated operand.
+ const bool call=liveBase ? compareTarget && liveBase+Select+20+static_cast<int64_t>(displacement)==compareTarget : displacement==0 && !compareTarget;
  return image && size>=Selector+18 && start==Start && dispatch==Dispatch &&
+  call &&
   !memcmp(image+Zero,ZeroBytes,sizeof(ZeroBytes)) &&
   !memcmp(image+Startup,StartupBytes,sizeof(StartupBytes)) &&
-  !memcmp(image+Select,SelectBytes,sizeof(SelectBytes)) &&
+  !memcmp(image+Select,SelectBytes,16) && !memcmp(image+Select+20,SelectBytes+20,sizeof(SelectBytes)-20) &&
   !memcmp(image+Setter,SetterBytes,sizeof(SetterBytes)) &&
   !memcmp(image+Selector,"renderCompression",18);
 }
 // Bounded transaction, including a writer which mutates then reports failure.
-template<class Write>bool apply(uint8_t *image,size_t size,size_t start,size_t dispatch,Write write){
- if(!matches(image,size,start,dispatch))return false;
+template<class Write>bool apply(uint8_t *image,size_t size,size_t start,size_t dispatch,Write write,uint64_t liveBase=0,uint64_t compareTarget=0){
+ if(!matches(image,size,start,dispatch,liveBase,compareTarget))return false;
  const uint8_t off=0;
  if(write(Immediate,StartupBytes+29,&off,1) &&
     write(Setter,SetterBytes,SetterOff,sizeof(SetterOff)) &&

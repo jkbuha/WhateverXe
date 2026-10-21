@@ -21,6 +21,15 @@ int main(int argc,char **argv){
  assert(!matches(nullptr,image.size(),Start,Dispatch));
  for(size_t n=0;n<image.size();++n)assert(!matches(image.data(),n,Start,Dispatch));
  assert(!matches(image.data(),image.size(),Start+1,Dispatch));assert(!matches(image.data(),image.size(),Start,Dispatch+1));
+ for(int32_t delta:{INT32_MIN,-4096,-1,0,1,4096,INT32_MAX}){
+  const uint64_t base=0xFFFFFF7F80000000ULL,target=base+Select+20+static_cast<int64_t>(delta);
+  memcpy(image.data()+Select+16,&delta,4);
+  assert(matches(image.data(),image.size(),Start,Dispatch,base,target));
+  assert(!matches(image.data(),image.size(),Start,Dispatch,base,target+1));
+  assert(!matches(image.data(),image.size(),Start,Dispatch,base,0));
+  if(delta)assert(!valid());
+ }
+ memset(image.data()+Select+16,0,4);
  struct Region{size_t at,len;};
  for(auto r:{Region{Startup,sizeof(StartupBytes)},Region{Zero,sizeof(ZeroBytes)},Region{Select,sizeof(SelectBytes)},Region{Setter,sizeof(SetterBytes)},Region{Selector,18}})
   for(size_t i=0;i<r.len;++i){image[r.at+i]^=1;assert(!valid());image[r.at+i]^=1;}
