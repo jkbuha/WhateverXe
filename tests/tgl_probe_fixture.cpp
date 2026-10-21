@@ -1,3 +1,5 @@
+template<class... A> static void rightPortRecord(A...) {}
+static void rightPortPublish() {}
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

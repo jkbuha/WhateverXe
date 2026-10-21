@@ -11,7 +11,7 @@ previous=re.search(pattern,old,re.S).group().replace('XE::tglDekelAccess','XE::t
 wrappers='\n'.join(re.search(p,source,re.S).group() for p in [r'uint32_t XE::wrapTGLReadDekel\(.*?\n\}',r'void XE::wrapTGLWriteDekel\(.*?\n\}'])
 header=(repo/'WhateverXe/kern_xe.hpp').read_text()
 fields=header[header.index('\tbool tglAUXParentReady'):header.index('\tstatic void wrapTGLEnableAUXPower')]
-fixture=(repo/'tests/tgl_port_map_fixture.cpp').read_text().replace('// FIELDS',fields)
+fixture=(repo/'tests/tgl_port_map_fixture.cpp').read_text().replace('// FIELDS',fields).replace('static uint32_t tglRightAltProbe(void *port);','static uint32_t tglRightAltProbe(void *) {return 0;}')
 with tempfile.TemporaryDirectory(prefix='tgl-port-map-') as directory:
  tmp=Path(directory);(tmp/'check.cpp').write_text(fixture.replace('// PRODUCTION_ACCESS',current+'\n'+previous+'\n'+wrappers))
  subprocess.run(['clang++','-std=c++14','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-I',str(repo/'WhateverXe'),str(tmp/'check.cpp'),'-o',str(tmp/'check')],check=True)

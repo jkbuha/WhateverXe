@@ -369,6 +369,16 @@ private:
 	uint32_t tglAUXParentMask {TGLTCWiring::Mask};
  TGLTCWiring tglTCWiring {TGLTCWiring::fromMasks(0,0,0)};
  bool tglTCWiringLoaded {}, tglTCWiringExplicit {};
+ uintptr_t orgTGLSetFIALanes {},orgTGLConfiguredLanes {};
+ bool tglRightConfiguredLanesReady {};uintptr_t tglRightSignalLaneCaller {};
+ bool tglRightAltRequested {},tglRightAltReady {},tglRightAltRoutingReady {},tglRightAltFault {};
+ bool tglRightAltEligible(uint32_t ddi) const {return ddi==5 && __atomic_load_n(&tglRightAltReady,__ATOMIC_ACQUIRE);}
+ bool tglDPTransportEligible(uint32_t ddi) const {return tglLegacyTCEligible(ddi)||tglRightAltEligible(ddi);}
+ bool tglDPMode(uint32_t ddi,uint32_t mode) const {return mode==4 || (mode==3&&tglRightAltEligible(ddi));}
+ static uint32_t tglRightAltProbe(void *port);
+ static uint32_t wrapTGLConfiguredLanes(void *port);
+ static void wrapTGLSetFIALanes(void *port,uint32_t lanes);
+
  // Native mode setter owns FIA1 bits 0/1 correctly on modular TGL. Later
  // instances need the new mode backend, regardless of available PHY math.
  uint32_t tglTCAutoCandidates {},tglTCAutoRegistered {};
@@ -385,6 +395,7 @@ private:
  uint32_t tglTCProbeMask() const {return tglTCWiring.valid ?
   (tglTCWiring.legacy|tglTCAutoCandidates)&tglAUXParentMask : 0;}
  bool tglTCModeAllowed(uint32_t ddi,uint32_t mode) const {
+  if(tglRightAltEligible(ddi))return mode==0 || mode==3;
   if(ddi>=9 || !(tglTCAutoCandidates&(1U<<ddi)))return true;
   return mode==0 || (mode==4 && (__atomic_load_n(&tglTCAutoRegistered,__ATOMIC_ACQUIRE)&(1U<<ddi)));
  }
@@ -395,7 +406,7 @@ private:
  }
 	uint32_t tglAUXParentRefs[9] {};
 	bool tglAUXParentEligible(uint32_t ddi) const {
-		return tglAUXParentReady && tglLegacyTCEligible(ddi);
+		return tglAUXParentReady && tglDPTransportEligible(ddi);
 	}
 	static void wrapTGLEnableAUXPower(void *power, uint32_t ddi);
 	static void wrapTGLDisableAUXPower(void *power, uint32_t ddi);

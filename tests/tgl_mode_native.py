@@ -3,7 +3,7 @@
 from pathlib import Path
 import argparse,hashlib,re,subprocess,tempfile
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('donor',type=Path);p.add_argument('--serialization',action='store_true');p.add_argument('--source',type=Path);a=p.parse_args()
-if hashlib.sha256(a.donor.read_bytes()).hexdigest()!='c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731':p.error('unqualified donor SHA256')
+if hashlib.sha256(a.donor.read_bytes()).hexdigest() not in {'c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731','8470f7edc677352a19193c005b6dcdece2e3283262d5a8ec891bf9360d755c6e'}:p.error('unqualified donor SHA256')
 r=Path(__file__).resolve().parents[1];s=(a.source or r/'WhateverXe/kern_xe.cpp').read_text()
 # Verify the production admission bytes, not just the fixture's ready flag.
 donor=a.donor.read_bytes()

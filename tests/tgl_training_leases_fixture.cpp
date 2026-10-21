@@ -1,3 +1,6 @@
+static bool rightProbeGood=true;
+template<class... A> static void rightPortRecord(A...) {}
+static void rightPortPublish() {}
 template<class... T>void tglTransitionRecord(T...){ }
 // Native boundaries are mocks; LEASE_FUNCTIONS is extracted unchanged from production.
 #include <algorithm>
@@ -35,6 +38,7 @@ void absolutetime_to_nanoseconds(uint64_t t, uint64_t *p) { *p = t; }
 #define SYSLOG(...) ((void)0)
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
+constexpr uint32_t kIOReturnNotReady=0xe00002d8;
 constexpr uint32_t kIOReturnBusy = 0xe00002d5;
 template<class... T> void tglTrace(T...) {}
 template<class... T> void tglRecordStartOrder(T...) {}
@@ -342,7 +346,27 @@ void endCompletion() {
  }
  puts("End completion: all 3 pipes retain failed cleanup and return Busy; retries consume native End once, training/adoption blocked, later End/Begin finishes; native error/commit semantics preserved");
 }
+void internalPanelAltAdmission() {
+ setup();obj.tglRightAltReady=true;ports[5].at<uint32_t>(0x550)=3;
+ ctl.at<uint8_t>(0xE55)=1;void *platform=reinterpret_cast<void *>(0x12340000);
+ ctl.at<void *>(0xD40)=platform;
+ reserve(5);
+ assert(ctl.at<uint8_t>(0xE55)==1 && ctl.at<void *>(0xD40)==platform);
+ release(5);clean();
+ setup();obj.tglRightAltReady=true;ports[5].at<uint32_t>(0x550)=3;
+ ctl.at<uint8_t>(0xE55)=1;ctl.at<void *>(0xD40)=platform;
+ rightProbeGood=false;
+ assert(XE::tglPrepareTrainingLease(ctl.data(),obj.tglTrainingLeases[5])==1);
+ rightProbeGood=true;
+ // The internal-panel exception cannot admit a different port or controller.
+ assert(XE::tglPrepareTrainingLease(ctl.data(),obj.tglTrainingLeases[4])==1);
+ auto saved=obj.tglObservationController;obj.tglObservationController=nullptr;
+ assert(XE::tglPrepareTrainingLease(ctl.data(),obj.tglTrainingLeases[5])==1);
+ obj.tglObservationController=saved;clean();
+ puts("Right DP-alt lease: built-in panel/platform preserved; wrong binding and other ports rejected");
+}
 int main(int argc, char **argv) {
+ internalPanelAltAdmission();
  if(argc==2) {
   if(!strcmp(argv[1],"end")) { endCompletion(); return 0; }
   if(!strcmp(argv[1],"shutdown")) { shutdownStatus(); return 0; }

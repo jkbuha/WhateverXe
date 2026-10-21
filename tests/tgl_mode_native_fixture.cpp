@@ -1,3 +1,4 @@
+template<class... A> void rightPortRecord(A...) {}
 #include <cassert>
 #include "kern_tgl_native_fia.hpp"
 #include <thread>
@@ -31,6 +32,10 @@ struct XE {
  uintptr_t tglNativeFiaBase=0,orgTGLPortReadReg=0,orgTGLPortWriteReg=0;
  uint32_t tglNativeFiaReads=0,tglNativeFiaWrites=0;
  bool tglLegacyTCEligible(uint32_t ddi)const{return ddi>=3&&ddi<=6;}
+ bool tglRightAltEligible(uint32_t)const{return false;}
+ bool tglDPTransportEligible(uint32_t d)const{return tglLegacyTCEligible(d);}
+ bool tglDPMode(uint32_t,uint32_t m)const{return m==4;}
+ static uint32_t tglRightAltProbe(void*){return 0;}
  static bool tglNativeFiaAccess(void*,uint32_t,uintptr_t,bool,TGLNativeFia&);
  static uint32_t wrapTGLPortReadReg(void*,uint32_t);
  static void wrapTGLPortWriteReg(void*,uint32_t,uint32_t);
