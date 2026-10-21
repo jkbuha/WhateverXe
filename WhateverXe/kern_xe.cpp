@@ -9899,9 +9899,16 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// Keep the broader new-color-request subtraction in WS/SA unchanged.
 			const uint8_t iosCCSNative[] {0x45,0x88,0xBD,0x74,0x14,0,0,0x45,0x38,0xBD,0x8C,0x12,0,0,
 				0x75,0x0E,0x41,0xF6,0x06,0x20,0x74,0x08,0x41,0xC6,0x85,0x74,0x14,0,0,1};
-			const bool iosCCSOK=size>0x246E1 &&
+			const bool iosCCSNativeOK=size>0x246E1 &&
 				!memcmp(reinterpret_cast<void *>(address+0x246C3),iosCCSNative,sizeof(iosCCSNative));
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSNativeReady",iosCCSOK);
+            // The policy comparison deliberately changes the native enable
+            // immediate. Admit only its fully verified applied form; keep all
+            // other accelerator admission requirements unchanged.
+            const bool iosCCSPolicyOK=policyReady && TGLTahoeCompressionPolicy::matches(
+             reinterpret_cast<const uint8_t *>(address),size,policyStart-address,policyDispatch-address,address,policyCall,true);
+            const bool iosCCSOK=iosCCSNativeOK || iosCCSPolicyOK;
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSNativeReady",iosCCSNativeOK);
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSPolicyAdmissionReady",iosCCSPolicyOK);
 			// r119: retain native RCS flush -> stamp order and all runtime address/
 			// notification fields. Gen12 flushes HDC before completion; Linux v6.12
 			// gen12_emit_fini_breadcrumb_rcs also requires DepthStall (1409600907).

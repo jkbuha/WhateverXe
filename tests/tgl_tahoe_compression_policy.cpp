@@ -58,7 +58,14 @@ int main(int argc,char **argv){
   const auto before=image;unsigned calls=0;
   auto write=[&](size_t at,const uint8_t *old,const uint8_t *value,size_t n){assert(!memcmp(image.data()+at,old,n));bool fail=++calls==failAt;if(!fail || mutate)memcpy(image.data()+at,value,n);return !fail;};
   bool ok=apply(image.data(),image.size(),Start,Dispatch,write);assert(ok==(failAt==0));
-  auto expected=before;if(ok){expected[Immediate]=0;memcpy(expected.data()+Setter,SetterOff,sizeof(SetterOff));}assert(image==expected);image=before;++transactions;
+  auto expected=before;if(ok){expected[Immediate]=0;memcpy(expected.data()+Setter,SetterOff,sizeof(SetterOff));}assert(image==expected);
+  assert(matches(image.data(),image.size(),Start,Dispatch,0,0,true)==ok);
+  if(ok){
+   assert(!valid());
+   for(auto r:{Region{Startup,sizeof(StartupBytes)},Region{Zero,sizeof(ZeroBytes)},Region{Select,sizeof(SelectBytes)},Region{Setter,sizeof(SetterBytes)},Region{Selector,18}})
+    for(size_t i=0;i<r.len;++i){image[r.at+i]^=1;assert(!matches(image.data(),image.size(),Start,Dispatch,0,0,true));image[r.at+i]^=1;}
+  }
+  image=before;++transactions;
  }
  // Invalid input must never call the kernel writer.
  image[Immediate]^=1;bool called=false;assert(!apply(image.data(),image.size(),Start,Dispatch,[&](size_t,const uint8_t*,const uint8_t*,size_t){called=true;return true;}));assert(!called);image[Immediate]^=1;
