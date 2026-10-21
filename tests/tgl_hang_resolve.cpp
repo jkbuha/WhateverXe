@@ -32,15 +32,24 @@ int main(){
  put(p.bytes,0x2c0,0x00101404U);collect(*out,*c,read,pageRead);assert(!out->q[5]);++cases;
  put(p.bytes,0x2c0,0x00105000U);
  auto r=std::make_unique<TGLTahoeResolveReceipt::Receipt>();r->q[0]=1;r->q[1]=2;r->q[3]=K+0x2000;r->q[10]=64;r->q[13]=TGLTahoeResolveReceipt::ScratchSize;r->q[17]=K+0x8000;
- put(r->mapped,0,r->q[17]);put(r->mapped,0x20,uint64_t(TGLTahoeResolveReceipt::ScratchSize));put(r->mapped,0x28,Base);put(r->mapped,0x38,K+0x4000);
- uint8_t live[64];memcpy(live,r->mapped,64);unsigned calls=0;bool mutate=false,missing=false;
- auto sr=[&](uint64_t at,void *v,unsigned n)->uint64_t{assert(at==r->q[3] && n==64);memcpy(v,live,64);if(mutate && calls++)static_cast<uint8_t*>(v)[0x38]^=0x10;return 64;};
+ put(r->mapped,0,r->q[17]);put(r->mapped,0x20,uint64_t(TGLTahoeResolveReceipt::ScratchSize));put(r->mapped,0x30,K+0x6000);put(r->mapped,0x38,K+0x4000);
+ uint8_t live[64],map[0x128]{};memcpy(live,r->mapped,64);put(map,0,K+0x10000);put(map,0x98,Base);
+ unsigned calls=0;bool mutate=false,missing=false;
+ auto sr=[&](uint64_t at,void *v,unsigned n)->uint64_t{
+  if(at==r->q[3] && n==64){memcpy(v,live,64);if(mutate && calls++)static_cast<uint8_t*>(v)[0x38]^=0x10;return 64;}
+  if(at==K+0x6000 && n==sizeof(map)){memcpy(v,map,n);return n;}
+  if(at==K+0x10000+0x128 && n==8){const auto getter=K+0x12000;memcpy(v,&getter,8);return 8;}
+  if(at==K+0x12000 && n==14){memcpy(v,GPUGetterBytes,14);return 14;}
+  assert(false);return 0;
+ };
  auto physical=[&](uint64_t cpu,uint64_t &phys){phys=cpu-K+0x800000;return !missing;};Scratch s{};
- scratch(s,0,*r,r->q[17],sr,physical);assert(!s.q[1] && s.q[4]==Base && s.q[5]==K+0x4000);
+ scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(!s.q[1] && s.q[4]==Base && s.q[5]==K+0x4000);
  for(unsigned i=0;i<6;++i)assert(s.pages[i][3]==7 && s.pages[i][1]==0x804000+i*4096);++cases;
- missing=true;scratch(s,0,*r,r->q[17],sr,physical);assert(!s.q[1]);for(auto &row:s.pages)assert(!row[3]);++cases;missing=false;
- mutate=true;calls=0;scratch(s,0,*r,r->q[17],sr,physical);assert(s.q[1]==2);++cases;mutate=false;
- for(unsigned field:{0U,0x20U,0x28U,0x38U}){live[field]^=1;scratch(s,0,*r,r->q[17],sr,physical);assert(s.q[1]==1);live[field]^=1;++cases;}
- r->q[13]=0;scratch(s,0,*r,r->q[17],sr,physical);assert(s.q[1]==1);++cases;
+ missing=true;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(!s.q[1]);for(auto &row:s.pages)assert(!row[3]);++cases;missing=false;
+ mutate=true;calls=0;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==2);++cases;mutate=false;
+ for(unsigned field:{0U,0x20U,0x30U,0x38U}){live[field]^=1;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);live[field]^=1;++cases;}
+ map[0x10]=0x40;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);map[0x10]=0;++cases;
+ put(map,0x98,uint64_t(0));scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);put(map,0x98,Base);++cases;
+ r->q[13]=0;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);++cases;
  printf("PASS %u failure-only resolve evidence cases; no GPU/system access; capture bytes=%zu\n",cases,sizeof(Capture));
 }

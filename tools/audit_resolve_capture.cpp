@@ -17,12 +17,12 @@ int main(int argc,char **argv){
  for(unsigned i=0;i<4;++i){auto&s=c->scratch[i];if(i)std::cout<<',';const char *alias="unknown";
   if(!c->q[1] && c->q[13]==c->q[14] && c->q[15] && c->q[15]==c->q[16] && s.q[0]==1 && !s.q[1] && s.q[6]==0x5100 && t.address>=s.q[4] && t.address-s.q[4]<=s.q[6]-8){
    const auto offset=t.address-s.q[4];const auto index=offset/4096;
-   if(index<6 && s.pages[index][3]==7 && s.pages[index][1]==s.pages[index][2]){
+   if(index<6 && s.pages[index][0]==s.q[5]+index*4096 && s.pages[index][3]==7 && s.pages[index][1]==s.pages[index][2]){
     const auto a=TGLSyncAudit::alias(e,s.pages[index][1]+(offset&4095));
     if(a==TGLSyncAudit::Alias::Match)alias="match";if(a==TGLSyncAudit::Alias::Mismatch)alias="mismatch";
    }
   }
-  std::cout<<"{\"slot\":"<<i<<",\"schema\":"<<s.q[0]<<",\"status\":"<<s.q[1]<<",\"GPU_base\":"<<s.q[4]<<",\"CPU_base\":"<<s.q[5]<<",\"target_physical_identity\":\""<<alias<<"\"}";
+  std::cout<<"{\"slot\":"<<i<<",\"schema\":"<<s.q[0]<<",\"status\":"<<s.q[1]<<",\"GPU_base\":"<<s.q[4]<<",\"CPU_base\":"<<s.q[5]<<",\"map\":"<<s.q[9]<<",\"getter\":"<<s.q[10]<<",\"map_flags\":"<<s.q[11]<<",\"target_physical_identity\":\""<<alias<<"\"}";
  }
  std::cout<<"],\"executed_shader_base_proven\":false,\"render_success_proven\":false}\n";
 }

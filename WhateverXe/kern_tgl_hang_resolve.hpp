@@ -5,8 +5,21 @@
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
 namespace TGLHangResolve {
 constexpr unsigned MaxPages=12;
+constexpr size_t GPUAccessor=0x13E7C;
+constexpr uint8_t GPUAccessorBytes[]={0x55,0x48,0x89,0xE5,0x48,0x8B,0x7F,0x30,0x48,0x8B,0x07,0x5D,0xFF,0xA0,0x28,0x01,0,0};
+// Tahoe Family2 fast path; bit0x40 selects native materialization, never called.
+constexpr uint8_t GPUGetterBytes[]={0xF6,0x47,0x10,0x40,0x75,0x08,0x48,0x8B,0x87,0x98,0,0,0,0xC3};
+template<class Read>bool gpuABI(uint64_t vtable,uint64_t &target,Read read){
+ target=0;if(!TGLHangPending::kernelRange(vtable,0x130) || read(vtable+0x128,&target,8)!=8 || !TGLHangPending::kernelRange(target,14))return false;
+ uint8_t head[14]{};if(read(target,head,14)!=14)return false;
+ if(head[0]==0xFF && head[1]==0x25){
+  int32_t delta=0;memcpy(&delta,head+2,4);const auto slot=target+6+static_cast<int64_t>(delta);
+  if(!TGLHangPending::kernelRange(slot,8) || read(slot,&target,8)!=8 || !TGLHangPending::kernelRange(target,14) || read(target,head,14)!=14)return false;
+ }
+ return !memcmp(head,GPUGetterBytes,sizeof(GPUGetterBytes));
+}
 struct Scratch {
- uint64_t q[12]; // schema,status,slot,mapped,GPU,CPU,size,class,phase,reserved
+ uint64_t q[12]; // schema,status,slot,mapped,GPU,CPU,size,class,phase,map,getter,map flags
  uint64_t pages[6][4]; // CPU, physical before/after, valid mask
 };
 struct Capture {
@@ -17,14 +30,19 @@ struct Capture {
 };
 static_assert(sizeof(Capture)<65536,"bounded separate failure property");
 template<class Read,class Physical>
-void scratch(Scratch &o,unsigned slot,const TGLTahoeResolveReceipt::Receipt &r,uint64_t mappedClass,Read read,Physical physical){
+void scratch(Scratch &o,unsigned slot,const TGLTahoeResolveReceipt::Receipt &r,uint64_t mappedClass,uint64_t mapClass,Read read,Physical physical){
  memset(&o,0,sizeof(o));o.q[0]=1;o.q[1]=1;o.q[2]=slot;o.q[3]=r.q[3];o.q[8]=r.q[1];
  if(r.q[0]!=1 || r.q[10]!=64 || r.q[13]!=TGLTahoeResolveReceipt::ScratchSize ||
     r.q[17]!=mappedClass || !mappedClass || !TGLHangPending::kernelRange(r.q[3],64))return;
  uint8_t b[64]{},a[64]{};if(read(r.q[3],b,64)!=64)return;
- const unsigned fields[]={0,0x20,0x28,0x38};
+ const unsigned fields[]={0,0x20,0x30,0x38};
  for(auto at:fields)if(TGLTahoeResolveReceipt::pair(b+at)!=TGLTahoeResolveReceipt::pair(r.mapped+at))return;
- auto cpu=TGLTahoeResolveReceipt::pair(b+0x38),gpu=TGLTahoeResolveReceipt::pair(b+0x28),size=TGLTahoeResolveReceipt::pair(b+0x20);
+ const auto map=TGLTahoeResolveReceipt::pair(b+0x30);o.q[9]=map;
+ uint8_t m[0x128]{},later[0x128]{};
+ if(!mapClass || !TGLHangPending::kernelRange(map,sizeof(m)) || read(map,m,sizeof(m))!=sizeof(m) || TGLTahoeResolveReceipt::pair(m)!=mapClass)return;
+ o.q[11]=TGLHangPending::u32(m+0x10);
+ if((o.q[11]&0x40) || !gpuABI(mapClass,o.q[10],read))return;
+ auto cpu=TGLTahoeResolveReceipt::pair(b+0x38),gpu=TGLTahoeResolveReceipt::pair(m+0x98),size=TGLTahoeResolveReceipt::pair(b+0x20);
  if(size!=TGLTahoeResolveReceipt::ScratchSize || (cpu&4095) || (gpu&4095) || !gpu || gpu>>47 || size>(1ULL<<47)-gpu || !TGLHangPending::kernelRange(cpu,size))return;
  o.q[4]=gpu;o.q[5]=cpu;o.q[6]=size;o.q[7]=mappedClass;o.q[1]=2;
  for(unsigned i=0;i<6;++i){auto row=o.pages[i];row[0]=cpu+i*4096;
@@ -34,6 +52,9 @@ void scratch(Scratch &o,unsigned slot,const TGLTahoeResolveReceipt::Receipt &r,u
  }
  if(read(r.q[3],a,64)!=64)return;
  for(auto at:fields)if(TGLTahoeResolveReceipt::pair(a+at)!=TGLTahoeResolveReceipt::pair(b+at))return;
+ if(read(map,later,sizeof(later))!=sizeof(later) ||
+    memcmp(m,later,8) || memcmp(m+0x10,later+0x10,4) || memcmp(m+0x98,later+0x98,8))return;
+ uint64_t getter=0;if(!gpuABI(mapClass,getter,read) || getter!=o.q[10])return;
  o.q[1]=0; // Consistent observations do not pin the object or prove lifetime.
 }
 template<class Read,class PageReader>

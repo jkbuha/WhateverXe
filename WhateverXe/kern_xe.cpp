@@ -832,6 +832,7 @@ static void tglTahoeCompressionEnable(void *resource,void *entry,uint64_t gpu,
 
 static uintptr_t tglTahoeResolveReceiptOriginal,tglTahoeResolveMappedClass;
 static uint32_t tglTahoeResolveReceiptCount;
+static bool tglHangResolveReady;
 static __attribute__((noinline)) void tglTahoeResolveObserve(unsigned slot,unsigned phase,
  void *pool,void *mapped,void *params,bool mode,const void *rects,bool result){
  if(slot>=TGLTahoeResolveReceipt::Capacity || !tglVM.nofault)return;
@@ -9452,6 +9453,10 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              receiptReady=patcher.routeMultiple(index,route,arrsize(route),address,size);
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveReceiptReady",receiptReady);
+            tglHangResolveReady=receiptReady && size>TGLHangResolve::GPUAccessor+sizeof(TGLHangResolve::GPUAccessorBytes) &&
+             patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK14IGMappedBuffer20getGPUVirtualAddressEv",address,size)==address+TGLHangResolve::GPUAccessor &&
+             !memcmp(reinterpret_cast<void *>(address+TGLHangResolve::GPUAccessor),TGLHangResolve::GPUAccessorBytes,sizeof(TGLHangResolve::GPUAccessorBytes));
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLHangResolveReady",tglHangResolveReady);
             patcher.clearError();
 
 			patcher.clearError();
@@ -12509,7 +12514,7 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
    }
    // Separate bounded failure evidence: preserve the existing schema/guards.
    // Never submit work or infer executed state from a raw saved-image packet.
-   if(!c->q[1] && tglTahoeTimingRequired && tglTahoeResolveMappedClass &&
+   if(!c->q[1] && tglTahoeTimingRequired && tglHangResolveReady && tglTahoeResolveMappedClass && tglTahoeResolveClasses.map &&
       c->before[TGLHangDetail::Owner]==reinterpret_cast<uint64_t>(tglHost.owner)) {
     auto evidence=static_cast<TGLHangResolve::Capture *>(IOMalloc(sizeof(TGLHangResolve::Capture)));
     if(evidence) {
@@ -12520,7 +12525,7 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
       auto object=root->copyProperty(key);auto receipt=OSDynamicCast(OSData,object);
       if(receipt && receipt->getLength()==sizeof(TGLTahoeResolveReceipt::Receipt))
        TGLHangResolve::scratch(evidence->scratch[slot],slot,
-        *static_cast<const TGLTahoeResolveReceipt::Receipt *>(receipt->getBytesNoCopy()),tglTahoeResolveMappedClass,read,physical);
+        *static_cast<const TGLTahoeResolveReceipt::Receipt *>(receipt->getBytesNoCopy()),tglTahoeResolveMappedClass,tglTahoeResolveClasses.map,read,physical);
       if(object)object->release();
      }
      uint64_t finalOwner[TGLHangDetail::Fields]{},rootAfter=0;
