@@ -68,6 +68,7 @@
 #include "kern_tgl_tahoe_compression.hpp"
 #include "kern_tgl_tahoe_resolve_alignment.hpp"
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
+#include "kern_tgl_tahoe_resolve_draw.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -9295,6 +9296,22 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(scratchReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveScratchStats)) {
              IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveScratchStats",stats);stats->release();
             }
+            patcher.clearError();
+            // Non-extended 3DPRIMITIVE is seven DWORDs. Preserve the native
+            // ten-DWORD footprint: its three guaranteed zeros become MI_NOOPs.
+            // Exact code guards prove R15 and the saved trailing fields are zero.
+            bool drawReady=scratchScope && ccsReady && resolveSymbol>=address &&
+             TGLTahoeResolveDraw::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address);
+            patcher.clearError();
+            if(drawReady){
+             auto site=reinterpret_cast<uint8_t *>(address+TGLTahoeResolveDraw::Site);
+             KernelPatcher::LookupPatch patch {currentGraphics,TGLTahoeResolveDraw::Original,
+              TGLTahoeResolveDraw::Replacement,sizeof(TGLTahoeResolveDraw::Original),1};
+             patcher.applyLookupPatch(&patch,site,sizeof(TGLTahoeResolveDraw::Original)+1);
+             drawReady=patcher.getError()==KernelPatcher::Error::NoError &&
+              !memcmp(site,TGLTahoeResolveDraw::Replacement,sizeof(TGLTahoeResolveDraw::Replacement));
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveDrawLengthReady",drawReady);
             patcher.clearError();
             const auto mappedClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV20IGSharedMappedBuffer",address,size);
             bool receiptReady=scratchScope && tglVM.nofault && resolveSymbol>=address && mappedClass>=address &&
