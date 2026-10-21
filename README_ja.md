@@ -98,11 +98,14 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wexbeta` | プラグインのOSバージョンチェックを回避する。kernel／driverの一致条件は維持する。 |
 | `-wex-tgl-off` | Tiger Lakeの処理を無効にする。 |
 | `-wex-noaccel` | Tiger LakeのFramebuffer単独モード。Acceleratorのprobeを停止します。 |
-| `-wex-edp-routing` | Tahoe上の物理Tiger Lake 9A49 revision 1向けの実験的なパネルポート経路、トレーニング前のクロック選択、native AUX電源制御、Combo PHY／2レーンのトレーニング、送信側フレーミング、null hotplugパスの保護。donor命令の完全一致を確認します。内蔵ディスプレイの完全な動作を保証するものではありません。 |
+| `-wex-edp-probe` | 内蔵パネルのAUX／DPCDを範囲を限定して診断します。検証済みパネル経路では`-wex-edp-routing`と併用する必要があります。この引数だけではパネルを有効にしません。 |
+| `-wex-edp-routing` | Tahoe上の物理Tiger Lake 9A49 revision 1向けの実験的なパネルポート経路、トレーニング前のクロック選択、native画面／AUX電源制御、Combo PHY／2レーンのトレーニング、送信側フレーミング、null hotplugパスの保護。`-wex-edp-probe`とdonor命令の完全一致を必要とします。 |
 
 ## 動作確認済みの機能と既知の問題
 
 Tiger LakeとAlder Lake-Nで、全6 OSにわたり、外部2画面の1920×1080・60Hz出力、Metal/MPS、OpenGL、OpenCL、ハードウェアH.264エンコード／デコード、ハードウェアHEVCデコード、画面の消灯／復帰、Safariのハードウェア動画デコード、Widevine再生を確認しています。共通TGLCompatビルドも、Alder Lake-Nの全6 OSで導入と機能を確認しています。すべてのcodec・アプリケーション・表内のGPUでの互換性を確認したものではありません。
+
+物理Tiger Lake `9A49` revision 1向けの検証済みTahoe経路では、内蔵1920×1200パネルの起動と、GPUバッファの読み戻しを伴うMetal 2コマンドの完了も確認しています。検証したnative描画圧縮ポリシーは、起動時と以後のplatform更新時に無効を維持します。この内蔵パネル構成での外部画面の抜き差し、システムスリープ／復帰、長時間の安定性は未検証です。
 
 ### 既知の問題と制限
 

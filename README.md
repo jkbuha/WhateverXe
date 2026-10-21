@@ -137,7 +137,8 @@ Alder Lake-N / Twin Lake.
 | `-wexbeta` | Bypass the plugin's OS-version check. Exact kernel/driver checks still apply. |
 | `-wex-tgl-off` | Disable the Tiger Lake path. |
 | `-wex-noaccel` | Tiger Lake framebuffer-only mode; blocks accelerator probing. |
-| `-wex-edp-routing` | Experimental panel-port routing, pre-training clock selection, native AUX power control, Combo PHY/two-lane training, source framing and null hotplug-path protection on Tahoe for physical Tiger Lake 9A49 revision 1, with exact donor instruction checks. This does not establish complete internal-display support. |
+| `-wex-edp-probe` | Enable bounded internal-panel AUX/DPCD diagnostics. Required with `-wex-edp-routing` for the guarded panel path; this flag alone does not enable the panel. |
+| `-wex-edp-routing` | Experimental panel-port routing, pre-training clock selection, native display/AUX power control, Combo PHY/two-lane training, source framing and null hotplug-path protection on Tahoe for physical Tiger Lake 9A49 revision 1. Requires `-wex-edp-probe` and exact donor instruction checks. |
 
 ## Tested features and known issues
 
@@ -148,6 +149,12 @@ video decode and Widevine playback. The common TGLCompat build has also passed
 installation and functional checks on Alder Lake-N across all six OS families.
 These checks do not establish compatibility with every codec, application or GPU
 in the table.
+
+The guarded Tahoe path for physical Tiger Lake `9A49` revision 1 has also passed
+internal 1920×1200 panel startup and Metal 2 command completion with GPU buffer
+readback. It holds the qualified native render-compression policy off at startup
+and subsequent platform updates. External-display hotplug, system sleep/wake and
+extended stability remain unverified for this internal-panel configuration.
 
 ### Known issues and limits
 
