@@ -175,8 +175,8 @@ in the table.
 ## Build and test
 
 Use macOS with Xcode command-line tools, Python 3.9 or newer, MacKernelSDK and
-Lilu's development headers/library. CI uses Lilu source revision
-[`e4748cc`](https://github.com/acidanthera/Lilu/tree/e4748cc081bf060302c7d3c44a643ce1d11b7e1d),
+Lilu's development headers/library. CI uses the Lilu
+[1.7.2 release tag](https://github.com/acidanthera/Lilu/tree/1.7.2),
 which includes the Tahoe kernel definition. Place `MacKernelSDK/` and `Lilu.kext/` in the
 repository root, or pass their paths with `--sdk` and `--lilu`.
 

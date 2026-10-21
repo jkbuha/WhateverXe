@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: acidanthera/Lilu
-          ref: e4748cc081bf060302c7d3c44a643ce1d11b7e1d
+          ref: 1.7.2
           path: build/dependencies/Lilu
           persist-credentials: false
       - name: Prepare Lilu development files

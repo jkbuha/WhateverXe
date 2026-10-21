@@ -126,7 +126,7 @@ Tiger LakeとAlder Lake-Nで、全6 OSにわたり、外部2画面の1920×1080�
 
 ## ビルドとテスト
 
-macOS、Xcode command-line tools、Python 3.9以降、MacKernelSDK、Liluの開発用ヘッダ／ライブラリを使用します。CIではTahoeのkernel定義を含むLiluソースの[`e4748cc`](https://github.com/acidanthera/Lilu/tree/e4748cc081bf060302c7d3c44a643ce1d11b7e1d)を使用します。`MacKernelSDK/`と`Lilu.kext/`をリポジトリ直下に配置するか、`--sdk`と`--lilu`でパスを指定してください。
+macOS、Xcode command-line tools、Python 3.9以降、MacKernelSDK、Liluの開発用ヘッダ／ライブラリを使用します。CIではTahoeのkernel定義を含むLiluの[1.7.2リリースタグ](https://github.com/acidanthera/Lilu/tree/1.7.2)を使用します。`MacKernelSDK/`と`Lilu.kext/`をリポジトリ直下に配置するか、`--sdk`と`--lilu`でパスを指定してください。
 
 ```sh
 python3 tools/build.py --release
