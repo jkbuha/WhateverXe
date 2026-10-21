@@ -71,6 +71,7 @@
 #include "kern_tgl_tahoe_resolve_draw.hpp"
 #include "kern_tgl_tahoe_resolve_attributes.hpp"
 #include "kern_tgl_tahoe_resolve_normal.hpp"
+#include "kern_tgl_tahoe_resolve_resource.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -851,6 +852,32 @@ static bool tglTahoeResolveReceipt(void *pool,void *mapped,void *params,bool mod
  const bool result=FunctionCast(tglTahoeResolveReceipt,tglTahoeResolveReceiptOriginal)(pool,mapped,params,mode,rects);
  tglTahoeResolveObserve(slot,2,pool,mapped,params,mode,rects,result);
  return result;
+}
+
+static uintptr_t tglTahoeResolveResourceOriginal;
+static TGLTahoeResolveResource::Classes tglTahoeResolveClasses{};
+static uint32_t tglTahoeResolveResourceCount,tglTahoeResolveRectangleCount;
+static bool tglTahoeResolveRectangleStats(void *,void *,OSSerialize *serializer){
+ const uint32_t q[]={1,__atomic_load_n(&tglTahoeResolveResourceCount,__ATOMIC_RELAXED),
+  __atomic_load_n(&tglTahoeResolveRectangleCount,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static __attribute__((noinline)) bool tglTahoeResolveResourcePrepare(void *resource,void *params,const void *rects,void *task,uint64_t *vector,uint32_t *rect){
+ if(!tglVM.nofault)return false;
+ auto record=static_cast<TGLTahoeResolveResource::Receipt *>(IOMalloc(sizeof(TGLTahoeResolveResource::Receipt)));if(!record)return false;
+ auto read=[](uint64_t p,void *out,size_t n)->uint64_t{return tglVM.nofault(p,reinterpret_cast<uint64_t>(out),n);};
+ const bool changed=TGLTahoeResolveResource::prepare(*record,reinterpret_cast<uint64_t>(resource),reinterpret_cast<uint64_t>(params),
+  reinterpret_cast<uint64_t>(rects),reinterpret_cast<uint64_t>(task),tglTahoeResolveClasses,rect,read);
+ if(changed){vector[0]=record->vector[0];vector[1]=record->vector[1];vector[2]=reinterpret_cast<uint64_t>(rect);__atomic_add_fetch(&tglTahoeResolveRectangleCount,1U,__ATOMIC_RELAXED);}
+ const unsigned slot=__atomic_fetch_add(&tglTahoeResolveResourceCount,1U,__ATOMIC_RELAXED);
+ if(slot<4){char key[48];snprintf(key,sizeof(key),"WXTahoeResolveResource%u",slot);IORegistryEntry::getRegistryRoot()->setProperty(key,record,sizeof(*record));}
+ IOFree(record,sizeof(*record));return changed;
+}
+static void tglTahoeResolveResource(void *owner,void *resource,void *params,const void *rects,void *task){
+ uint64_t vector[3]{};uint32_t rect[4]{};
+ const bool changed=tglTahoeResolveResourcePrepare(resource,params,rects,task,vector,rect);
+ FunctionCast(tglTahoeResolveResource,tglTahoeResolveResourceOriginal)(owner,resource,params,changed?vector:rects,task);
 }
 
 // One diagnostic allocation on the real kernel task, after native start has
@@ -9393,6 +9420,25 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveNormalReady",normalReady);
             if(normalReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveNormalStats)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveNormalStats",stats);stats->release();
+            }
+            patcher.clearError();
+            const char *resourceName="__ZN16IntelAccelerator16submitCCSResolveEP15IGAccelResourceP22color_resolve_params_tRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyEP11IGAccelTask";
+            const auto resourceEntry=patcher.solveSymbol<mach_vm_address_t>(index,resourceName,address,size);
+            const auto resourceMap=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IGAccelMemoryMap",address,size);
+            const auto resourceMemory=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV16IGAccelSysMemory",address,size);
+            bool rectangleReady=scratchScope && tglVM.nofault && resourceEntry>=address && resourceMap>=address && resourceMemory>=address &&
+             compressionResource>=address && compressionTask>=address &&
+             TGLTahoeResolveResource::matches(reinterpret_cast<const uint8_t *>(address),size,resourceEntry-address,
+              resourceMap-address,resourceMemory-address,compressionResource-address,compressionTask-address);
+            patcher.clearError();
+            if(rectangleReady){
+             tglTahoeResolveClasses={compressionResource+16,compressionTask+16,resourceMap+16,resourceMemory+16};
+             KernelPatcher::RouteRequest route[] {{resourceName,tglTahoeResolveResource,tglTahoeResolveResourceOriginal}};
+             rectangleReady=patcher.routeMultiple(index,route,arrsize(route),address,size);
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveRectangleReady",rectangleReady);
+            if(rectangleReady)if(auto stats=OSSerializer::forTarget(nullptr,tglTahoeResolveRectangleStats)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveRectangleStats",stats);stats->release();
             }
             patcher.clearError();
             const auto mappedClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV20IGSharedMappedBuffer",address,size);
