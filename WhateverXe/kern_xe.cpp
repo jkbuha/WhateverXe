@@ -68,6 +68,7 @@
 #include "kern_tgl_hang_resolve.hpp"
 #include "kern_tgl_tahoe_resolve_allocation.hpp"
 #include "kern_tgl_tahoe_compression.hpp"
+#include "kern_tgl_tahoe_compression_policy.hpp"
 #include "kern_tgl_tahoe_resolve_alignment.hpp"
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
 #include "kern_tgl_tahoe_resolve_draw.hpp"
@@ -9325,6 +9326,27 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             const auto scratchSymbol=patcher.solveSymbol<mach_vm_address_t>(index,"_g7_resolve_scratch_space_size",address,size);
             const bool scratchScope=TGLTahoeTiming::requested(xeProfile.identity,xeProfile.revision,xeProfile.overridden(),
              XELP::kernelOS(version)==XELP::OS::Tahoe) && checkKernelArgument("-disablegfxfirmware");
+            // A later renderCompression platform call can override startup's
+            // policy. Keep both sources off for this exact-donor comparison.
+            // Resource/storage flags and the native enable method stay intact.
+            const auto policyStart=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator5startEP9IOService",address,size);
+            patcher.clearError();
+            const auto policyDispatch=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator20callPlatformFunctionEPK8OSSymbolbPvS3_S3_S3_",address,size);
+            patcher.clearError();
+            const bool policyPlan=scratchScope && compressionReady && policyStart>=address && policyDispatch>=address &&
+             TGLTahoeCompressionPolicy::matches(reinterpret_cast<const uint8_t *>(address),size,policyStart-address,policyDispatch-address);
+            auto setPolicy=[&](size_t offset,const uint8_t *before,const uint8_t *after,size_t bytes){
+             auto at=reinterpret_cast<uint8_t *>(address+offset);
+             KernelPatcher::LookupPatch patch {currentGraphics,before,after,bytes,1};
+             patcher.applyLookupPatch(&patch,at,bytes+1);
+             const bool ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(at,after,bytes);
+             patcher.clearError();return ok;
+            };
+            const bool policyReady=policyPlan && TGLTahoeCompressionPolicy::apply(reinterpret_cast<uint8_t *>(address),size,
+             policyStart-address,policyDispatch-address,setPolicy);
+            uint64_t policyReport[]={1,policyPlan,policyReady,0x1474,0};
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicy",policyReport,sizeof(policyReport));
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicyReady",policyReady);
             bool alignmentReady=scratchScope && ccsReady && resolveSymbol>=address &&
              TGLTahoeResolveAlignment::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address);
             patcher.clearError();
