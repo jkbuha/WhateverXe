@@ -65,6 +65,7 @@
 #include "kern_edp_aux_lease.hpp"
 #include "kern_tgl_panel_power.hpp"
 #include "kern_tgl_tahoe_resolve_scratch.hpp"
+#include "kern_tgl_hang_resolve.hpp"
 #include "kern_tgl_tahoe_compression.hpp"
 #include "kern_tgl_tahoe_resolve_alignment.hpp"
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
@@ -12505,6 +12506,31 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
       c->activeGGTT.q[1]=5;
     }
     tglHostClock(g.q+3);root->setProperty("TGLHangGGTT0",&g,sizeof(g));
+   }
+   // Separate bounded failure evidence: preserve the existing schema/guards.
+   // Never submit work or infer executed state from a raw saved-image packet.
+   if(!c->q[1] && tglTahoeTimingRequired && tglTahoeResolveMappedClass &&
+      c->before[TGLHangDetail::Owner]==reinterpret_cast<uint64_t>(tglHost.owner)) {
+    auto evidence=static_cast<TGLHangResolve::Capture *>(IOMalloc(sizeof(TGLHangResolve::Capture)));
+    if(evidence) {
+     auto pageRead=[&](TGLHangGraph::Page &p){TGLHangDetail::mappedPage(p,c->before,tglVM.directBase,tglVM.directEnd,read,physical);};
+     TGLHangResolve::collect(*evidence,*c,read,pageRead);
+     for(unsigned slot=0;slot<4;++slot) {
+      char key[48];snprintf(key,sizeof(key),"WXTahoeResolve%uB",slot);
+      auto object=root->copyProperty(key);auto receipt=OSDynamicCast(OSData,object);
+      if(receipt && receipt->getLength()==sizeof(TGLTahoeResolveReceipt::Receipt))
+       TGLHangResolve::scratch(evidence->scratch[slot],slot,
+        *static_cast<const TGLTahoeResolveReceipt::Receipt *>(receipt->getBytesNoCopy()),tglTahoeResolveMappedClass,read,physical);
+      if(object)object->release();
+     }
+     uint64_t finalOwner[TGLHangDetail::Fields]{},rootAfter=0;
+     if(!TGLHangDetail::ownership(finalOwner,c->q[4],tglPPGTTClass,read) ||
+        memcmp(finalOwner,c->before,sizeof(finalOwner)) ||
+        !tglVMRead(tglVM.kernelPmap+0x50,rootAfter) || rootAfter!=cpuRoot)evidence->q[1]=2;
+     evidence->q[14]=finalOwner[TGLHangDetail::Root];evidence->q[15]=cpuRoot;evidence->q[16]=rootAfter;
+     root->setProperty("TGLHangResolve0",evidence,sizeof(*evidence));
+     IOFree(evidence,sizeof(*evidence));
+    }
    }
    status[2]=0;status[3]=c->q[1];
   } else {c->q[0]=TGLHangDetail::Schema;c->q[1]=6;status[2]=2;status[3]=6;}

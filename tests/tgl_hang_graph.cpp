@@ -42,6 +42,23 @@ struct Fixture {
 };
 }
 int main(int argc,char **argv) {
+ // Modify-enable bits control inheritance independently for each base. A new
+ // candidate must never inherit state from a previously decoded submission.
+ {Fixture f;auto c=std::make_unique<Capture>();auto read=[&](Page &p){f.read(p);};Walker<decltype(read)> w{*c,read};
+  for(unsigned mask=0;mask<8;++mask){
+   c->state[0]={};Words a;setup(a);w.update(a.data(),22,0);
+   Words b(22);b[0]=0x61010014;b[4]=(Surfaces+4096)|((mask&1)?1:0);
+   b[6]=(Dynamic+4096)|((mask&2)?1:0);b[10]=(Code+4096)|((mask&4)?1:0);w.update(b.data(),22,0);
+   const auto &s=c->state[0];assert(s.surface==Surfaces+((mask&1)?4096:0));
+   assert(s.dynamic==Dynamic+((mask&2)?4096:0));assert(s.instruction==Code+((mask&4)?4096:0));
+   assert((s.known&(SurfaceBase|DynamicBase|InstructionBase))==(SurfaceBase|DynamicBase|InstructionBase));
+  }
+  auto e=std::make_unique<TGLHangPending::Entry>();Words a;setup(a);draw(a);add(a,{0x05000000});
+  e->gpu=Main;e->stable=1;e->dwords=a.size();e->copied=a.size()*4;memcpy(e->bytes,a.data(),e->copied);w.candidate(0,*e);
+  assert(c->draws[0].q[2]&InstructionBase);Words b;draw(b);add(b,{0x05000000});
+  e->dwords=b.size();e->copied=b.size()*4;memcpy(e->bytes,b.data(),e->copied);w.candidate(1,*e);
+  assert(c->q[2]==2 && c->draws[1].q[2]==0 && c->draws[1].q[5]==0 && (c->q[5]&MissingState));
+ }
  {Fixture f;Words root;setup(root);draw(root,3);root.resize(0x6800/4);
   draw(root,6);add(root,{0x05000000});f.external(root,Main,MappedRootBytes);
   auto c=f.mapped();assert(!c->q[5] && c->q[2]==2 && c->q[12]==root.size()*4);

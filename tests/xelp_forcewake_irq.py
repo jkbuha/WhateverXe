@@ -18,7 +18,7 @@ assert 'tglCSBForceWake[0](renderWakeOwner,false,1)' in s
 if a.donor is None:
  print('PASS: common TGL/ADL-N routing and exact-entry guards; use --donor for native reentry execution')
  sys.exit(0)
-data=a.donor.read_bytes();assert hashlib.sha256(data).hexdigest() in ['890735a93a19d3ddda24ff31bda3075dbd145fb7b26c11769f33c4564a8027ac','bd1a21f5e622aadabdab6441f6b5c38ed73fa3053c783fdf0fb7e4b309f273d0']
+data=a.donor.read_bytes();assert hashlib.sha256(data).hexdigest() in ['890735a93a19d3ddda24ff31bda3075dbd145fb7b26c11769f33c4564a8027ac','bd1a21f5e622aadabdab6441f6b5c38ed73fa3053c783fdf0fb7e4b309f273d0','6d99a2b72f34648cbb68d651af53cb64a33e6298763e4f83a7c9f0be1406bb64']
 prologue=bytes.fromhex('554889e541574156415541545350');assert data[0x28c2a:0x28c2a+len(prologue)]==prologue
 prefix=r'''
 #include <cstdint>
