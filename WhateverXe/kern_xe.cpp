@@ -67,6 +67,7 @@
 #include "kern_tgl_tahoe_resolve_scratch.hpp"
 #include "kern_tgl_tahoe_compression.hpp"
 #include "kern_tgl_tahoe_resolve_alignment.hpp"
+#include "kern_tgl_tahoe_resolve_receipt.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -791,6 +792,31 @@ static void tglTahoeCompressionEnable(void *resource,void *entry,uint64_t gpu,
  void *accel,void *task,uint8_t level,uint8_t face,bool skip) {
  tglTahoeCompressionObserve(resource,entry,gpu,accel,task,level,face,skip);
  FunctionCast(tglTahoeCompressionEnable,tglTahoeCompressionOriginal)(resource,entry,gpu,accel,task,level,face,skip);
+}
+
+static uintptr_t tglTahoeResolveReceiptOriginal,tglTahoeResolveMappedClass;
+static uint32_t tglTahoeResolveReceiptCount;
+static __attribute__((noinline)) void tglTahoeResolveObserve(unsigned slot,unsigned phase,
+ void *pool,void *mapped,void *params,bool mode,const void *rects,bool result){
+ if(slot>=TGLTahoeResolveReceipt::Capacity || !tglVM.nofault)return;
+ auto receipt=static_cast<TGLTahoeResolveReceipt::Receipt *>(IOMalloc(sizeof(TGLTahoeResolveReceipt::Receipt)));
+ if(!receipt)return;
+ auto read=[](uint64_t p,void *out,size_t n)->uint64_t{return tglVM.nofault(p,reinterpret_cast<uint64_t>(out),n);};
+ TGLTahoeResolveReceipt::collect(*receipt,reinterpret_cast<uint64_t>(pool),reinterpret_cast<uint64_t>(mapped),
+  reinterpret_cast<uint64_t>(params),reinterpret_cast<uint64_t>(rects),mode,phase,result,tglTahoeResolveMappedClass,read);
+ receipt->q[23]=slot;
+ char key[48];snprintf(key,sizeof(key),"WXTahoeResolve%u%c",slot,phase==1?'A':'B');
+ IORegistryEntry::getRegistryRoot()->setProperty(key,receipt,sizeof(*receipt));
+ IOFree(receipt,sizeof(*receipt));
+}
+static bool tglTahoeResolveReceipt(void *pool,void *mapped,void *params,bool mode,const void *rects){
+ unsigned slot=__atomic_load_n(&tglTahoeResolveReceiptCount,__ATOMIC_RELAXED);
+ while(slot<TGLTahoeResolveReceipt::Capacity &&
+  !__atomic_compare_exchange_n(&tglTahoeResolveReceiptCount,&slot,slot+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+ tglTahoeResolveObserve(slot,1,pool,mapped,params,mode,rects,false);
+ const bool result=FunctionCast(tglTahoeResolveReceipt,tglTahoeResolveReceiptOriginal)(pool,mapped,params,mode,rects);
+ tglTahoeResolveObserve(slot,2,pool,mapped,params,mode,rects,result);
+ return result;
 }
 
 // One diagnostic allocation on the real kernel task, after native start has
@@ -9227,8 +9253,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionReady",compressionReady);
             patcher.clearError();
-            // Port only the owned synchronization-slot correction; panel routing
-            // and native draw/shader/rectangle operations remain unchanged.
+            // Guarded resolve corrections; native draw, shader and rectangle
+            // operations remain unchanged outside the qualified descriptor.
             const auto resolveSymbol=patcher.solveSymbol<mach_vm_address_t>(index,
              "__Z11resolve_ccsP25IOAccelCommandBufferPool2P14IGMappedBufferP22color_resolve_params_tbRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyE",address,size);
             const auto scratchSymbol=patcher.solveSymbol<mach_vm_address_t>(index,"_g7_resolve_scratch_space_size",address,size);
@@ -9269,6 +9295,17 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(scratchReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveScratchStats)) {
              IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveScratchStats",stats);stats->release();
             }
+            patcher.clearError();
+            const auto mappedClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV20IGSharedMappedBuffer",address,size);
+            bool receiptReady=scratchScope && tglVM.nofault && resolveSymbol>=address && mappedClass>=address &&
+             TGLTahoeResolveReceipt::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address,mappedClass-address);
+            patcher.clearError();
+            if(receiptReady){
+             tglTahoeResolveMappedClass=mappedClass+16;
+             KernelPatcher::RouteRequest route[] {{"__Z11resolve_ccsP25IOAccelCommandBufferPool2P14IGMappedBufferP22color_resolve_params_tbRK8IGVectorI11blit_rect_t25IGIOMallocAllocatorPolicyE",tglTahoeResolveReceipt,tglTahoeResolveReceiptOriginal}};
+             receiptReady=patcher.routeMultiple(index,route,arrsize(route),address,size);
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveReceiptReady",receiptReady);
             patcher.clearError();
 
 			patcher.clearError();
