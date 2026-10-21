@@ -66,6 +66,7 @@
 #include "kern_tgl_panel_power.hpp"
 #include "kern_tgl_tahoe_resolve_scratch.hpp"
 #include "kern_tgl_tahoe_compression.hpp"
+#include "kern_tgl_tahoe_resolve_alignment.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -103,6 +104,20 @@ static void tglPublishPanelPower() {
  const auto &s=tglPanelPowerLease;
  uint32_t q[]={1,tglPanelPowerReady,s.held,s.gets,s.puts,s.inheritedPuts,s.errors,s.fault};
  IORegistryEntry::getRegistryRoot()->setProperty("WXTahoePanelPower",q,sizeof(q));
+}
+
+extern "C" {
+ uint32_t wxTahoeResolveAlignmentEnabled=0,wxTahoeResolveAlignmentFixes=0;
+ uintptr_t wxTahoeResolveAlignmentResume=0;
+}
+extern "C" __attribute__((naked,used)) void wxTahoeResolveAlignmentBridge() {
+ asm volatile(WEX_TAHOE_RESOLVE_ALIGNMENT_BRIDGE);
+}
+static bool wxTahoeResolveAlignmentStats(void *,void *,OSSerialize *serializer) {
+ const uint32_t q[]={1,__atomic_load_n(&wxTahoeResolveAlignmentEnabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&wxTahoeResolveAlignmentFixes,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
 extern "C" {
@@ -9219,6 +9234,24 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             const auto scratchSymbol=patcher.solveSymbol<mach_vm_address_t>(index,"_g7_resolve_scratch_space_size",address,size);
             const bool scratchScope=TGLTahoeTiming::requested(xeProfile.identity,xeProfile.revision,xeProfile.overridden(),
              XELP::kernelOS(version)==XELP::OS::Tahoe) && checkKernelArgument("-disablegfxfirmware");
+            bool alignmentReady=scratchScope && ccsReady && resolveSymbol>=address &&
+             TGLTahoeResolveAlignment::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address);
+            patcher.clearError();
+            if(alignmentReady){
+             auto site=reinterpret_cast<uint8_t *>(address+TGLTahoeResolveAlignment::Site);
+             wxTahoeResolveAlignmentResume=address+TGLTahoeResolveAlignment::Resume;
+             uint8_t jump[sizeof(TGLTahoeResolveAlignment::Original)];memset(jump,0x90,sizeof(jump));
+             jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(wxTahoeResolveAlignmentBridge);memcpy(jump+6,&target,8);
+             patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(site),jump,sizeof(jump));
+             alignmentReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,jump,sizeof(jump));
+            }
+            __atomic_store_n(&wxTahoeResolveAlignmentEnabled,alignmentReady?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAlignmentReady",alignmentReady);
+            if(alignmentReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveAlignmentStats)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAlignmentStats",stats);stats->release();
+            }
+            patcher.clearError();
             bool scratchReady=scratchScope && ccsReady && resolveSymbol>=address && scratchSymbol>=address &&
              TGLTahoeResolveScratch::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address,scratchSymbol-address);
             patcher.clearError();
