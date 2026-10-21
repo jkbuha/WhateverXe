@@ -14,6 +14,21 @@ extern "C" __attribute__((naked)) unsigned invokeSetter(void*,void*,void*) {
  asm volatile("pushq %rbp\nmovq %rsp,%rbp\npushq %r14\npushq %r15\nmovq %rdi,%r14\nmovq %rsi,%r15\ncallq *%rdx\nmovzbl 0x1474(%r14),%eax\npopq %r15\npopq %r14\npopq %rbp\nretq\n");
 }
 int main(int argc,char **argv){
+ {
+  constexpr uint64_t base=0xFFFFFF7F80000000ULL,expected=base+256;
+  std::array<uint8_t,512> memory{};
+  auto read=[&](uint64_t at,void *out,unsigned n)->uint64_t{if(at<base || at-base>memory.size() || n>memory.size()-(at-base))return 0;memcpy(out,memory.data()+(at-base),n);return n;};
+  assert(resolvesTo(expected,expected,read));assert(!resolvesTo(base,expected,read));
+  memory[0]=0xFF;memory[1]=0x25;int32_t delta=26;memcpy(memory.data()+2,&delta,4);memcpy(memory.data()+32,&expected,8);
+  assert(resolvesTo(base,expected,read));assert(!resolvesTo(base,expected+1,read));
+  for(unsigned i=0;i<6;++i){memory[i]^=1;assert(!resolvesTo(base,expected,read));memory[i]^=1;}
+  uint64_t bad=0;memcpy(memory.data()+32,&bad,8);assert(!resolvesTo(base,expected,read));
+  bad=base;memcpy(memory.data()+32,&bad,8);assert(!resolvesTo(base,expected,read));
+  memory.fill(0);memory[0]=0xE9;delta=251;memcpy(memory.data()+1,&delta,4);assert(resolvesTo(base,expected,read));
+  delta=-5;memcpy(memory.data()+1,&delta,4);assert(!resolvesTo(base,expected,read));
+  assert(!resolvesTo(0,expected,read));assert(!resolvesTo(base,0,read));
+  assert(!resolvesTo(base,expected,[](uint64_t,void*,unsigned)->uint64_t{return 0;}));
+ }
  std::vector<uint8_t> image(Selector+18);
  auto put=[&](size_t at,const auto &bytes){memcpy(image.data()+at,bytes,sizeof(bytes));};
  put(Startup,StartupBytes);put(Zero,ZeroBytes);put(Select,SelectBytes);put(Setter,SetterBytes);memcpy(image.data()+Selector,"renderCompression",18);

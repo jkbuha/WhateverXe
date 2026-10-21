@@ -14,12 +14,30 @@ constexpr uint8_t SetterBytes[]={0x41,0x8A,0x07,0x41,0x88,0x86,0x74,0x14,0,0,0xE
 // MOV AL,0; NOP retains instruction extent and flags. The native store and
 // success continuation stay intact; the caller's byte is never modified.
 constexpr uint8_t SetterOff[]={0xB0,0,0x90};
+inline bool kernel(uint64_t p,size_t n){return (p>>47)==0x1FFFF && p<=UINT64_MAX-n;}
+template<class Read>bool resolvesTo(uint64_t target,uint64_t expected,Read read){
+ if(!kernel(expected,1))return false;
+ uint64_t seen[3]{};
+ for(unsigned hop=0;hop<3;++hop){
+  if(!kernel(target,6))return false;if(target==expected)return true;
+  for(unsigned i=0;i<hop;++i)if(target==seen[i])return false;seen[hop]=target;
+  uint8_t bytes[6]{};if(read(target,bytes,6)!=6)return false;
+  int32_t delta=0;
+  if(bytes[0]==0xFF && bytes[1]==0x25){
+   memcpy(&delta,bytes+2,4);const auto slot=target+6+static_cast<int64_t>(delta);
+   if(!kernel(slot,8) || read(slot,&target,8)!=8)return false;
+  }else if(bytes[0]==0xE9){memcpy(&delta,bytes+1,4);target=target+5+static_cast<int64_t>(delta);}
+  else return false;
+ }
+ return target==expected;
+}
 inline bool matches(const uint8_t *image,size_t size,size_t start,size_t dispatch,uint64_t liveBase=0,uint64_t compareTarget=0){
  if(!image || size<Selector+18)return false;
  int32_t displacement=0;memcpy(&displacement,image+Select+16,4);
  // This is an external BRANCH relocation to _strncmp in the exact donor.
  // Offline accepts its zero addend; live admission requires the resolved
- // kernel target, rather than ignoring the relocated operand.
+ // admitted branch target, rather than ignoring the relocated operand.
+ // Production separately validates direct/loader-stub jumps to _strncmp.
  const bool call=liveBase ? compareTarget && liveBase+Select+20+static_cast<int64_t>(displacement)==compareTarget : displacement==0 && !compareTarget;
  return image && size>=Selector+18 && start==Start && dispatch==Dispatch &&
   call &&

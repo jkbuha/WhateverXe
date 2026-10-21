@@ -9335,8 +9335,18 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             patcher.clearError();
             const auto policyCompare=patcher.solveSymbol(KernelPatcher::KernelID,"_strncmp");
             patcher.clearError();
-            const bool policyPlan=scratchScope && compressionReady && policyStart>=address && policyDispatch>=address &&
-             TGLTahoeCompressionPolicy::matches(reinterpret_cast<const uint8_t *>(address),size,policyStart-address,policyDispatch-address,address,policyCompare);
+            uint64_t policyCall=0;bool policyCallReady=false;uint8_t policyCallBytes[6]{};
+            if(scratchScope && tglVM.nofault && size>TGLTahoeCompressionPolicy::Select+20){
+             int32_t delta=0;memcpy(&delta,reinterpret_cast<void *>(address+TGLTahoeCompressionPolicy::Select+16),4);
+             policyCall=address+TGLTahoeCompressionPolicy::Select+20+static_cast<int64_t>(delta);
+             auto readPolicy=[](uint64_t p,void *out,unsigned n)->uint64_t{
+              return TGLTahoeCompressionPolicy::kernel(p,n)?tglVM.nofault(p,reinterpret_cast<uint64_t>(out),n):0;
+             };
+             policyCallReady=TGLTahoeCompressionPolicy::resolvesTo(policyCall,policyCompare,readPolicy);
+             readPolicy(policyCall,policyCallBytes,sizeof(policyCallBytes));
+            }
+            const bool policyPlan=scratchScope && compressionReady && policyCallReady && policyStart>=address && policyDispatch>=address &&
+             TGLTahoeCompressionPolicy::matches(reinterpret_cast<const uint8_t *>(address),size,policyStart-address,policyDispatch-address,address,policyCall);
             auto setPolicy=[&](size_t offset,const uint8_t *before,const uint8_t *after,size_t bytes){
              auto at=reinterpret_cast<uint8_t *>(address+offset);
              KernelPatcher::LookupPatch patch {currentGraphics,before,after,bytes,1};
@@ -9345,12 +9355,13 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              patcher.clearError();return ok;
             };
             const bool policyReady=policyPlan && TGLTahoeCompressionPolicy::apply(reinterpret_cast<uint8_t *>(address),size,
-             policyStart-address,policyDispatch-address,setPolicy,address,policyCompare);
+             policyStart-address,policyDispatch-address,setPolicy,address,policyCall);
             uint64_t policyReport[]={1,policyPlan,policyReady,0x1474,0};
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicy",policyReport,sizeof(policyReport));
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicyReady",policyReady);
-            uint64_t policyGuard[]={1,scratchScope,compressionReady,policyStart-address,policyDispatch-address,policyCompare,address};
+            uint64_t policyGuard[]={2,scratchScope,compressionReady,policyStart-address,policyDispatch-address,policyCompare,address,policyCall,policyCallReady};
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionPolicyGuard",policyGuard,sizeof(policyGuard));
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeCompressionCallBytes",policyCallBytes,sizeof(policyCallBytes));
             if(size>TGLTahoeCompressionPolicy::Selector+18){
              uint8_t policyBytes[80]{};
              memcpy(policyBytes,reinterpret_cast<void *>(address+TGLTahoeCompressionPolicy::Zero),3);
