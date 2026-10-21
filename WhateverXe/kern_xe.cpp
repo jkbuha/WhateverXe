@@ -69,6 +69,7 @@
 #include "kern_tgl_tahoe_resolve_alignment.hpp"
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
 #include "kern_tgl_tahoe_resolve_draw.hpp"
+#include "kern_tgl_tahoe_resolve_attributes.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -118,6 +119,20 @@ extern "C" __attribute__((naked,used)) void wxTahoeResolveAlignmentBridge() {
 static bool wxTahoeResolveAlignmentStats(void *,void *,OSSerialize *serializer) {
  const uint32_t q[]={1,__atomic_load_n(&wxTahoeResolveAlignmentEnabled,__ATOMIC_ACQUIRE),
   __atomic_load_n(&wxTahoeResolveAlignmentFixes,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
+extern "C" {
+ uint32_t wxTahoeResolveAttributesEnabled=0,wxTahoeResolveAttributesCount=0;
+ uintptr_t wxTahoeResolveAttributesResume=0;
+}
+extern "C" __attribute__((naked,used)) void wxTahoeResolveAttributesBridge(){
+ asm volatile(WEX_TAHOE_RESOLVE_ATTRIBUTES_BRIDGE);
+}
+static bool wxTahoeResolveAttributesStats(void *,void *,OSSerialize *serializer){
+ const uint32_t q[]={1,__atomic_load_n(&wxTahoeResolveAttributesEnabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&wxTahoeResolveAttributesCount,__ATOMIC_RELAXED)};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -9312,6 +9327,26 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
               !memcmp(site,TGLTahoeResolveDraw::Replacement,sizeof(TGLTahoeResolveDraw::Replacement));
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveDrawLengthReady",drawReady);
+            patcher.clearError();
+            // Native SBE literal has zero attributes. Clear only PS_EXTRA's
+            // attribute-enable bit; replay native RAX/store and restore flags.
+            bool attributesReady=scratchScope && ccsReady && resolveSymbol>=address &&
+             TGLTahoeResolveAttributes::matches(reinterpret_cast<const uint8_t *>(address),size,resolveSymbol-address);
+            patcher.clearError();
+            if(attributesReady){
+             auto site=reinterpret_cast<uint8_t *>(address+TGLTahoeResolveAttributes::Site);
+             wxTahoeResolveAttributesResume=address+TGLTahoeResolveAttributes::Resume;
+             uint8_t jump[sizeof(TGLTahoeResolveAttributes::Original)];memset(jump,0x90,sizeof(jump));
+             jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);
+             const uintptr_t target=reinterpret_cast<uintptr_t>(wxTahoeResolveAttributesBridge);memcpy(jump+6,&target,8);
+             patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(site),jump,sizeof(jump));
+             attributesReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,jump,sizeof(jump));
+            }
+            __atomic_store_n(&wxTahoeResolveAttributesEnabled,attributesReady?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAttributesReady",attributesReady);
+            if(attributesReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveAttributesStats)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAttributesStats",stats);stats->release();
+            }
             patcher.clearError();
             const auto mappedClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV20IGSharedMappedBuffer",address,size);
             bool receiptReady=scratchScope && tglVM.nofault && resolveSymbol>=address && mappedClass>=address &&
