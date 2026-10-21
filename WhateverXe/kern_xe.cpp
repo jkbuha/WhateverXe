@@ -70,6 +70,7 @@
 #include "kern_tgl_tahoe_resolve_receipt.hpp"
 #include "kern_tgl_tahoe_resolve_draw.hpp"
 #include "kern_tgl_tahoe_resolve_attributes.hpp"
+#include "kern_tgl_tahoe_resolve_normal.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -133,6 +134,23 @@ extern "C" __attribute__((naked,used)) void wxTahoeResolveAttributesBridge(){
 static bool wxTahoeResolveAttributesStats(void *,void *,OSSerialize *serializer){
  const uint32_t q[]={1,__atomic_load_n(&wxTahoeResolveAttributesEnabled,__ATOMIC_ACQUIRE),
   __atomic_load_n(&wxTahoeResolveAttributesCount,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
+extern "C" {
+ uint32_t wxTahoeResolveNormalEnabled=0,wxTahoeResolveNormalCopies=0,wxTahoeResolveNormalSelects=0;
+ uintptr_t wxTahoeResolveNormalSource=0,wxTahoeResolveNormalCopyResume=0,wxTahoeResolveNormalSelectResume=0;
+}
+extern "C" void *wxTahoeResolveNormalCopy(void *last,const void *source,size_t bytes){
+ return TGLTahoeResolveNormal::copy(last,source,bytes,
+  __atomic_load_n(&wxTahoeResolveNormalEnabled,__ATOMIC_ACQUIRE),wxTahoeResolveNormalCopies);
+}
+extern "C" __attribute__((naked,used)) void wxTahoeResolveNormalCopyBridge(){asm volatile(WEX_TAHOE_RESOLVE_NORMAL_COPY_BRIDGE);}
+extern "C" __attribute__((naked,used)) void wxTahoeResolveNormalSelectBridge(){asm volatile(WEX_TAHOE_RESOLVE_NORMAL_SELECT_BRIDGE);}
+static bool wxTahoeResolveNormalStats(void *,void *,OSSerialize *serializer){
+ const uint32_t q[]={1,__atomic_load_n(&wxTahoeResolveNormalEnabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&wxTahoeResolveNormalCopies,__ATOMIC_RELAXED),__atomic_load_n(&wxTahoeResolveNormalSelects,__ATOMIC_RELAXED),0x4D00,144,0x5100,0x5000};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -9346,6 +9364,35 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAttributesReady",attributesReady);
             if(attributesReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveAttributesStats)){
              IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveAttributesStats",stats);stats->release();
+            }
+            patcher.clearError();
+            // Preserve native initialization and add the qualified helper only
+            // inside its 0x5100 scratch allocation, before completion at0x5000.
+            const auto resolveInit=patcher.solveSymbol<mach_vm_address_t>(index,
+             "__Z35resolve_initialize_scratch_space_g7P16IGAccelSysMemory",address,size);
+            bool normalReady=scratchScope && scratchReady && attributesReady && drawReady &&
+             resolveInit>=address && resolveSymbol>=address && scratchSymbol>=address &&
+             TGLTahoeResolveNormal::matches(reinterpret_cast<const uint8_t *>(address),size,
+              resolveInit-address,resolveSymbol-address,scratchSymbol-address);
+            patcher.clearError();
+            if(normalReady){
+             wxTahoeResolveNormalSource=address+TGLTahoeResolveNormal::Source;
+             wxTahoeResolveNormalCopyResume=address+TGLTahoeResolveNormal::CopyResume;
+             wxTahoeResolveNormalSelectResume=address+TGLTahoeResolveNormal::SelectResume;
+             const size_t sites[]={TGLTahoeResolveNormal::CopySite,TGLTahoeResolveNormal::SelectSite};
+             const size_t lengths[]={27,sizeof(TGLTahoeResolveNormal::SelectOriginal)};
+             const uintptr_t targets[]={reinterpret_cast<uintptr_t>(wxTahoeResolveNormalCopyBridge),reinterpret_cast<uintptr_t>(wxTahoeResolveNormalSelectBridge)};
+             for(unsigned i=0;i<2 && normalReady;++i){
+              uint8_t jump[27];memset(jump,0x90,sizeof(jump));jump[0]=0xFF;jump[1]=0x25;memset(jump+2,0,4);memcpy(jump+6,targets+i,8);
+              auto site=reinterpret_cast<uint8_t *>(address+sites[i]);
+              patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(site),jump,lengths[i]);
+              normalReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,jump,lengths[i]);patcher.clearError();
+             }
+            }
+            __atomic_store_n(&wxTahoeResolveNormalEnabled,normalReady?1U:0U,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveNormalReady",normalReady);
+            if(normalReady)if(auto stats=OSSerializer::forTarget(nullptr,wxTahoeResolveNormalStats)){
+             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveNormalStats",stats);stats->release();
             }
             patcher.clearError();
             const auto mappedClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV20IGSharedMappedBuffer",address,size);
