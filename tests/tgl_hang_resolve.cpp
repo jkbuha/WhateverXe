@@ -51,5 +51,28 @@ int main(){
  map[0x10]=0x40;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);map[0x10]=0;++cases;
  put(map,0x98,uint64_t(0));scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);put(map,0x98,Base);++cases;
  r->q[13]=0;scratch(s,0,*r,r->q[17],K+0x10000,sr,physical);assert(s.q[1]==1);++cases;
+
+ // Current task -> exact resolve context -> current mapped scratch, with a
+ // second ownership walk after all six GPU-page observations.
+ const uint64_t task=K+0x20000,context=K+0x21000,taskClass=K+0x22000,contextClass=K+0x23000,pool=K+0x24000;
+ c->before[TGLHangDetail::Task]=task;c->before[TGLHangDetail::Context]=context;memcpy(c->after,c->before,sizeof(c->before));
+ put(map,0x90,task);uint64_t linked=context;bool wrongClass=false,changeLink=false;
+ auto ownedRead=[&](uint64_t at,void *v,unsigned n)->uint64_t{
+  uint64_t value=0;
+  if(at==task && n==8)value=wrongClass?taskClass+8:taskClass;
+  else if(at==task+0x2A8 && n==8)value=linked;
+  else if(at==context && n==8)value=contextClass;
+  else if(at==context+0xD8 && n==8)value=r->q[3];
+  else if(at==context+0xE0 && n==8)value=pool;
+  else return sr(at,v,n);
+  memcpy(v,&value,8);return 8;
+ };
+ auto ownedPage=[&](TGLHangGraph::Page&q){pages.insert(q.q[0]);if(changeLink)linked=context+4096;};
+ auto runOwned=[&](){pages.clear();collect(*out,*c,read,pageRead);selected(*out,*c,taskClass,contextClass,r->q[17],K+0x10000,ownedRead,physical,ownedPage);};
+ runOwned();assert(!out->q[23] && out->q[19]==context && out->q[20]==r->q[3] && out->q[21]==pool && out->q[22]==task && !out->selected.q[1] && out->q[2]==7);++cases;
+ wrongClass=true;runOwned();assert(out->q[23]==1);wrongClass=false;++cases;
+ linked=context+4096;runOwned();assert(out->q[23]==2);linked=context;++cases;
+ changeLink=true;runOwned();assert(out->q[23]==6);changeLink=false;linked=context;++cases;
+ put(map,0x90,task+4096);runOwned();assert(!out->q[23] && out->q[22]!=task);put(map,0x90,task);++cases;
  printf("PASS %u failure-only resolve evidence cases; no GPU/system access; capture bytes=%zu\n",cases,sizeof(Capture));
 }

@@ -833,6 +833,7 @@ static void tglTahoeCompressionEnable(void *resource,void *entry,uint64_t gpu,
 static uintptr_t tglTahoeResolveReceiptOriginal,tglTahoeResolveMappedClass;
 static uint32_t tglTahoeResolveReceiptCount;
 static bool tglHangResolveReady;
+static uintptr_t tglHangResolveContextClass;
 static __attribute__((noinline)) void tglTahoeResolveObserve(unsigned slot,unsigned phase,
  void *pool,void *mapped,void *params,bool mode,const void *rects,bool result){
  if(slot>=TGLTahoeResolveReceipt::Capacity || !tglVM.nofault)return;
@@ -9453,9 +9454,18 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
              receiptReady=patcher.routeMultiple(index,route,arrsize(route),address,size);
             }
             IORegistryEntry::getRegistryRoot()->setProperty("WXTahoeResolveReceiptReady",receiptReady);
-            tglHangResolveReady=receiptReady && size>TGLHangResolve::GPUAccessor+sizeof(TGLHangResolve::GPUAccessorBytes) &&
+            const auto resolveContextClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV24IGHardwareResolveContext",address,size);
+            patcher.clearError();
+            const auto resolveContextGetter=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN11IGAccelTask22getColorResolveContextEb",address,size);
+            patcher.clearError();
+            tglHangResolveReady=receiptReady && resolveContextClass==address+TGLHangResolve::ContextClass &&
+             resolveContextGetter==address+TGLHangResolve::ContextGetter &&
+             !memcmp(reinterpret_cast<void *>(resolveContextGetter),TGLHangResolve::ContextGetterBytes,sizeof(TGLHangResolve::ContextGetterBytes)) &&
+             !memcmp(reinterpret_cast<void *>(address+TGLHangResolve::ContextLoads),TGLHangResolve::ContextLoadBytes,sizeof(TGLHangResolve::ContextLoadBytes)) &&
+             size>TGLHangResolve::GPUAccessor+sizeof(TGLHangResolve::GPUAccessorBytes) &&
              patcher.solveSymbol<mach_vm_address_t>(index,"__ZNK14IGMappedBuffer20getGPUVirtualAddressEv",address,size)==address+TGLHangResolve::GPUAccessor &&
              !memcmp(reinterpret_cast<void *>(address+TGLHangResolve::GPUAccessor),TGLHangResolve::GPUAccessorBytes,sizeof(TGLHangResolve::GPUAccessorBytes));
+            tglHangResolveContextClass=tglHangResolveReady?resolveContextClass+16:0;
             IORegistryEntry::getRegistryRoot()->setProperty("TGLHangResolveReady",tglHangResolveReady);
             patcher.clearError();
 
@@ -12528,6 +12538,8 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
         *static_cast<const TGLTahoeResolveReceipt::Receipt *>(receipt->getBytesNoCopy()),tglTahoeResolveMappedClass,tglTahoeResolveClasses.map,read,physical);
       if(object)object->release();
      }
+     TGLHangResolve::selected(*evidence,*c,tglTahoeResolveClasses.task,tglHangResolveContextClass,
+      tglTahoeResolveMappedClass,tglTahoeResolveClasses.map,read,physical,pageRead);
      uint64_t finalOwner[TGLHangDetail::Fields]{},rootAfter=0;
      if(!TGLHangDetail::ownership(finalOwner,c->q[4],tglPPGTTClass,read) ||
         memcmp(finalOwner,c->before,sizeof(finalOwner)) ||
