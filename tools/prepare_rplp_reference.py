@@ -15,6 +15,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
   if p.is_file():shutil.copy2(p,out/p.name)
  for p in [source/'LICENSE',source/'NOTICE.md',source/'src/LICENSE-NootedGreen']:shutil.copy2(p,out/p.name)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
+ gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
  gate+='extern bool wexRplReferenceAdoptFramebuffer(void *);\nextern void wexRplReferenceFramebufferStarted(void *,bool);\nextern mach_vm_address_t wexRplDisplayPipeInitOriginal;\nextern bool wexRplReferenceDisplayPipeInit(void *,void *,void *,void *,unsigned);\n'
  (out/'wex_reference_gate.hpp').write_text(gate)
@@ -94,6 +95,13 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  }
  // WEX native barrier candidate end.
 """)
+ # The reference's raw cached context can outlive its owner (shutdown panic).
+ # Invalidate before native base free; repair holds a temporary live reference.
+ edit('kern_gen11.cpp','cb->lastRCSCtx = ctx;', 'wexRplReferenceCacheRCSContext(ctx);')
+ edit('kern_gen11.cpp','void *ctx = cb->lastRCSCtx;',
+      'struct WEXRCSLease { void *object; ~WEXRCSLease(){wexRplReferenceReleaseRCSContext(object);} };\n\tWEXRCSLease lease{wexRplReferenceAcquireRCSContext()};\n\tvoid *ctx = lease.object;')
+ edit('kern_gen11.cpp','{"__ZN17IGHardwareContext11withOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh",',
+      '{"__ZN17IGHardwareContext4freeEv", wexRplReferenceContextFree, wexRplReferenceContextFreeOriginal},\n\t\t\t {"__ZN17IGHardwareContext11withOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh",')
  # V509 must never invent a ring start on our machine. Invalid mapping refuses repair.
  edit('kern_gen11.cpp','if (!rcsStart) rcsStart = 0x402eb000;         // fallback from HANGCHECK','if (!rcsStart) { cb->writeReg32(GGTT_PTE_LO(0), saveLo); cb->writeReg32(GGTT_PTE_HI(0), saveHi); cb->writeReg32(0x101008, 1); return ret; }')
  # Bounded passive snapshots: no console logging or MMIO writes in interrupt paths.

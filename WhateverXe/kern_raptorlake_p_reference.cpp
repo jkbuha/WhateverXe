@@ -7,6 +7,9 @@
 #include "kern_raptorlake_p_reference_core.hpp"
 #include "kern_raptorlake_p_reference_fb_core.hpp"
 #include "kern_raptorlake_p_reference_snapshot.hpp"
+#include "kern_raptorlake_p_reference_context.hpp"
+#include "kern_raptorlake_p_reference_shutdown.hpp"
+#include <IOKit/IOLocks.h>
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_raptorlake_p_native_core.hpp"
@@ -23,6 +26,7 @@
 #include "wex_reference_framebuffer.hpp"
 extern "C" const char version[];
 mach_vm_address_t wexRplDisplayPipeInitOriginal;
+mach_vm_address_t wexRplReferenceContextFreeOriginal;
 namespace {
 NGreen backend;
 IOPCIDevice *target;
@@ -33,6 +37,18 @@ thread_call_t framebufferWork;
 thread_call_t moduleWork;
 thread_call_t captureWork;
 uint32_t captureBusy,captureSequence;
+using ShutdownQuery=int (*)();
+using TryRetain=bool (*)(const OSObject *,const void *);
+ShutdownQuery shutdownQuery;TryRetain contextTryRetain;
+IOSimpleLock *contextLock;
+RaptorLakeP::ReferenceContext::Cache contextCache;
+uint32_t contextState[8]{1}; // schema, stores, borrowed, dying, forgotten, released, shutdown skips, free calls
+struct ContextIO {
+ IOInterruptState interruptState{};
+ void lock(){interruptState=IOSimpleLockLockDisableInterrupt(contextLock);}
+ void unlock(){IOSimpleLockUnlockEnableInterrupt(contextLock,interruptState);}
+ bool tryRetain(void *object){bool ok=contextTryRetain(static_cast<OSObject *>(object),nullptr);if(!ok)__sync_fetch_and_add(&contextState[3],1);return ok;}
+};
 uint32_t barrierState[8]{1}; // schema, attempts, native, refused, last reason, last result, failures, reserved
 using ModuleLoader=int (*)(const char *,bool,bool,uint8_t,uint8_t,void *);
 ModuleLoader moduleLoader;
@@ -70,7 +86,7 @@ uint32_t compatPortMode(void *port){
 }
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
-void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
+void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
 void moduleWorker(thread_call_param_t,thread_call_param_t){
  if(!wexRplReferencePanel() || !moduleLoader || !target || !state[1] || state[4] || state[7] || !moduleState[1])return;
  const char *ids[]{"org.b00t0x.AppleIntelTGLCompat","com.apple.driver.AppleIntelTGLGraphicsFramebuffer","com.apple.driver.AppleIntelTGLGraphics"};
@@ -83,7 +99,7 @@ void moduleWorker(thread_call_param_t,thread_call_param_t){
  }
  moduleState[6]=1;publish();
 }
-void ready(){RaptorLakeP::Control::update(state[1]&&state[2]&&state[3]&&state[5]&&state[8]&&(!wexRplReferencePanel() || panelState[10])&&!state[7],state[4]);publish();}
+void ready(){RaptorLakeP::Control::update(state[1]&&state[2]&&state[3]&&state[5]&&state[8]&&(!wexRplReferencePanel() || (panelState[10] && shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal))&&!state[7],state[4]);publish();}
 void monitorWorker(thread_call_param_t,thread_call_param_t){
  if(!state[4] || !state[6] || state[7] || !target || !nativeOwner || monitorSamples>=120)return;
  uint32_t sample[256]{};wexRplReferenceRuntime(sample,256);
@@ -106,6 +122,7 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   auto sample=RaptorLakeP::ReferenceSnapshot::capture(io,++captureSequence);
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
   target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));
+  target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));
  }
  __sync_synchronize();captureBusy=0;
 }
@@ -215,6 +232,13 @@ void worker(thread_call_param_t,thread_call_param_t){
 void kernel(void *,KernelPatcher &p){
  if(!wexRplReferenceValidate())return;
  if(wexRplReferencePanel()){
+  auto query=p.solveSymbol(KernelPatcher::KernelID,"_get_system_inshutdown");p.clearError();
+  auto flag=p.solveSymbol(KernelPatcher::KernelID,"_system_inshutdown");p.clearError();
+  if(query && flag && RaptorLakeP::ReferenceShutdown::getter(reinterpret_cast<const uint8_t *>(query),12,query,flag))shutdownQuery=reinterpret_cast<ShutdownQuery>(query);
+  auto retain=p.solveSymbol(KernelPatcher::KernelID,"__ZNK8OSObject15taggedTryRetainEPKv");p.clearError();
+  const uint8_t retainPrefix[]{0x55,0x48,0x89,0xE5};
+  if(retain && !memcmp(reinterpret_cast<void *>(retain),retainPrefix,4))contextTryRetain=reinterpret_cast<TryRetain>(retain);
+  if(!shutdownQuery || !contextTryRetain || !contextLock){state[7]=9;ready();return;}
   auto address=p.solveSymbol(KernelPatcher::KernelID,"__ZN6OSKext22loadKextWithIdentifierEPKcbbhhP7OSArray");p.clearError();
   const uint8_t prefix[]{0x55,0x48,0x89,0xE5};
   if(address && !memcmp(reinterpret_cast<void *>(address),prefix,sizeof(prefix)))moduleLoader=reinterpret_cast<ModuleLoader>(address);
@@ -228,7 +252,7 @@ void kext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
   const char *name="__ZN17AppleIntelPortHAL13probePortModeEv";
   const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x10};
   bool ok=RaptorLakeP::ReferenceFB::compatImage(reinterpret_cast<void *>(a),n);
-  auto entry=ok?p.solveSymbol<mach_vm_address_t>(i,name,a,n):0;p.clearError();
+  auto entry=ok?p.solveSymbol(i,name,a,n):0;p.clearError();
   ok=ok && entry>=a && n>=sizeof(prefix) && entry-a<=n-sizeof(prefix) && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
   if(ok){KernelPatcher::RouteRequest route{name,compatPortMode,compatPortOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
   panelState[10]=ok;
@@ -238,7 +262,7 @@ void kext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
  if(i==fbInfo.loadIndex && !wexRplReferencePanel()){
   if(!wexRplReferenceImage(reinterpret_cast<void *>(a),n,false)){state[7]=3;ready();return;}
   const char *name="__ZN31AppleIntelFramebufferController5startEP9IOService";
-  const auto entry=p.solveSymbol<mach_vm_address_t>(i,name,a,n);p.clearError();
+  const auto entry=p.solveSymbol(i,name,a,n);p.clearError();
   const uint8_t prefix[]{0x55,0x48,0x89,0xE5};
   bool ok=entry>=a && entry-a<n-16 && !memcmp(reinterpret_cast<void *>(entry),prefix,4);
   if(ok){KernelPatcher::RouteRequest route{name,framebufferStart,fbOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
@@ -318,9 +342,27 @@ bool wexRplReferenceImage(const void *p,unsigned long n,bool gpu){
 }
 void wexRplReferenceIOAF(bool ok){state[8]=ok;if(!ok)state[7]=6;ready();}
 void wexRplReferenceLoaded(bool gpu){state[gpu?3:2]=1;ready();}
+void wexRplReferenceCacheRCSContext(void *object){
+ if(!object || !contextLock)return;
+ ContextIO io;contextCache.store(io,object);__sync_fetch_and_add(&contextState[1],1);
+}
+void *wexRplReferenceAcquireRCSContext(){
+ if(!contextLock || !contextTryRetain || !shutdownQuery)return nullptr;
+ if(shutdownQuery()){__sync_fetch_and_add(&contextState[6],1);return nullptr;}
+ ContextIO io;auto object=contextCache.acquire(io);
+ if(object)__sync_fetch_and_add(&contextState[2],1);return object;
+}
+void wexRplReferenceReleaseRCSContext(void *object){
+ if(!object)return;__sync_fetch_and_add(&contextState[5],1);static_cast<OSObject *>(object)->release();
+}
+void wexRplReferenceContextFree(void *object){
+ if(contextLock){ContextIO io;if(contextCache.forget(io,object))__sync_fetch_and_add(&contextState[4],1);}
+ __sync_fetch_and_add(&contextState[7],1);
+ reinterpret_cast<void (*)(void *)>(wexRplReferenceContextFreeOriginal)(object);
+}
 bool wexRplReferenceBarrierOwner(const void *owner){
  return checkKernelArgument("-wex-rplp-native-barriers") && wexRplReferencePanel() && state[1] && state[4] &&
-  state[6] && !state[7] && nativeOwner && owner==nativeOwner && !nativeOwner->isInactive();
+  state[6] && !state[7] && shutdownQuery && !shutdownQuery() && nativeOwner && owner==nativeOwner && !nativeOwner->isInactive();
 }
 void wexRplReferenceBarrierResult(unsigned reason,unsigned result){
  __sync_fetch_and_add(&barrierState[1],1);
@@ -356,6 +398,7 @@ bool enabled(){
 void init(){
 #ifdef WEX_RPLP_REFERENCE_BACKEND
  if(!enabled())return;
+ if(wexRplReferencePanel())contextLock=IOSimpleLockAlloc();
  monitor=thread_call_allocate(monitorWorker,nullptr);
  if(wexRplReferencePanel())captureWork=thread_call_allocate(captureWorker,nullptr);
  if(wexRplReferencePanel())moduleWork=thread_call_allocate(moduleWorker,nullptr);

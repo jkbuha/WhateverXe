@@ -17,5 +17,11 @@ with tempfile.TemporaryDirectory(prefix='rplp-reference-metadata-') as d:
  p=personality('acceleratorPersonalityXML');original=plistlib.loads(Path('/Library/Extensions/AppleIntelTGLGraphics.kext/Contents/Info.plist').read_bytes())['IOKitPersonalities']['Gen7']
  assert p['Development']==original['Development'] and p['Development']['SingleChannelIndex']==0
  assert p['IOAccelDisplayPipeCapabilities']=={'DisplayPipeSupported':True,'TransactionsSupported':True}
- assert 'wexRplReferenceAdoptFramebuffer(that)' in (out/'kern_gen11.cpp').read_text()
+ native=(out/'kern_gen11.cpp').read_text()
+ assert 'wexRplReferenceAdoptFramebuffer(that)' in native
+ assert 'cb->lastRCSCtx' not in native
+ assert 'wexRplReferenceCacheRCSContext(ctx)' in native
+ assert 'WEXRCSLease lease{wexRplReferenceAcquireRCSContext()}' in native
+ assert '~WEXRCSLease(){wexRplReferenceReleaseRCSContext(object);}' in native
+ assert '{"__ZN17IGHardwareContext4freeEv", wexRplReferenceContextFree, wexRplReferenceContextFreeOriginal}' in native
 print('PASS actual generated signed/reference metadata: original 80000 priority, native match category/class/identity, complete GPU defaults and display capabilities')

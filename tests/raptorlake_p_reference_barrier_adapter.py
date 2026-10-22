@@ -55,14 +55,14 @@ owner=r'''#include <cassert>
 #include <cstdint>
 #include <cstring>
 struct Owner{bool dead;bool isInactive(){return dead;}} obj,other;Owner*nativeOwner=&obj;
-uint32_t state[9]{1},barrierState[8]{1};bool argument,panel;
+uint32_t state[9]{1},barrierState[8]{1};bool argument,panel;bool shuttingDown;int query(){return shuttingDown;} int(*shutdownQuery)()=query;
 bool checkKernelArgument(const char*s){assert(!strcmp(s,"-wex-rplp-native-barriers"));return argument;}
 bool wexRplReferencePanel(){return panel;}
 BODY
-int main(){for(unsigned bits=0;bits<128;++bits){
- argument=bits&1;panel=bits&2;state[1]=bits&4;state[4]=bits&8;state[6]=bits&16;state[7]=bits&32;obj.dead=bits&64;
+int main(){for(unsigned bits=0;bits<256;++bits){
+ argument=bits&1;panel=bits&2;state[1]=bits&4;state[4]=bits&8;state[6]=bits&16;state[7]=bits&32;obj.dead=bits&64;shuttingDown=bits&128;
  assert(wexRplReferenceBarrierOwner(&obj)==(bits==31));assert(!wexRplReferenceBarrierOwner(&other));
- }nativeOwner=nullptr;state[7]=0;obj.dead=false;assert(!wexRplReferenceBarrierOwner(&obj));
+ }shutdownQuery=nullptr;assert(!wexRplReferenceBarrierOwner(&obj));shutdownQuery=query;shuttingDown=false;nativeOwner=nullptr;state[7]=0;obj.dead=false;assert(!wexRplReferenceBarrierOwner(&obj));
  wexRplReferenceBarrierResult(0,1);wexRplReferenceBarrierResult(6,0);wexRplReferenceBarrierResult(0,0);
  assert(barrierState[1]==3&&barrierState[2]==2&&barrierState[3]==1&&barrierState[6]==1&&barrierState[7]==6);
 }
@@ -72,4 +72,4 @@ with tempfile.TemporaryDirectory(prefix='rplp-barrier-') as d:
   p=Path(d);(p/(name+'.cpp')).write_text(code)
   subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined',str(p/(name+'.cpp')),'-o',str(p/name)],check=True)
   subprocess.run([str(p/name)],check=True)
-print('PASS production barrier preflight21 cases, owner gate128 cases, telemetry and original return propagation')
+print('PASS production barrier preflight21 cases, owner gate256 cases, telemetry and original return propagation')
