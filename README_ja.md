@@ -109,6 +109,7 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wex-rplp-donor-fixes` | 実験的なRPL-P専用donor修正。context電源、preemption、Tahoe plane数、圧縮policyを調整します。manual armとnative-engine診断が必要です。accelerator起動は引き続き無効です。 |
 | `-wex-rplp-reference-backend` | 専用buildのRPL-P参照backendを有効にします。厳密なmachine判定とroot manual armが必要です。通常のTGL/診断backendは起動しません。 |
 | `-wex-rplp-fb` | 厳密な参照framebuffer donorを指定した専用buildでRPL-P panel backendを有効にします。参照backendとroot manual armが必要です。通常の署名済みframebufferではこれらのhookを使用できません。 |
+| `-wex-rplp-native-barriers` | native accelerator の公開後に依存 barrier を有効にする実験的 RPL-P 診断。任意の panel backend と手動 arm が必要で、native context を検証してから従来の startup path を離れます。 |
 | `-wex-rplp-manual-arm` | 管理者が`WhateverXeRPLPControl` serviceへ`BeginDiagnostic=true`を送信するまでRPL-P native診断を待機させます。既存のnative-probe前提条件が必要です。実験的診断の開始前に動作確認済みboot fileを復元できます。通常のaccelerator admissionは有効にしません。 |
 | `-wex-rplp-subranges` | native descriptorの割り当て・枯渇・backing RAMの共有・復元・解放と再利用、およびcustom eventを使わないpage-pool登録を検証する実験的診断。factory全体とcache-shadow診断の成功が必要です。所有RAMのみを使用し、子descriptorの所有権が不明な場合は再起動までmanagerを保持します。accelerationは有効にしません。 |
 | `-wex-rplp-cache-shadow` | 所有RAM上でnative cache初期化を再生する実験的診断。模擬forcewakeの取得・解放とRAM全体・境界を検証します。native-factory診断が必要です。時間制限付きforcewake中に既存cache registerも読み取りますが、実機cacheへの書き込みやaccelerationの有効化は行いません。 |

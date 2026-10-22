@@ -33,6 +33,7 @@ thread_call_t framebufferWork;
 thread_call_t moduleWork;
 thread_call_t captureWork;
 uint32_t captureBusy,captureSequence;
+uint32_t barrierState[8]{1}; // schema, attempts, native, refused, last reason, last result, failures, reserved
 using ModuleLoader=int (*)(const char *,bool,bool,uint8_t,uint8_t,void *);
 ModuleLoader moduleLoader;
 uint32_t moduleState[8]{1}; // schema, requested, stage, Compat, FB, GPU, complete, failure
@@ -69,7 +70,7 @@ uint32_t compatPortMode(void *port){
 }
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
-void publish(){if(target){target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
+void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
 void moduleWorker(thread_call_param_t,thread_call_param_t){
  if(!wexRplReferencePanel() || !moduleLoader || !target || !state[1] || state[4] || state[7] || !moduleState[1])return;
  const char *ids[]{"org.b00t0x.AppleIntelTGLCompat","com.apple.driver.AppleIntelTGLGraphicsFramebuffer","com.apple.driver.AppleIntelTGLGraphics"};
@@ -104,6 +105,7 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   } io;
   auto sample=RaptorLakeP::ReferenceSnapshot::capture(io,++captureSequence);
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
+  target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));
  }
  __sync_synchronize();captureBusy=0;
 }
@@ -316,6 +318,17 @@ bool wexRplReferenceImage(const void *p,unsigned long n,bool gpu){
 }
 void wexRplReferenceIOAF(bool ok){state[8]=ok;if(!ok)state[7]=6;ready();}
 void wexRplReferenceLoaded(bool gpu){state[gpu?3:2]=1;ready();}
+bool wexRplReferenceBarrierOwner(const void *owner){
+ return checkKernelArgument("-wex-rplp-native-barriers") && wexRplReferencePanel() && state[1] && state[4] &&
+  state[6] && !state[7] && nativeOwner && owner==nativeOwner && !nativeOwner->isInactive();
+}
+void wexRplReferenceBarrierResult(unsigned reason,unsigned result){
+ __sync_fetch_and_add(&barrierState[1],1);
+ __sync_fetch_and_add(&barrierState[reason?3:2],1);
+ barrierState[4]=reason;barrierState[5]=result;
+ if(reason)barrierState[7]=reason;
+ if(!reason && !result)__sync_fetch_and_add(&barrierState[6],1);
+}
 bool wexRplReferenceQueue(OSDictionary *dict){
  if(!state[1] || !dict || accelerator)return false;
  // Direct allocation needs the complete signed personality defaults. In

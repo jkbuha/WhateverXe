@@ -15,6 +15,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
   if p.is_file():shutil.copy2(p,out/p.name)
  for p in [source/'LICENSE',source/'NOTICE.md',source/'src/LICENSE-NootedGreen']:shutil.copy2(p,out/p.name)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
+ gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
  gate+='extern bool wexRplReferenceAdoptFramebuffer(void *);\nextern void wexRplReferenceFramebufferStarted(void *,bool);\nextern mach_vm_address_t wexRplDisplayPipeInitOriginal;\nextern bool wexRplReferenceDisplayPipeInit(void *,void *,void *,void *,unsigned);\n'
  (out/'wex_reference_gate.hpp').write_text(gate)
  def edit(name,before,after):
@@ -60,6 +61,39 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  # presentation becomes 9A49. The known exact donor is guarded before this edit.
  edit('kern_gen11.cpp','\t\tNGreen::callback->setRMMIOIfNecessary();\n\t\tSYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");',
       '\t\tNGreen::callback->setRMMIOIfNecessary();\n\t\tconst uint8_t skuOld[]{0x81,0xFF,0x86,0x80,0x48,0x9A,0x74,0x25};\n\t\tconst uint8_t skuNew[]{0x81,0xFF,0x86,0x80,0xA0,0xA7,0x74,0x25};\n\t\tif(size<=0x23C37 || memcmp(reinterpret_cast<void *>(address+0x23C2F),skuOld,8))return false;\n\t\tpatcher.routeBlock(address+0x23C2F,skuNew,8);\n\t\tif(patcher.getError()!=KernelPatcher::Error::NoError){patcher.clearError();return false;}\n\t\tSYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");')
+ # Preserve legacy startup behavior. Admit the original dependency barrier only
+ # after native publication and after checking every context it dereferences.
+ edit('kern_gen11.cpp','void *event, uint16_t count, const uint16_t *list) {',
+      'void *event, uint16_t count, const uint16_t *list) {\n'+r"""
+ // WEX native barrier candidate begin.
+ if(wexRplReferenceBarrierOwner(accelerator)) {
+  unsigned reason=0;
+  void *task=nullptr;
+  if(!queue || !cmdDesc || !event || (count && !list))reason=1;
+  if(!reason && getMember<void *>(queue,0x5C0)!=accelerator)reason=2;
+  if(!reason){
+   auto last=getMember<int32_t>(queue,0x830);
+   if(last < -1 || last > 15 || !getMember<void *>(cmdDesc,0x58))reason=3;
+   else if(!(task=getMember<void *>(cmdDesc,8)))reason=4;
+   else if(last>=0)for(int i=0;i<=last;++i)if(!getMember<void *>(queue,0x7B0+8*i)){reason=5;break;}
+  }
+  auto valid=[](void *ctx){return ctx && getMember<void *>(ctx,0xB8);};
+  void *(*getters[])(void *,bool){getBlit2DContext,getBlit3DContext,getDepthResolveContext,getColorResolveContext};
+  for(unsigned i=0;!reason && i<4;++i)if(!valid(getters[i](task,true)))reason=6+i;
+  if(!reason){
+   auto systemTask=getMember<void *>(accelerator,0x150);
+   if(!systemTask)reason=10;
+   for(unsigned i=0;!reason && i<2;++i)if(!valid(getters[i](systemTask,true)))reason=11+i;
+  }
+  if(!reason && !callback->obarrierSubmission)reason=13;
+  if(!reason){
+   auto result=FunctionCast(barrierSubmission,callback->obarrierSubmission)(queue,accelerator,cmdDesc,event,count,list);
+   wexRplReferenceBarrierResult(0,result);return result;
+  }
+  wexRplReferenceBarrierResult(reason,0);
+ }
+ // WEX native barrier candidate end.
+""")
  # V509 must never invent a ring start on our machine. Invalid mapping refuses repair.
  edit('kern_gen11.cpp','if (!rcsStart) rcsStart = 0x402eb000;         // fallback from HANGCHECK','if (!rcsStart) { cb->writeReg32(GGTT_PTE_LO(0), saveLo); cb->writeReg32(GGTT_PTE_HI(0), saveHi); cb->writeReg32(0x101008, 1); return ret; }')
  # Bounded passive snapshots: no console logging or MMIO writes in interrupt paths.

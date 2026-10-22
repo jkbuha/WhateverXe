@@ -163,5 +163,6 @@
   ],
   "-wex-rplp-donor-fixes": [],
   "-wex-rplp-reference-backend": [],
-  "-wex-rplp-fb": []
+  "-wex-rplp-fb": [],
+  "-wex-rplp-native-barriers": []
 }
