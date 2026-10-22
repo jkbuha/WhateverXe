@@ -96,6 +96,31 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wexdbg` | debug buildでログを有効にする。 |
 | `-wexoff` | WhateverXeを無効にする。 |
 | `-wexbeta` | プラグインのOSバージョンチェックを回避する。kernel／driverの一致条件は維持する。 |
+| `-wex-rplp-probe` | Tahoe上の物理Raptor Lake-P A7A0 revision 4向けGPU fuse／engineおよび電源が入ったpipeとファームウェアメモリの読み取り専用診断。時間制限付きGT／render forcewake取得で情報を収集します。アクセラレーションの有効化やディスプレイの設定変更は行いません。 |
+| `-wex-rplp-bcs` | Tahoe上の物理A7A0 revision 4向け、時間制限付きcopy engineコマンドの実験的診断。`-wex-rplp-probe`と検証済みファームウェアメモリ引き継ぎが必要です。テスト用contextを確保して再起動まで保持します。通常のアクセラレーションは有効化しません。 |
+| `-wex-rplp-rcs` | Tahoe上の物理A7A0 revision 4向け、時間制限付きrenderコマンドの実験的診断。`-wex-rplp-probe`が必要で、`-wex-rplp-bcs`との併用はできません。テスト用contextを再起動まで保持し、通常のアクセラレーションは有効化しません。 |
+| `-wex-rplp-native-probe` | Tahoe上の物理A7A0 revision 4向けnative accelerator probeの実験的診断。`-wex-rplp-probe`が必要で、command probeとは別に使用します。正確な署名済みdonorを検証してdevice選択を許可し、GPU初期化前にnative `start()`を停止します。 |
+| `-wex-rplp-native-memory` | nativeメモリマッピングの実験的診断。RPL-Pの両probe引数が必要です。native BAR mappingとaddress segmentを初期化し、dummy-page割当およびGGTT初期化の前に意図的に失敗させます。アクセラレーションは無効のままです。 |
+| `-wex-rplp-native-pages` | native dummy-page割当の実験的診断。RPL-Pの両probe引数と`-wex-rplp-native-memory`が必要です。割当失敗時のcleanupを保護し、両CPU bufferを検証してGGTT初期化前に停止します。 |
+| `-wex-rplp-gtt-shadow` | 所有するRAM上でnative GGTT constructorを検証する実験的診断。RPL-Pのnative probe、memory、page引数がすべて必要です。予約prefix、64-bit PTE storeとcleanupを検証し、別途slot診断を要求しない限り実際のGGTTは変更しません。 |
+| `-wex-rplp-cache-transaction` | 103個のcache-policy registerの書き込み・読み取り確認・復元を行う実験的診断。cache-shadow成功、idleな96-EU/GOP状態、管理者によるmanual armが必要です。firmware MOCS61、PAT0とL3 layoutを保持し、試行した書き込みをすべて復元します。renderingやaccelerationは有効にしません。 |
+| `-wex-rplp-caps-shadow` | 実験的な読み取り専用capability取得と、所有RAM上でのnative capability/mode再生。cache-shadow/cache-transactionの成功とmanual armが必要です。hardware engine modeやaccelerationは有効にしません。 |
+| `-wex-rplp-native-engines` | native ring-field/mode/HWS helperと検証済みGen12 register templateを使う実験的render/blitter command診断。native-memory/capability診断の成功とmanual armが必要です。別々のGGTT範囲を使い、submit済みcontextは再起動まで保持します。shaderやmacOS accelerationは有効にしません。 |
+| `-wex-rplp-donor-fixes` | 実験的なRPL-P専用donor修正。context電源、preemption、Tahoe plane数、圧縮policyを調整します。manual armとnative-engine診断が必要です。accelerator起動は引き続き無効です。 |
+| `-wex-rplp-reference-backend` | 専用buildのRPL-P参照backendを有効にします。厳密なmachine判定とroot manual armが必要です。通常のTGL/診断backendは起動しません。 |
+| `-wex-rplp-fb` | 厳密な参照framebuffer donorを指定した専用buildでRPL-P panel backendを有効にします。参照backendとroot manual armが必要です。通常の署名済みframebufferではこれらのhookを使用できません。 |
+| `-wex-rplp-manual-arm` | 管理者が`WhateverXeRPLPControl` serviceへ`BeginDiagnostic=true`を送信するまでRPL-P native診断を待機させます。既存のnative-probe前提条件が必要です。実験的診断の開始前に動作確認済みboot fileを復元できます。通常のaccelerator admissionは有効にしません。 |
+| `-wex-rplp-subranges` | native descriptorの割り当て・枯渇・backing RAMの共有・復元・解放と再利用、およびcustom eventを使わないpage-pool登録を検証する実験的診断。factory全体とcache-shadow診断の成功が必要です。所有RAMのみを使用し、子descriptorの所有権が不明な場合は再起動までmanagerを保持します。accelerationは有効にしません。 |
+| `-wex-rplp-cache-shadow` | 所有RAM上でnative cache初期化を再生する実験的診断。模擬forcewakeの取得・解放とRAM全体・境界を検証します。native-factory診断が必要です。時間制限付きforcewake中に既存cache registerも読み取りますが、実機cacheへの書き込みやaccelerationの有効化は行いません。 |
+| `-wex-rplp-native-factory` | memory factory全体の構築とcleanupを検証する実験的診断。統合manager-pool診断が必要です。capabilityの連続した読み取りでeDRAM無効を確認した場合のみ先へ進み、旧forcewake probeの代わりに測定結果を使います。最後にpool arrayとmanagerを明示的に解放します。acceleratorの起動やGT cacheのprogrammingは行いません。 |
+| `-wex-rplp-manager-pools` | 実際のnative manager内でpool arrayの構築とcleanupを検証する実験的診断。page-array、空のpage-pool診断およびその前提引数が必要です。manager内にarrayを構築した後、通常は元の失敗時unwindを強制します（`-wex-rplp-native-factory`指定時を除く）。cache programmingは行いません。accelerationは有効にしません。 |
+| `-wex-rplp-page-array` | 空のpage-pool診断の成功後に、CPUごとのnative page-pool arrayを検証する実験的診断。専用のCPUメモリ上のmanager record、割当失敗を処理するpool constructor、修正した部分失敗cleanupを使用し、最後にarrayを解放します。完全なmemory managerやGPU engineは有効にしません。 |
+| `-wex-rplp-page-pool` | 空のnative page-pool constructorを検証する実験的診断。native-chainとnative-pools診断の成功が必要です。割当失敗を処理し、空のcontainer metadataを検証してobjectを解放します。memory-managerのpage-pool gateは停止したままで、GPU engineやaccelerationは有効になりません。 |
+| `-wex-rplp-native-chain` | slot/aperture検証後にmemory managerの構築を進める実験的診断。native pool診断の前提引数がすべて必要です。所有するRAMをnative poolに渡してfactory内でpoolとfence allocatorを構築し、通常はpage-pool初期化の前で停止します（`-wex-rplp-manager-pools`指定時はarray構築後、cache programming前で停止）。cleanupを検証してからbacking RAMを解放します。物理stolen memoryの割当やGPU engineの有効化は行いません。 |
+| `-wex-rplp-native-pools` | aperture診断の成功後にnative allocatorの構築を検証する実験的診断。所有するRAM 1 pageをnative stolen-memory poolのbackingとして使い、そのdescriptorとnative fence allocatorを検証します。native objectを解放してからbacking pageを解放します。物理stolen memoryの割当、fenceのprogramming、GPU commandの投入は行いません。 |
+| `-wex-rplp-gtt-aperture` | bounded GGTT slot診断中にapertureから読み出す実験的検証。`-wex-rplp-gtt-slot`とその前提引数がすべて必要です。native dummy pageをflushし、uncached aperture mappingから全1024 wordを検証します。不一致時もfirmware PTEを復元します。GPU commandやapertureへの書き込みは行いません。 |
+| `-wex-rplp-gtt-slot` | GGTTの1 entryだけを対象にする実験的hardware診断。shadow、pin-pagesおよびすべてのnative probe引数が必要です。idle GTとpanel handoffを再検証し、active scanoutの外にある10MiBのspare pageのidentity mappingに限定してnative書き込みを検証し、元のPTEを復元します。復元失敗または別entryの変化時はbufferを次のrebootまでpinしたまま保持します。acceleratorの開始やGPU commandの投入は行いません。 |
+| `-wex-rplp-pin-pages` | `-wex-rplp-gtt-shadow`実行時のbuffer lifetime診断。追加のprepare/retainで保持し、native cleanup後にpreparation IDと物理addressの安定性を検証して追加保持を解放します。 |
 | `-wex-tgl-off` | Tiger Lakeの処理を無効にする。 |
 | `-wex-noaccel` | Tiger LakeのFramebuffer単独モード。Acceleratorのprobeを停止します。 |
 | `-wex-edp-probe` | 内蔵パネルのAUX／DPCDを範囲を限定して診断します。検証済みパネル経路では`-wex-edp-routing`と併用する必要があります。この引数だけではパネルを有効にしません。 |
@@ -141,3 +166,9 @@ WhateverXeとAppleIntelTGLCompatのkext、およびソースのmanifestは`build
 ## ライセンスとクレジット
 
 WhateverXeはWhateverGreenの著作権表示とBSD-3-Clauseライセンスを継承しています。[LICENSE.txt](LICENSE.txt)を参照してください。LiluとMacKernelSDKは別の依存コンポーネントです。
+
+任意のRPL-P参照実装統合: commit `d0c046a441fa467ac492770aeeefe9636b97c65e` のcheckoutを `--rplp-reference-source /path/to/Hackintosh-XPS13Plus-IrisXe-Tahoe` で指定します。この実験的buildは別ライセンスのTSNPL sourceを含み、build出力にnoticeを保存します。BSDのみの配布物ではありません。通常buildはこのsourceを含みません。任意の `--rplp-reference-framebuffer /path/to/AppleIntelTGLGraphicsFramebuffer.kext` で厳密に対応するpanel donorの契約を追加できます。Apple binaryは別のbuild入力として保持します。
+
+Panel buildは、system graphicsの依存先が利用可能になってから参照framebufferを読み込むための `WhateverXeRPLPBridge.kext` も生成します。このproviderはkernel KPIだけに依存し、6種類の操作をWhateverXeが検証したframebuffer ownerへ転送します。読み込みだけではGPUのarmやnative framebufferのmatchingを有効にしません。
+
+パネルバックエンドは手動アーミング後に、署名済みパーソナリティ本来のプローブ優先度で IOKit マッチングを行います。ディスプレイパイプの作成には、このバックエンドが所有するネイティブフレームバッファが必要です。

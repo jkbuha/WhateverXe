@@ -115,6 +115,28 @@
   "-wex-nopanel": [
     "-tglnopanel"
   ],
+  "-wex-rplp-bcs": [],
+  "-wex-rplp-cache-shadow": [],
+  "-wex-rplp-cache-transaction": [],
+  "-wex-rplp-caps-shadow": [],
+  "-wex-rplp-gtt-aperture": [],
+  "-wex-rplp-gtt-shadow": [],
+  "-wex-rplp-gtt-slot": [],
+  "-wex-rplp-manager-pools": [],
+  "-wex-rplp-manual-arm": [],
+  "-wex-rplp-native-chain": [],
+  "-wex-rplp-native-engines": [],
+  "-wex-rplp-native-factory": [],
+  "-wex-rplp-native-memory": [],
+  "-wex-rplp-native-pages": [],
+  "-wex-rplp-native-pools": [],
+  "-wex-rplp-native-probe": [],
+  "-wex-rplp-page-array": [],
+  "-wex-rplp-page-pool": [],
+  "-wex-rplp-pin-pages": [],
+  "-wex-rplp-probe": [],
+  "-wex-rplp-rcs": [],
+  "-wex-rplp-subranges": [],
   "-wex-tc-aux": [
     "-tgltc-aux"
   ],
@@ -138,5 +160,8 @@
   ],
   "-wexoff": [
     "-wxeoff"
-  ]
+  ],
+  "-wex-rplp-donor-fixes": [],
+  "-wex-rplp-reference-backend": [],
+  "-wex-rplp-fb": []
 }

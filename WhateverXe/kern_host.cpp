@@ -1,6 +1,9 @@
 // Copyright © 2018 vit9696. Derived from WhateverGreen (BSD-3-Clause).
 #include "kern_host.hpp"
 #include "kern_xelp_device.hpp"
+#include "kern_raptorlake_p_probe.hpp"
+#include "kern_raptorlake_p_native.hpp"
+#include "kern_raptorlake_p_reference.hpp"
 #include "kern_xe_data_access.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
@@ -12,6 +15,8 @@ struct FramebufferViewer : public IOFramebuffer {
 static const char *graphicsPath[] { "/System/Library/Extensions/IOGraphicsFamily.kext/IOGraphicsFamily" };
 static KernelPatcher::KextInfo graphics { "com.apple.iokit.IOGraphicsFamily",graphicsPath,arrsize(graphicsPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 void XeHost::init() {
+ if(RaptorLakeP::Reference::enabled()){RaptorLakeP::Reference::init();return;}
+ RaptorLakeP::Native::init();
  callbackHost=this;
  PE_parse_boot_argn("gfxrst",&resetFramebuffer,sizeof(resetFramebuffer));
  if(resetFramebuffer>=FB_TOTAL)resetFramebuffer=FB_DETECT;
@@ -33,6 +38,7 @@ void XeHost::processKernel(KernelPatcher &patcher) {
    static_cast<uint32_t>(profile.family),static_cast<uint32_t>(profile.display),
    static_cast<uint32_t>(profile.gt),active};
   gpu->setProperty("WhateverXeDeviceSelection",selection,sizeof(selection));
+  RaptorLakeP::probe(gpu,profile);
   if(!gpu->getProperty("model"))if(const auto name=XELP::model(profile))gpu->setProperty("model",const_cast<char *>(name),strlen(name)+1);
  }
  if(active) {

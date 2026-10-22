@@ -13,14 +13,15 @@ code=r'''
 #include <cstdio>
 #include <vector>
 #include "kern_xelp_platform.hpp"
-std::vector<int> events;bool publish=true,published=false;uint32_t identity=0x9a498086;
+#include "kern_raptorlake_p.hpp"
+std::vector<int> events;bool publish=true,published=false;uint32_t identity=0x9a498086;uint8_t revision=0;
 struct Object {virtual ~Object()=default;};
 struct OSData:Object {uint32_t value=0;void *getBytesNoCopy(){return &value;}size_t getLength(){return 4;}};
 OSData fake;Object customModel;bool hasModel=false;unsigned modelWrites=0;Object *deviceProperty=nullptr;
 struct IOPCIDevice {
  const char *name="GFX0";unsigned renames=0;
  uint32_t configRead32(int){assert(published);events.push_back(2);return identity;}
- uint8_t configRead8(int){assert(published);events.push_back(3);return 0;}
+ uint8_t configRead8(int){assert(published);events.push_back(3);return revision;}
  uint16_t configRead16(int){assert(published);events.push_back(4);return 0x300;}
  const char *getName(){return name;}Object *getProperty(const char *key){return !strcmp(key,"device-id")?deviceProperty:!strcmp(key,"model")&&hasModel?&customModel:nullptr;}
  void setProperty(const char *,const char *){}void setProperty(const char *key,const void *value,unsigned size){if(!strcmp(key,"model")){assert(value && size>1);++modelWrites;}}void setProperty(const char *,uint64_t,unsigned){}
@@ -33,6 +34,7 @@ struct DeviceInfo {
 };DeviceInfo DeviceInfo::value;
 namespace WIOKit {bool awaitPublishing(IOPCIDevice *){events.push_back(1);published=publish;return publish;}void renameDevice(IOPCIDevice *device,const char *name){device->name=name;++device->renames;events.push_back(5);}}
 // DEVICE_ADAPTER
+namespace RaptorLakeP {void probe(IOPCIDevice *,const XELP::Profile &p){assert(published);assert(!p.admitted() || p.gt!=XELP::GT::Unknown);if(p.family==XELP::Family::RaptorLakeP){assert(RaptorLakeP::eligible(p,XELP::OS::Tahoe,true));events.push_back(10);}}}
 struct KernelPatcher {static constexpr int KernelID=0;uintptr_t solveSymbol(int,const char *){return 0;}void clearError(){}};
 namespace XeDataAccess {void processKernel(KernelPatcher &){assert(published);events.push_back(7);}}
 struct Graphics {bool off=false;void switchOff(){off=true;}} graphics;
@@ -45,20 +47,20 @@ struct XeHost {
 '''.replace('// DEVICE_ADAPTER',adapter)+body+r'''
 int main(){KernelPatcher patcher;IOPCIDevice gpu,mei;
 const char *names[]={nullptr,"IMEI","HECI","MEI"};
-for(unsigned firmware=0;firmware<2;++firmware)for(unsigned me=0;me<5;++me)for(unsigned test=0;test<6;++test){
+for(unsigned firmware=0;firmware<2;++firmware)for(unsigned me=0;me<5;++me)for(unsigned test=0;test<7;++test){
  mei.name=names[me%4];mei.renames=0;gpu.name="GFX0";
  DeviceInfo::value.managementEngine=me==4?nullptr:&mei;
  DeviceInfo::value.firmwareVendor=firmware?DeviceInfo::FirmwareVendor::Apple:DeviceInfo::FirmwareVendor::Other;
- events.clear();published=false;publish=test!=1;identity=(test==2 || test>=4)?0x12348086:0x9a498086;deviceProperty=test>=4?&fake:nullptr;fake.value=test==4?0x46D2:0xFFFF;graphics.off=false;
+ revision=test==6?4:0;events.clear();published=false;publish=test!=1;identity=test==6?0xA7A08086:(test==2 || test>=4)?0x12348086:0x9a498086;deviceProperty=(test==4 || test==5)?&fake:nullptr;fake.value=test==4?0x46D2:0xFFFF;graphics.off=false;
  hasModel=test==3;modelWrites=0;
  DeviceInfo::value.videoBuiltin=test==0?nullptr:&gpu;XeHost host;host.processKernel(patcher);
  const bool normalize=(test==3 || test==4) && me!=4;
  assert(mei.renames==(normalize && me!=1?1U:0U));
  if(normalize)assert(mei.name && !strcmp(mei.name,"IMEI"));
  else assert(mei.name==names[me%4]);
- assert(events.back()==9);assert(modelWrites==(test==4?1U:0U));
+ assert(events.back()==9);assert(modelWrites==((test==4 || test==6)?1U:0U));
  if(test<2){assert(!host.active&&graphics.off);assert(events.size()==(test==0?1:2));}
- else if(test==2 || test==5){assert(!host.active&&graphics.off);assert(events.size()==4);}
+ else if(test==2 || test==5 || test==6){assert(!host.active&&graphics.off);assert(events.size()==(test==6?5:4));if(test==6)assert(events[3]==10);}
  else {assert(host.active&&!graphics.off);assert(events.front()==1);assert(events[events.size()-2]==8);}
 }
 puts("PASS actual host admission: absent/unpublished/unsupported GPUs never enter Xe; published PCI reads precede selected-driver dispatch");}

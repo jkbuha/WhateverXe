@@ -1,0 +1,192 @@
+// Isolated RPL-P RCS command probe, based on the existing pre-native Gen12
+// command fixture. Dynamic GGTT placement is qualified by the caller.
+// No driver admission, display programming or GT reset. Linux v6.12
+// intel_lrc.c selects gen12_rcs_offsets for this graphics IP.
+#ifndef KERN_RAPTORLAKE_P_RCS_CORE_HPP
+#define KERN_RAPTORLAKE_P_RCS_CORE_HPP
+#include <stdint.h>
+namespace RaptorLakeP { namespace RCS {
+constexpr uint32_t GPUBytes=32*4096, GPUPages=32;
+constexpr uint32_t GPUResultOffset=29*4096+0x100, GPUTail=48;
+constexpr uint32_t GPUValue=0x52504353, GPUToken=0xC001CAFE;
+enum class GPUStatus : uint64_t {
+    NotAdmitted, BadMemory, BusyGGTT, ForcewakeBusy, ForcewakeTimeout,
+    EngineBusy, Mapped, Complete, TimedOut, ReleaseFailed, RestoreFailed
+};
+struct GPUResult {
+    uint64_t version {1}, status {}, stage {}, retained {}, pteWrites {}, pteErrors {},
+        apertureSamples {}, apertureErrors {}, fwBefore {}, fwHeld {}, fwAfter {}, fwReleased {},
+        engineWrites {}, polls {}, descriptor {}, dmaFirst {}, dmaLast {}, result {}, token {},
+        head {}, tail {}, miMode {}, elStatusLo {}, elStatusHi {}, csbPointer {}, csbWrite {},
+        gucStatus {}, irqEnable {}, errors {}, ipeir {}, ipehr {}, faultAddress {};
+    uint64_t csb[12] {};
+    uint64_t slot {},renderBefore {},renderHeld {},renderAfter {},renderReleased {};
+};
+static_assert(sizeof(GPUResult)==49*8,"RPL-P RCS property layout");
+
+inline bool gpuImage(uint8_t *memory,const uint64_t *dma,uint32_t GPUBase) {
+    if(!memory || !dma || (GPUBase&4095) || GPUBase<0x10000 || GPUBase>0x10000000-GPUBytes)return false;
+    for(unsigned p=0;p<GPUPages;++p)
+        if(!dma[p] || (dma[p]&4095) || dma[p]>0x7FFFFFF000ULL)return false;
+    for(unsigned p=0;p<GPUPages;++p)for(unsigned q=0;q<p;++q)if(dma[p]==dma[q])return false;
+    for(unsigned i=0;i<GPUBytes;++i)memory[i]=0;
+    auto hws=reinterpret_cast<uint32_t *>(memory);
+    // Gen11+ CSB: 12 qwords at dword0x10, write pointer at dword0x2f.
+    for(unsigned i=0;i<24;++i)hws[0x10+i]=UINT32_MAX;
+    hws[0x2f]=11;
+    auto regs=reinterpret_cast<uint32_t *>(memory+2*4096);
+    // Gen12 XCS initial restore list, intel_lrc.c gen12_xcs_offsets.
+    constexpr uint32_t first[] {0x244,0x034,0x030,0x038,0x03c,0x168,0x140,
+        0x110,0x1c0,0x1c4,0x1c8,0x180,0x2b4};
+    constexpr uint32_t second[] {0x3a8,0x28c,0x288,0x284,0x280,0x27c,0x278,0x274,0x270};
+    regs[1]=(0x22U<<23)|0x80000|0x1000|25;
+    for(unsigned i=0;i<13;++i)regs[2+2*i]=0x2000+first[i];
+    regs[33]=(0x22U<<23)|0x80000|0x1000|17;
+    for(unsigned i=0;i<9;++i)regs[34+2*i]=0x2000+second[i];
+    // Gen12 render has additional LRI groups beyond the common XCS prefix.
+    regs[52]=(0x22U<<23)|0x80000|0x1000|5;
+    const uint32_t extra[]{0x1B0,0x5A8,0x5AC};
+    for(unsigned i=0;i<3;++i)regs[53+2*i]=0x2000+extra[i];
+    regs[65]=(0x22U<<23)|0x80000|1;regs[66]=0x20C8;
+    regs[67]=0x80041000; // One full Gen12 slice; no subslice/EU PG request.
+    regs[81]=(0x22U<<23)|0x80000|0x1000|101;
+    const uint32_t state[]{0x588,0x588,0x588,0x588,0x588,0x588,
+        0x028,0x09C,0x0C0,0x178,0x17C,0x358,0x170,0x150,0x154,0x158,0x41C};
+    for(unsigned i=0;i<17;++i)regs[82+2*i]=0x2000+state[i];
+    for(unsigned i=0;i<32;++i)regs[116+2*i]=0x2600+4*i;
+    regs[180]=0x2068;regs[182]=0x2084;
+    regs[185]=(0x0AU<<23)|1; // End diagnostic initial-restore list.
+    regs[3]=0x00090009; // Fresh context, render state restore inhibited.
+    regs[5]=0;regs[7]=GPUTail;regs[9]=GPUBase+24*4096;regs[11]=1;
+    regs[23]=0xD<<6; // Gen12 indirect-context offset, batch pointer disabled.
+    regs[0x31]=uint32_t(dma[25]>>32);regs[0x33]=uint32_t(dma[25]);
+    regs[0x61]=0x01000000; // Context-saved MI_MODE: clear STOP_RING.
+    for(unsigned level=25;level<28;++level)
+        reinterpret_cast<uint64_t *>(memory+level*4096)[0]=dma[level+1]|3;
+    for(unsigned i=0;i<512;++i)reinterpret_cast<uint64_t *>(memory+28*4096)[i]=dma[30]|3;
+    auto ring=reinterpret_cast<uint32_t *>(memory+24*4096);
+    ring[0]=(0x20U<<23)|(1U<<22)|2;
+    ring[1]=GPUBase+GPUResultOffset;ring[2]=0;ring[3]=GPUValue;
+    // Render PIPE_CONTROL: CS stall + immediate qword write using GGTT.
+    ring[4]=0x7A000004;ring[5]=(1U<<24)|(1U<<20)|(1U<<14);
+    ring[6]=GPUBase+GPUResultOffset+8;ring[7]=0;ring[8]=GPUToken;ring[9]=0;
+    // Two trailing NOOPs keep the submitted tail eight-byte aligned.
+    return true;
+}
+
+// Caller has verified the complete firmware lease, native-start exclusion,
+// exact kernel/PCI/GGC and wired MapperNone memory. On any engine write, all
+// mapped pages stay pinned until reboot even if the token completes.
+struct DefaultImage {bool operator()(uint8_t *m,const uint64_t *d,uint32_t b)const{return gpuImage(m,d,b);}};
+struct DefaultSetup {template<class IO>bool operator()(IO &,uint32_t)const{return true;}};
+template<class IO,class Image=DefaultImage,class Setup=DefaultSetup> GPUResult testGPU(IO &io,uint8_t *memory,const uint64_t *dma,
+                                     const uint64_t *predecessor,uint32_t GPUBase,bool admitted,Image image={},Setup setup={}) {
+    GPUResult out;
+    if(!admitted)return out;
+    out.status=uint64_t(GPUStatus::BadMemory);
+    out.slot=GPUBase;
+    if(!predecessor || !image(memory,dma,GPUBase))return out;
+    out.dmaFirst=dma[0];out.dmaLast=dma[GPUPages-1];
+    const uint32_t pte=0x800000+(GPUBase>>9);
+    constexpr uint32_t registers[]{0xA188,0x130044,0xA278,0xD84,0xC000,0x190030,0x209c,0x2234,0x2238,
+        0x229c,0x2030,0x2034,0x2038,0x203c,0x2098,0x2080,0x23a0,0x2550,
+        0x20b0,0x2064,0x2068,0x2078,0x2060};
+    for(auto reg:registers)if(!io.readable(reg))return out;
+    for(unsigned q=0;q<8;++q)if(!io.readable(0x2510+8*q) || !io.readable(0x2514+8*q))return out;
+    if(!io.readable(pte+GPUPages*8-4))return out;
+    for(unsigned p=0;p<GPUPages;++p)if(io.readPTE(pte+8*p)!=predecessor[p]) {
+        out.status=uint64_t(GPUStatus::BusyGGTT);return out;
+    }
+    out.stage=1;out.fwBefore=io.read(0xA188);
+    uint64_t ack=io.read(0x130044),renderAck=io.read(0xD84);
+    out.renderBefore=io.read(0xA278);
+    if(out.fwBefore==UINT32_MAX || ack==UINT32_MAX || out.renderBefore==UINT32_MAX ||
+       renderAck==UINT32_MAX || ((out.fwBefore|ack|out.renderBefore|renderAck)&1)) {
+        out.status=uint64_t(GPUStatus::ForcewakeBusy);return out;
+    }
+    const auto waitFW=[&](unsigned domain,bool held,uint64_t &last) {
+        for(unsigned n=0;n<500;++n) {
+            last=io.read(domain ? 0xD84 : 0x130044);
+            if(last==UINT32_MAX)return false;
+            if(bool(last&1)==held)return true;
+            io.delay();
+        }
+        return false;
+    };
+    io.write(0xA188,0x10001);io.read(0xA188);
+    io.write(0xA278,0x10001);io.read(0xA278);
+    bool mapped=false;
+    do {
+        out.status=uint64_t(GPUStatus::ForcewakeTimeout);
+        if(!waitFW(0,true,out.fwHeld) || !waitFW(1,true,out.renderHeld))break;
+        out.stage=2;out.status=uint64_t(GPUStatus::EngineBusy);
+        out.gucStatus=io.read(0xC000);out.irqEnable=io.read(0x190030);
+        out.miMode=io.read(0x209c);out.elStatusLo=io.read(0x2234);out.elStatusHi=io.read(0x2238);
+        // No GuC uKernel and no render/copy interrupts owned by firmware.
+        if((out.gucStatus&0xFF00) || out.gucStatus==UINT32_MAX || out.irqEnable ||
+           out.miMode!=0x200 || out.elStatusLo!=1 || out.elStatusHi || io.read(0x229c)!=0 ||
+           io.read(0x2030) || io.read(0x2034) || io.read(0x2038) || io.read(0x203c))break;
+        // Refuse even an idle firmware queue with any valid descriptors.
+        bool queueBusy=false;
+        for(unsigned p=0;p<8;++p)if(io.read(0x2510+8*p)&1)queueBusy=true;
+        if(queueBusy)break;
+        if(!io.displayUnchanged())break;
+        io.flushMemory(memory,GPUBytes);
+        out.stage=3;out.status=uint64_t(GPUStatus::Mapped);mapped=true;
+        for(unsigned p=0;p<GPUPages;++p) {
+            io.writePTE(pte+8*p,dma[p]|1);++out.pteWrites;
+            if(io.readPTE(pte+8*p)!=(dma[p]|1))++out.pteErrors;
+        }
+        io.fence();if(out.pteErrors)break;
+        for(unsigned p=0;p<GPUPages;++p)for(uint32_t offset=0;offset<=4092;offset+=4092) {
+            ++out.apertureSamples;
+            if(io.apertureRead(p*4096+offset)!=*reinterpret_cast<uint32_t *>(memory+p*4096+offset))++out.apertureErrors;
+        }
+        if(out.apertureErrors)break;
+        if(!io.displayUnchanged())break;
+        out.stage=4;out.retained=1;
+        if(!setup(io,GPUBase)){out.status=uint64_t(GPUStatus::EngineBusy);break;}
+        const auto write=[&](uint32_t reg,uint32_t value) {io.write(reg,value);++out.engineWrites;};
+        write(0x2098,UINT32_MAX); // HWSTAM, no ISR-copy writes.
+        write(0x229c,0x00080008); // Gen11+ disable legacy / enable execlists.
+        write(0x209c,0x01000000); // clear STOP_RING, preserve idle indication.
+        write(0x2080,GPUBase);io.read(0x2080); // global HWSP.
+        write(0x23a0,0xFFFF0B0B);io.read(0x23a0); // 12-entry CSB.
+        // ELSQ slots persist across LOAD. Clear all 8, then publish one context.
+        for(unsigned p=0;p<8;++p) {write(0x2510+8*p,0);write(0x2514+8*p,0);}
+        out.descriptor=uint64_t(GPUBase+4096+0x319)|(2ULL<<37); // Render class0, context ID2.
+        write(0x2510,uint32_t(out.descriptor));write(0x2514,uint32_t(out.descriptor>>32));
+        io.fence();write(0x2550,1);io.read(0x2550);
+        out.stage=5;out.status=uint64_t(GPUStatus::TimedOut);
+        for(unsigned n=0;n<20000;++n) { // 2s bound; no GPU reset on timeout.
+            io.flushMemory(memory+GPUResultOffset,64);
+            out.result=*reinterpret_cast<volatile uint32_t *>(memory+GPUResultOffset);
+            out.token=*reinterpret_cast<volatile uint32_t *>(memory+GPUResultOffset+8);
+            out.head=io.read(0x2034);out.tail=io.read(0x2030);out.miMode=io.read(0x209c);++out.polls;
+            if(out.result==GPUValue && out.token==GPUToken && (out.head&0x1FFFFC)==GPUTail &&
+               out.tail==GPUTail && (out.miMode&0x200)) {out.status=uint64_t(GPUStatus::Complete);break;}
+            io.delay();
+        }
+        out.elStatusLo=io.read(0x2234);out.elStatusHi=io.read(0x2238);
+        out.csbPointer=io.read(0x23a0);io.flushMemory(memory,4096);
+        out.csbWrite=reinterpret_cast<volatile uint32_t *>(memory)[0x2f];
+        for(unsigned i=0;i<12;++i)out.csb[i]=reinterpret_cast<volatile uint64_t *>(memory+0x40)[i];
+        out.errors=io.read(0x20b0);out.ipeir=io.read(0x2064);out.ipehr=io.read(0x2068);
+        out.faultAddress=uint64_t(io.read(0x2078))|(uint64_t(io.read(0x2060))<<32);
+    } while(false);
+    if(mapped && !out.retained) {
+        for(unsigned p=0;p<GPUPages;++p) {io.writePTE(pte+8*p,predecessor[p]);++out.pteWrites;}
+        io.fence();
+        for(unsigned p=0;p<GPUPages;++p)if(io.readPTE(pte+8*p)!=predecessor[p]) {
+            out.retained=1;out.status=uint64_t(GPUStatus::RestoreFailed);
+        }
+    }
+    io.write(0xA278,0x10000);out.renderAfter=io.read(0xA278);
+    out.renderReleased=waitFW(1,false,renderAck) && ((out.renderAfter&0xFFFF)==(out.renderBefore&0xFFFF));
+    io.write(0xA188,0x10000);out.fwAfter=io.read(0xA188);
+    out.fwReleased=waitFW(0,false,ack) && ((out.fwAfter&0xFFFF)==(out.fwBefore&0xFFFF));
+    if(!out.fwReleased || !out.renderReleased)out.status=uint64_t(GPUStatus::ReleaseFailed);
+    return out;
+}
+}}
+#endif
