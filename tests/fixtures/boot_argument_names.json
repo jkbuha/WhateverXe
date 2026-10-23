@@ -164,5 +164,6 @@
   "-wex-rplp-donor-fixes": [],
   "-wex-rplp-reference-backend": [],
   "-wex-rplp-fb": [],
-  "-wex-rplp-native-barriers": []
+  "-wex-rplp-native-barriers": [],
+  "-wex-rplp-backlight": []
 }

@@ -8,6 +8,9 @@
 #include "kern_raptorlake_p_reference_fb_core.hpp"
 #include "kern_raptorlake_p_reference_snapshot.hpp"
 #include "kern_raptorlake_p_reference_context.hpp"
+#include "kern_backlight_profile.hpp"
+#include "kern_raptorlake_p_reference_backlight.hpp"
+#include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_raptorlake_p_reference_shutdown.hpp"
 #include <IOKit/IOLocks.h>
 #include "kern_xelp_device.hpp"
@@ -65,6 +68,9 @@ const char *fbPaths[]{"/Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext
 KernelPatcher::KextInfo fbInfo{"com.apple.driver.AppleIntelTGLGraphicsFramebuffer",fbPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 const char *compatPaths[]{"/Library/Extensions/AppleIntelTGLCompat.kext/Contents/MacOS/AppleIntelTGLCompat"};
 KernelPatcher::KextInfo compatInfo{"org.b00t0x.AppleIntelTGLCompat",compatPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
+const char *backlightPaths[]{"/System/Library/Extensions/AppleBacklight.kext/Contents/MacOS/AppleBacklight"};
+KernelPatcher::KextInfo backlightInfo{"com.apple.driver.AppleBacklight",backlightPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
+mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
 uint32_t compatPortMode(void *port){
  // This export is also shared with the TGL backend. Leave other owners on the
@@ -121,6 +127,10 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   } io;
   auto sample=RaptorLakeP::ReferenceSnapshot::capture(io,++captureSequence);
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
+  if(checkKernelArgument("-wex-rplp-backlight")){
+   auto pwm=RaptorLakeP::ReferenceBacklight::capture(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1));
+   target->setProperty("WhateverXeRPLPBacklightPWM",&pwm,sizeof(pwm));
+  }
   target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));
   target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));
  }
@@ -244,6 +254,69 @@ void kernel(void *,KernelPatcher &p){
   if(address && !memcmp(reinterpret_cast<void *>(address),prefix,sizeof(prefix)))moduleLoader=reinterpret_cast<ModuleLoader>(address);
  }
  XeDataAccess::processKernel(p);
+}
+bool backlightSetDisplay(IOService *panel,IOService *display) {
+ if(!backlightOriginal)return false;
+ // Add only the missing UID-19 profile for an actual internal 16-bit PWM
+ // display. Keep Apple's/custom profiles and the native selection algorithm.
+ // No string patch, product-ID list, ACPI path or model-specific table.
+ auto provider=panel ? panel->getProvider() : nullptr;
+ auto uid=provider ? OSDynamicCast(OSString,provider->getProperty("_UID")) : nullptr;
+ auto product=display ? OSDynamicCast(OSNumber,display->getProperty("DisplayProductID")) : nullptr;
+ bool owned=false;
+ IOFramebuffer *framebuffer=nullptr;
+ const bool enabled=wexRplReferencePanel() && wexRplReferenceArmed() && checkKernelArgument("-wex-rplp-backlight");
+ for(auto entry=enabled ? display : nullptr;entry;entry=entry->getProvider()) {
+  // IOGraphicsFamily is loaded later than this Lilu plugin. A direct
+  // IOFramebuffer::metaClass import is not available in our dependency set.
+  if(!framebuffer)framebuffer=static_cast<IOFramebuffer *>(entry->metaCast("IOFramebuffer"));
+  if(entry==target){owned=true;break;}
+ }
+ // setDisplay precedes publication of IODisplayParameters. Query the same
+ // three-word (current,min,max) attribute as AppleIntelPanelA itself.
+ uintptr_t pwm[3] {};
+ const bool internal=display && display->metaCast("AppleBacklightDisplay");
+ const bool range=owned && internal && framebuffer &&
+  framebuffer->getAttributeForConnection(0,'bklt',pwm)==kIOReturnSuccess;
+ OSDictionary *heldProfiles=nullptr;
+ if(range && uid && product && pwm[1]<=UINT32_MAX && pwm[2]<=UINT32_MAX &&
+    XeBacklightProfile::eligible(uid->isEqualTo("19") ? 19 : 0,pwm[1],pwm[2],internal)) {
+  auto original=OSDynamicCast(OSDictionary,panel->getProperty("ApplePanels"));
+  if(original && !panel->getProperty("ApplePanel")) {
+   char key[32];snprintf(key,sizeof(key),"F19T%04x",product->unsigned32BitValue());
+   if(!original->getObject(key) && !original->getObject("F19")) {
+    auto copy=OSDictionary::withDictionary(original);
+    auto curve=OSData::withBytes(XeBacklightProfile::curve,sizeof(XeBacklightProfile::curve));
+    if(copy && curve && copy->setObject(key,curve) && panel->setProperty("ApplePanels",copy)) {
+     // Native removes ApplePanels before retaining its selected OSData in
+     // ApplePanel. Keep the candidate dictionary alive across that handoff.
+     heldProfiles=copy;
+     panel->setProperty("WhateverXeRPLPBacklightProfile",key);
+    }
+    if(curve)curve->release();
+    if(copy && !heldProfiles)copy->release();
+   }
+  }
+ }
+ uint32_t inputs[]={1,owned,uid && uid->isEqualTo("19"),range ? static_cast<uint32_t>(pwm[1]) : ~0U,
+  range ? static_cast<uint32_t>(pwm[2]) : 0,0};
+ const bool result=backlightOriginal ? FunctionCast(backlightSetDisplay,backlightOriginal)(panel,display) : false;
+ if(heldProfiles)heldProfiles->release();
+ if(panel) {
+  inputs[5]=result;
+  panel->setProperty("WhateverXeRPLPBacklightMatch",inputs,sizeof(inputs));
+ }
+ return result;
+}
+void backlightKext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(i!=backlightInfo.loadIndex || !wexRplReferenceValidate() || !wexRplReferencePanel() || !checkKernelArgument("-wex-rplp-backlight"))return;
+ const char *name="__ZN15AppleIntelPanel10setDisplayEP9IODisplay";
+ bool ok=RaptorLakeP::ReferenceBacklight::image(reinterpret_cast<void *>(a),n);
+ auto entry=ok ? p.solveSymbol(i,name,a,n) : 0;p.clearError();
+ const uint8_t prefix[]{0x55,0x48,0x89,0xE5};
+ ok=ok && entry>=a && n>=sizeof(prefix) && entry-a<=n-sizeof(prefix) && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
+ if(ok){KernelPatcher::RouteRequest route{name,backlightSetDisplay,backlightOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ if(target)target->setProperty("WhateverXeRPLPBacklightProfileReady",ok);
 }
 void kext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
  if(!state[1])return;
@@ -405,6 +478,7 @@ void init(){
  if(wexRplReferencePanel())framebufferWork=thread_call_allocate(framebufferWorker,nullptr);
  work=thread_call_allocate(worker,nullptr);if(!work || !monitor || (wexRplReferencePanel() && (!framebufferWork || !captureWork))){state[7]=4;return;}
  lilu.onPatcherLoadForce(kernel,nullptr);
+ if(wexRplReferencePanel() && checkKernelArgument("-wex-rplp-backlight"))lilu.onKextLoadForce(&backlightInfo,1,backlightKext,nullptr);
  backend.init();
  XeDataAccess::init();if(!wexRplReferencePanel())lilu.onKextLoadForce(&fbInfo,1,kext,nullptr);
  if(wexRplReferencePanel())lilu.onKextLoadForce(&compatInfo,1,kext,nullptr);
