@@ -416,8 +416,11 @@ bool wexRplReferenceValidate(){
  DeviceInfo::deleter(info);publish();return state[1] && !state[7];
 }
 bool wexRplReferenceArmed(){return state[1] && state[4] && !state[7];}
+bool wexRplReferenceTCSSSelected(){
+ return wexRplReferencePanel() && state[1] && !state[7] && checkKernelArgument("-wex-rplp-tcss");
+}
 bool wexRplReferenceTCSSRequested(){
- return wexRplReferencePanel() && state[1] && state[4] && !state[7] && checkKernelArgument("-wex-rplp-tcss");
+ return wexRplReferenceTCSSSelected() && state[4];
 }
 bool wexRplReferenceImage(const void *p,unsigned long n,bool gpu){
  if(!state[1] || !p || n<32)return false;

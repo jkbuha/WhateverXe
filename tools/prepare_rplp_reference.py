@@ -18,7 +18,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  apply_recovery(out)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
  gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
- gate+='extern bool wexRplReferenceTCSSRequested();\n'
+ gate+='extern bool wexRplReferenceTCSSSelected();\nextern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
  gate+='extern bool wexRplReferenceAdoptFramebuffer(void *);\nextern void wexRplReferenceFramebufferStarted(void *,bool);\nextern mach_vm_address_t wexRplDisplayPipeInitOriginal;\nextern bool wexRplReferenceDisplayPipeInit(void *,void *,void *,void *,unsigned);\n'
@@ -71,6 +71,19 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
       '\t\t\tpinfo[1].fInfoPortCount=7;\n'
       '\t\t\tpinfo[1].connectors[3]={3,9,1,1,ConnectorDP,0x201};\n'
       '\t\t}\n')
+ # The native HAL already merges south HPD and north TC/TBT HPD correctly.
+ # The imported f19 experiment redirects its north read to TGL modular FIA,
+ # hiding ADL-P TC hotplug. Preserve the exact original bytes for this trial,
+ # while still checking the unique donor pattern. Keep f13's independent
+ # early power-well probe bypass unchanged.
+ p=out/'kern_gen11.cpp';text=p.read_text()
+ needle='{activeKext, f19, r19, arrsize(f19),\t1},'
+ lines=text.splitlines(keepends=True);matches=0
+ for i,line in enumerate(lines):
+  if line.lstrip().startswith(needle):
+   lines[i]=line.replace(needle,'{activeKext, f19, wexRplReferenceTCSSSelected()?f19:r19, arrsize(f19),\t1},');matches+=1
+ assert matches==2
+ p.write_text(''.join(lines))
  # Keep PCI hardware identity throughout module preparation; on root arm the
  # presentation becomes 9A49. The known exact donor is guarded before this edit.
  edit('kern_gen11.cpp','\t\tNGreen::callback->setRMMIOIfNecessary();\n\t\tSYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");',

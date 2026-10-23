@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='rplp-reference-tcss-table-') as d:
  body=s[s.index('uint64_t Gen11::getOSInformation('):s.index('int Gen11::handleLinkIntegrityCheck()')]
  types=h[h.index('struct PACKED VoltageConfig'):h.index('// ─── DMC')]
  reference=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text()
- gate=reference[reference.index('bool wexRplReferenceTCSSRequested(){'):reference.index('bool wexRplReferenceTCSSRequested(){')+reference[reference.index('bool wexRplReferenceTCSSRequested(){'):].index('\n}')+2]
+ gate=reference[reference.index('bool wexRplReferenceTCSSSelected(){'):reference.index('bool wexRplReferenceTCSSRequested(){')+reference[reference.index('bool wexRplReferenceTCSSRequested(){'):].index('\n}')+2]
  fixture=r"""
 #include <cassert>
 #include <cstdint>
@@ -70,6 +70,7 @@ int main(){
  assert(!memcmp(&table[1],&baseline,sizeof(baseline)));
  backend.gPlatformInformationList=0;assert(Gen11::getOSInformation(nullptr)==0x12345678ABCDEFULL&&calls==3);
  for(unsigned b=0;b<32;++b){panel=b&1;state[1]=bool(b&2);state[4]=bool(b&4);state[7]=bool(b&8);tcss=b&16;
+  assert(wexRplReferenceTCSSSelected()==(panel&&state[1]&&!state[7]&&tcss));
   assert(wexRplReferenceTCSSRequested()==(panel&&state[1]&&state[4]&&!state[7]&&tcss));}
 }
 """.replace('TYPES',types).replace('GATE',gate).replace('BODY',body)
@@ -82,3 +83,11 @@ raw=(frame/'Contents/MacOS/AppleIntelTGLGraphicsFramebuffer').read_bytes()
 for offset,pattern in [(0x254B9,'89df48c1e703'),(0x254F0,'bf00070000'),(0x8E329,'4883f808'),(0x8F466,'83c0fd83f805')]:
  assert raw[offset:offset+len(pattern)//2]==bytes.fromhex(pattern),(hex(offset),pattern)
 print('PASS exact private HAL: dynamic port allocation, 0x700 class, index<=8 switch and TC index minus three; actual owner/flag gate combinations')
+
+assert native.count('{activeKext, f19, wexRplReferenceTCSSSelected()?f19:r19, arrsize(f19),\t1},')==2
+assert '{activeKext, f13, r13, arrsize(f13),\t1},' in native
+assert raw[0x918FB:0x91900]==bytes.fromhex('be70440400')
+assert raw[0x91A18:0x91A31]==bytes.fromhex('4489f0c1e81a4489f9c1e90209c14489fbc1eb1209cb83e301')
+nativeTC3=lambda south,north:((south>>26)|(north>>2)|(north>>18))&1
+assert not nativeTC3(0x10000,0x10) and nativeTC3(0x10000,0x40000)==1
+print('PASS native TC3 HPD: original north register sees connected sink; inherited FIA rewrite hides it; power-well bypass retained')
