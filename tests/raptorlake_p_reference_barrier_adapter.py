@@ -50,19 +50,29 @@ int main(){for(mode=0;mode<21;++mode){
  assert(originalCalls==1&&records==1&&!lastReason&&result==(mode==17?0:1)&&lastValue==result);
 }}
 '''.replace('BODY',body)
-s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();start=s.index('bool wexRplReferenceBarrierOwner(');end=s.index('bool wexRplReferenceQueue(',start)
+s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();start=s.index('bool wexRplReferenceRecoveryRequested(');end=s.index('bool wexRplReferenceQueue(',start)
 owner=r'''#include <cassert>
 #include <cstdint>
 #include <cstring>
 struct Owner{bool dead;bool isInactive(){return dead;}} obj,other;Owner*nativeOwner=&obj;
-uint32_t state[9]{1},barrierState[8]{1};bool argument,panel;bool shuttingDown;int query(){return shuttingDown;} int(*shutdownQuery)()=query;
-bool checkKernelArgument(const char*s){assert(!strcmp(s,"-wex-rplp-native-barriers"));return argument;}
+uint32_t state[9]{1},barrierState[8]{1};bool argument,panel,balanceArgument,recoveryArgument;bool shuttingDown;int query(){return shuttingDown;} int(*shutdownQuery)()=query;
+bool checkKernelArgument(const char*s){if(!strcmp(s,"-wex-rplp-native-barriers"))return argument;if(!strcmp(s,"-wex-rplp-forcewake-balance"))return balanceArgument;assert(!strcmp(s,"-wex-rplp-gpu-recovery"));return recoveryArgument;}
 bool wexRplReferencePanel(){return panel;}
 BODY
 int main(){for(unsigned bits=0;bits<256;++bits){
  argument=bits&1;panel=bits&2;state[1]=bits&4;state[4]=bits&8;state[6]=bits&16;state[7]=bits&32;obj.dead=bits&64;shuttingDown=bits&128;
  assert(wexRplReferenceBarrierOwner(&obj)==(bits==31));assert(!wexRplReferenceBarrierOwner(&other));
  }shutdownQuery=nullptr;assert(!wexRplReferenceBarrierOwner(&obj));shutdownQuery=query;shuttingDown=false;nativeOwner=nullptr;state[7]=0;obj.dead=false;assert(!wexRplReferenceBarrierOwner(&obj));
+ for(unsigned b=0;b<1024;++b){panel=b&1;state[1]=b&2;state[4]=b&4;state[6]=b&8;state[7]=b&16;shuttingDown=b&32;obj.dead=b&64;balanceArgument=b&128;recoveryArgument=b&256;nativeOwner=(b&512)?&obj:nullptr;
+ bool balance=panel&&state[1]&&!state[7]&&balanceArgument;
+ assert(wexRplReferenceForceWakeRequested()==balance);
+ assert(wexRplReferenceRecoveryRequested()==bool(panel&&state[1]&&!state[7]&&recoveryArgument));
+ assert(wexRplReferenceForceWakeOwner(&obj)==bool(balance&&state[4]&&nativeOwner&&!shuttingDown));
+ assert(wexRplReferenceRuntimeOwner(&obj)==bool(panel&&state[1]&&state[4]&&state[6]&&!state[7]&&nativeOwner&&!shuttingDown&&!obj.dead));
+ assert(!wexRplReferenceRuntimeOwner(&other)&&!wexRplReferenceForceWakeOwner(&other));
+ }
+ panel=balanceArgument=true;nativeOwner=&obj;obj.dead=false;state[1]=state[4]=state[6]=1;state[7]=0;shuttingDown=false;shutdownQuery=nullptr;
+ assert(!wexRplReferenceRuntimeOwner(&obj)&&!wexRplReferenceForceWakeOwner(&obj));
  wexRplReferenceBarrierResult(0,1);wexRplReferenceBarrierResult(6,0);wexRplReferenceBarrierResult(0,0);
  assert(barrierState[1]==3&&barrierState[2]==2&&barrierState[3]==1&&barrierState[6]==1&&barrierState[7]==6);
 }
@@ -72,4 +82,4 @@ with tempfile.TemporaryDirectory(prefix='rplp-barrier-') as d:
   p=Path(d);(p/(name+'.cpp')).write_text(code)
   subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined',str(p/(name+'.cpp')),'-o',str(p/name)],check=True)
   subprocess.run([str(p/name)],check=True)
-print('PASS production barrier preflight21 cases, owner gate256 cases, telemetry and original return propagation')
+print('PASS production barrier preflight21 cases, owner gate256 cases + recovery/forcewake gates1024 cases, telemetry and original return propagation')

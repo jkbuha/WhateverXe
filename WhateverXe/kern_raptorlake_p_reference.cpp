@@ -305,6 +305,7 @@ bool backlightSetDisplay(IOService *panel,IOService *display) {
  if(panel) {
   inputs[5]=result;
   panel->setProperty("WhateverXeRPLPBacklightMatch",inputs,sizeof(inputs));
+  if(target)target->setProperty("WhateverXeRPLPBacklightMatch",inputs,sizeof(inputs));
  }
  return result;
 }
@@ -432,6 +433,15 @@ void wexRplReferenceContextFree(void *object){
  if(contextLock){ContextIO io;if(contextCache.forget(io,object))__sync_fetch_and_add(&contextState[4],1);}
  __sync_fetch_and_add(&contextState[7],1);
  reinterpret_cast<void (*)(void *)>(wexRplReferenceContextFreeOriginal)(object);
+}
+bool wexRplReferenceRecoveryRequested(){return wexRplReferencePanel() && state[1] && !state[7] && checkKernelArgument("-wex-rplp-gpu-recovery");}
+bool wexRplReferenceForceWakeRequested(){return wexRplReferencePanel() && state[1] && !state[7] && checkKernelArgument("-wex-rplp-forcewake-balance");}
+bool wexRplReferenceForceWakeOwner(const void *owner){
+ return wexRplReferenceForceWakeRequested() && state[4] && owner && owner==nativeOwner && shutdownQuery && !shutdownQuery();
+}
+bool wexRplReferenceRuntimeOwner(const void *owner){
+ return wexRplReferencePanel() && state[1] && state[4] && state[6] && !state[7] && owner && owner==nativeOwner &&
+  shutdownQuery && !shutdownQuery() && !nativeOwner->isInactive();
 }
 bool wexRplReferenceBarrierOwner(const void *owner){
  return checkKernelArgument("-wex-rplp-native-barriers") && wexRplReferencePanel() && state[1] && state[4] &&

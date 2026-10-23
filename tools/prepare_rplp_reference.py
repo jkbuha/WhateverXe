@@ -14,7 +14,10 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  for p in src.iterdir():
   if p.is_file():shutil.copy2(p,out/p.name)
  for p in [source/'LICENSE',source/'NOTICE.md',source/'src/LICENSE-NootedGreen']:shutil.copy2(p,out/p.name)
+ from prepare_rplp_recovery import apply as apply_recovery
+ apply_recovery(out)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
+ gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
  gate+='extern bool wexRplReferenceAdoptFramebuffer(void *);\nextern void wexRplReferenceFramebufferStarted(void *,bool);\nextern mach_vm_address_t wexRplDisplayPipeInitOriginal;\nextern bool wexRplReferenceDisplayPipeInit(void *,void *,void *,void *,unsigned);\n'
@@ -173,6 +176,6 @@ void wexRplReferenceRuntime(unsigned *out,unsigned count){
  xml=plistlib.dumps(gp).decode();xml=xml[xml.index('<dict>'):xml.rindex('</dict>')+7]
  header+='constexpr char acceleratorPersonalityXML[]=R"WEX('+xml+')WEX";\n'
  (out/'wex_reference_framebuffer.hpp').write_text(header)
- result={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.iterdir()) if p.is_file()}
- (out/'SOURCE-MANIFEST.json').write_text(json.dumps(dict(upstream=PIN,files=result),indent=2)+'\n')
+ result={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.iterdir()) if p.is_file() and p.name!='SOURCE-MANIFEST.json'}
+ (out/'SOURCE-MANIFEST.json').write_text(json.dumps(dict(upstream=PIN,recovery_commit='813d2e6adca277dd349ebe9674233953cce66342',recovery_patch_sha256=hashlib.sha256((Path(__file__).resolve().parents[1]/'Reference/JulioNectar/813d2e6.patch').read_bytes()).hexdigest(),hardening_sha256=hashlib.sha256((Path(__file__).parent/'prepare_rplp_recovery.py').read_bytes()).hexdigest(),files=result),indent=2)+'\n')
  return [out/(n+'.cpp') for n in names]

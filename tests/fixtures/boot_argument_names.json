@@ -165,5 +165,7 @@
   "-wex-rplp-reference-backend": [],
   "-wex-rplp-fb": [],
   "-wex-rplp-native-barriers": [],
-  "-wex-rplp-backlight": []
+  "-wex-rplp-backlight": [],
+  "-wex-rplp-gpu-recovery": [],
+  "-wex-rplp-forcewake-balance": []
 }
