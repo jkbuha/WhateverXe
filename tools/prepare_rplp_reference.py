@@ -130,6 +130,9 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
       'struct WEXRCSLease { void *object; ~WEXRCSLease(){wexRplReferenceReleaseRCSContext(object);} };\n\tWEXRCSLease lease{wexRplReferenceAcquireRCSContext()};\n\tvoid *ctx = lease.object;')
  edit('kern_gen11.cpp','{"__ZN17IGHardwareContext11withOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh",',
       '{"__ZN17IGHardwareContext4freeEv", wexRplReferenceContextFree, wexRplReferenceContextFreeOriginal},\n\t\t\t {"__ZN17IGHardwareContext11withOptionsEP11IGAccelTaskRK23IGHardwareContextParamsh",')
+ # Context switching is routine; never flood release logs or imply a reset.
+ edit('kern_gen11.cpp','SYSLOG("ngreen", "V194: getBlit3DContext ctx changed %p -> %p (restart recovery), updating cache",',
+      'DBGLOG("ngreen", "getBlit3DContext: updating cached context %p -> %p",')
  # V509 must never invent a ring start on our machine. Invalid mapping refuses repair.
  edit('kern_gen11.cpp','if (!rcsStart) rcsStart = 0x402eb000;         // fallback from HANGCHECK','if (!rcsStart) { cb->writeReg32(GGTT_PTE_LO(0), saveLo); cb->writeReg32(GGTT_PTE_HI(0), saveHi); cb->writeReg32(0x101008, 1); return ret; }')
  # Bounded passive snapshots: no console logging or MMIO writes in interrupt paths.
