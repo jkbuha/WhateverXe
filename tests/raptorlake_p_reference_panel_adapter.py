@@ -1,7 +1,7 @@
 """Execute catalogue admission, native adoption and bounded handover waits."""
 from pathlib import Path
 import subprocess,tempfile
-r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('bool nativeHeadReady('):s.index('void worker(')];adopt=s[s.index('bool wexRplReferenceAdoptFramebuffer('):s.index('bool wexRplReferenceDisplayPipeInit(')]
+r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('bool nativeHeadReady('):s.index('bool waitForNativeTimings(')];adopt=s[s.index('bool wexRplReferenceAdoptFramebuffer('):s.index('bool wexRplReferenceDisplayPipeInit(')]
 fixture=r'''#include <cassert>
 #include <cstdint>
 #include <cstdlib>

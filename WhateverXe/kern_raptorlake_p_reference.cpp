@@ -91,6 +91,7 @@ mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
 mach_vm_address_t scanoutMemoryOriginal;
 uint32_t scanoutGate[7]{1}; // schema, hook, calls, forwarded, null refusals, last flags, install error
+uint32_t displayPipeReadyMask,bootProbe[8]{1}; // schema, timing checks, ready, requested, result, pipe mask, failure, reserved
 
 uint32_t guardedScanoutMemory(void *pipe,void *mode,uint32_t flags){
  using Allocate=uint32_t (*)(void *,void *,uint32_t);
@@ -251,7 +252,7 @@ uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t byt
 
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
-void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceScanoutGate",scanoutGate,sizeof(scanoutGate));target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
+void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceBootProbe",bootProbe,sizeof(bootProbe));target->setProperty("WhateverXeRPLPReferenceScanoutGate",scanoutGate,sizeof(scanoutGate));target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
 void moduleWorker(thread_call_param_t,thread_call_param_t){
  if(!wexRplReferencePanel() || !moduleLoader || !target || !state[1] || state[4] || state[7] || !moduleState[1])return;
  const char *ids[]{"org.b00t0x.AppleIntelTGLCompat","com.apple.driver.AppleIntelTGLGraphicsFramebuffer","com.apple.driver.AppleIntelTGLGraphics"};
@@ -391,6 +392,22 @@ void framebufferWorker(thread_call_param_t,thread_call_param_t){
  }
  target->registerService(kIOServiceAsynchronous);publish();
 }
+bool waitForNativeTimings(){
+ for(unsigned elapsed=0;elapsed<=2000;elapsed+=25){
+  ++bootProbe[1];
+  IOService *head=nullptr;
+  if(framebufferOwner && panelState[3]==0x1C48)
+   memcpy(&head,reinterpret_cast<uint8_t *>(framebufferOwner)+0xD60,8);
+  if(head && head->getProvider()==target && head->getMetaClass()->getClassSize()==0x4B98){
+   uint32_t mode;uintptr_t timings;
+   memcpy(&mode,reinterpret_cast<uint8_t *>(head)+0x4250,4);
+   memcpy(&timings,reinterpret_cast<uint8_t *>(head)+0x4260,8);
+   if(timings && mode>=0x10000 && mode<0xFFFF0000){bootProbe[2]=1;return true;}
+  }
+  if(elapsed<2000)IOSleep(25);
+ }
+ return false;
+}
 void worker(thread_call_param_t,thread_call_param_t){
  if(!state[4] || !target || !accelerator || state[7] || nativeOwner)return;
  startup[1]=1;publish();
@@ -435,6 +452,16 @@ void worker(thread_call_param_t,thread_call_param_t){
  startup[11]=1;startup[1]=5;publish();
  startup[12]=nativeOwner->start(target);startup[1]=6;publish();
  if(!startup[12]){startup[15]=7;publish();return;}
+ if(wexRplReferencePanel()){
+  // A framebuffer may probe us before start() has created the collector.
+  // Retry only after native start and real mode timing are ready, before
+  // publishing the accelerator to WindowServer. No fixed activation delay.
+  if(!waitForNativeTimings()){bootProbe[6]=1;startup[15]=11;publish();return;}
+  bootProbe[3]=1;
+  bootProbe[4]=static_cast<uint32_t>(nativeOwner->requestProbe(kIOFBUserRequestProbe));
+  bootProbe[5]=displayPipeReadyMask;
+  if(bootProbe[4] || !(displayPipeReadyMask&1)){bootProbe[6]=2;startup[15]=12;publish();return;}
+ }
  nativeOwner->registerService(kIOServiceAsynchronous);startup[13]=1;startup[1]=7;state[6]=1;publish();
  if(monitor)thread_call_enter(monitor);
 }
@@ -576,7 +603,9 @@ bool wexRplReferenceDisplayPipeInit(void *pipe,void *gpu,void *machine,void *fra
  // its unimplemented 'vald' call otherwise waits forever in the PCI provider.
  if(!displayPipe[6] || !wexRplDisplayPipeInitOriginal){displayPipe[7]=1;publish();return false;}
  auto ok=reinterpret_cast<Init>(wexRplDisplayPipeInitOriginal)(pipe,gpu,machine,frame,index);
- displayPipe[5]=ok;if(!ok)displayPipe[7]=2;publish();return ok;
+ displayPipe[5]=ok;if(!ok)displayPipe[7]=2;
+ if(ok && index<3)__sync_fetch_and_or(&displayPipeReadyMask,1U<<index);
+ publish();return ok;
 }
 void wexRplReferenceFBFailure(unsigned code){__sync_bool_compare_and_swap(&panelState[15],0,code);}
 uint32_t wexRplReferenceFBRead(unsigned long reg){return backend.readReg32(reg);}

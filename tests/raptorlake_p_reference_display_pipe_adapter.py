@@ -10,7 +10,7 @@ struct IOService;
 struct Meta{unsigned size=0x4B98;const char *name="AppleIntelFramebufferDiags";unsigned getClassSize(){return size;}const char *getClassName(){return name;}};
 struct IOService{uint8_t bytes[0x5000]{};Meta meta;IOService *provider=nullptr;Meta *getMetaClass(){return &meta;}IOService *getProvider(){return provider;}uint64_t getRegistryEntryID(){return 123;}} targetObject,controller,head,accel,firmware;
 IOService *target=&targetObject,*framebufferOwner=&controller,*nativeOwner=&accel;
-uint64_t panelState[16]{1},displayPipe[8]{1};bool panel=true,armed=true,result=true;unsigned calls,indexExpected;
+uint64_t panelState[16]{1},displayPipe[8]{1};uint32_t displayPipeReadyMask;bool panel=true,armed=true,result=true;unsigned calls,indexExpected;
 bool wexRplReferencePanel(){return panel;}bool wexRplReferenceArmed(){return armed;}void publish(){}
 bool original(void *p,void *g,void *m,void *f,uint32_t i){assert(p==(void *)1&&g==nativeOwner&&m==(void *)2&&f==&head&&i==indexExpected);++calls;return result;}
 mach_vm_address_t wexRplDisplayPipeInitOriginal=reinterpret_cast<uintptr_t>(original);
@@ -27,7 +27,7 @@ int main(){panelState[3]=0x1C48;head.provider=target;setHead(0);
  assert(!wexRplReferenceDisplayPipeInit((void *)1,nativeOwner,(void *)2,&head,3)&&calls==1);
  setHead(2);indexExpected=2;assert(wexRplReferenceDisplayPipeInit((void *)1,nativeOwner,(void *)2,&head,2)&&calls==2);
  result=false;assert(!wexRplReferenceDisplayPipeInit((void *)1,nativeOwner,(void *)2,&head,2)&&calls==3&&displayPipe[7]==2);
- result=true;panel=false;assert(wexRplReferenceDisplayPipeInit((void *)1,nativeOwner,(void *)2,&head,2)&&calls==4);
+ assert(displayPipeReadyMask==5);result=true;panel=false;assert(wexRplReferenceDisplayPipeInit((void *)1,nativeOwner,(void *)2,&head,2)&&calls==4);
 }'''.replace('BODY',body)
 with tempfile.TemporaryDirectory(prefix='rplp-reference-pipe-') as d:
  p=Path(d);(p/'test.cpp').write_text(fixture);subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined',str(p/'test.cpp'),'-o',str(p/'test')],check=True);subprocess.run([str(p/'test')],check=True)
