@@ -18,6 +18,14 @@ int main(){
  for(unsigned d=2;d<=5;++d){auto bit=6+8*(d-2);assert(portMode(d,0)==0);assert(portMode(d,1U<<bit)==2);assert(portMode(d,1U<<(bit-1))==3);assert(portMode(d,(1U<<bit)|(1U<<(bit-1)))==2);assert(portMode(d,UINT32_MAX)==0);}
  for(unsigned d:{6u,8u,9u,UINT32_MAX})assert(portMode(d,0x7FFFFFFF)==0);
 
+ for(unsigned d=0;d<10;++d)for(unsigned status=0;status<256;++status){
+  auto reg=adlpTCSSRegister(d);assert(reg==(d>=3&&d<=6?0x161500+4*(d-3):0));
+  assert(adlpPortMode(d,status)==(d<2?1:reg&&(status&4)&&(status&3)==1?3:0));
+ }
+ for(unsigned d=2;d<10;++d)assert(!adlpPortMode(d,UINT32_MAX));
+ assert(adlpPortMode(5,0x35)==3&&adlpTCSSRegister(5)==0x161508);
+ assert(!adlpPortMode(5,6)&&!adlpPortMode(5,7)); // unqualified TBT / ambiguous status
+
  for(unsigned width:{4u,8u}){
   assert(range(0,width,0x1000000));assert(range(0x1000000-width,width,0x1000000));
   assert(!range(0x1000000-width+1,width,0x1000000));assert(!range(UINT64_MAX,width,0x1000000));

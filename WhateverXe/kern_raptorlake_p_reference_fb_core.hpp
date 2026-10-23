@@ -28,6 +28,15 @@ inline uint32_t portMode(uint32_t ddi,uint32_t fia){
  auto bit=6+8*(ddi-2);
  return (fia&(1U<<bit))?2:(fia&(1U<<(bit-1)))?3:0;
 }
+// The exact native HAL numbers Combo A/B/C as 0..2 and TC1 as 3.
+// Display 13 ADL-P has four TC ports. Its live/ready state is in TCSS,
+// not the TGL modular-FIA register. Do not admit unqualified TBT transport.
+inline uint32_t adlpTCSSRegister(uint32_t ddi){return ddi>=3 && ddi<=6?0x161500+4*(ddi-3):0;}
+inline uint32_t adlpPortMode(uint32_t ddi,uint32_t status){
+ if(ddi<2)return 1;
+ if(!adlpTCSSRegister(ddi) || status==UINT32_MAX || !(status&4))return 0;
+ return (status&3)==1?3:0;
+}
 inline bool range(uint64_t offset,unsigned width,uint64_t bytes){return (width==4 || width==8) && !(offset&(width-1)) && bytes>=width && offset<=bytes-width;}
 inline bool window(uint64_t base,uint64_t offset,unsigned width,uint64_t mmio){return mmio && !(base&7) && base>=mmio && base-mmio<0x1000000 && range(offset,width,0x1000000-(base-mmio));}
 inline bool dsb(uint64_t offset,uint64_t bytes,unsigned page){return page==4096 && bytes==0x12000 && !(offset&4095) && offset>=0x1000000 && offset<=0x100000000ULL-bytes;}

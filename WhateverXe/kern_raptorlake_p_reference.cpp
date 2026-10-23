@@ -60,6 +60,7 @@ uint32_t moduleState[8]{1}; // schema, requested, stage, Compat, FB, GPU, comple
 IOService *framebufferOwner,*firmwareOwner;
 uint64_t handover[8]{1},displayPipe[8]{1},firmwareScan[8]{1};
 uint64_t panelState[16]{1};
+uint32_t portModes[37]{1}; // schema, then calls / register / status / mode per DDI
 unsigned monitorSamples;
 
 IOService *nativeOwner;
@@ -89,7 +90,13 @@ uint32_t compatPortMode(void *port){
  uint32_t ddi;memcpy(&ddi,reinterpret_cast<void *>(config),4);
  if(ddi!=(config-platform-0x20)/24){++panelState[14];return 0;}
  panelState[12]=ddi;
- return panelState[13]=RaptorLakeP::ReferenceFB::portMode(ddi,ddi<2?0:backend.readReg32(0x1638A0));
+ const bool tcss=wexRplReferenceTCSSRequested();
+ auto reg=tcss?RaptorLakeP::ReferenceFB::adlpTCSSRegister(ddi):(ddi<2?0:0x1638A0);
+ auto status=reg?backend.readReg32(reg):0;
+ auto mode=tcss?RaptorLakeP::ReferenceFB::adlpPortMode(ddi,status):RaptorLakeP::ReferenceFB::portMode(ddi,status);
+ auto index=1+4*ddi;
+ __sync_fetch_and_add(&portModes[index],1);portModes[index+1]=reg;portModes[index+2]=status;portModes[index+3]=mode;
+ return panelState[13]=mode;
 }
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
@@ -138,6 +145,7 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   target->setProperty("WhateverXeRPLPReferenceConnectors",&connectors,sizeof(connectors));
   auto tc=RaptorLakeP::ReferenceConnectors::typeC(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && sample.activePipes);
   target->setProperty("WhateverXeRPLPReferenceTypeC",&tc,sizeof(tc));
+  target->setProperty("WhateverXeRPLPReferencePortModes",portModes,sizeof(portModes));
   if(checkKernelArgument("-wex-rplp-backlight")){
    auto pwm=RaptorLakeP::ReferenceBacklight::capture(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1));
    target->setProperty("WhateverXeRPLPBacklightPWM",&pwm,sizeof(pwm));
@@ -408,6 +416,9 @@ bool wexRplReferenceValidate(){
  DeviceInfo::deleter(info);publish();return state[1] && !state[7];
 }
 bool wexRplReferenceArmed(){return state[1] && state[4] && !state[7];}
+bool wexRplReferenceTCSSRequested(){
+ return wexRplReferencePanel() && state[1] && state[4] && !state[7] && checkKernelArgument("-wex-rplp-tcss");
+}
 bool wexRplReferenceImage(const void *p,unsigned long n,bool gpu){
  if(!state[1] || !p || n<32)return false;
  if(gpu && !RaptorLakeP::Native::exactImage(p,n)){state[7]=3;ready();return false;}

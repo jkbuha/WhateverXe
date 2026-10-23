@@ -18,6 +18,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  apply_recovery(out)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
  gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
+ gate+='extern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
  gate+='extern bool wexRplReferenceAdoptFramebuffer(void *);\nextern void wexRplReferenceFramebufferStarted(void *,bool);\nextern mach_vm_address_t wexRplDisplayPipeInitOriginal;\nextern bool wexRplReferenceDisplayPipeInit(void *,void *,void *,void *,unsigned);\n'
@@ -61,6 +62,15 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
   edit('kern_gen11.cpp','\t\tlilu.onKextLoadForce(&kextG11FBTA);',
        '\t\t// Private debug donor only; never route the production framebuffer ABI.')
  p=out/'kern_gen11.cpp';p.write_text(p.read_text().replace('checkKernelArgument("-ngreentglwithgfx")','wexRplReferencePanel()'))
+ # Preserve the qualified panel/pipe/head counts. Only expose the physical
+ # ADL-P port domain under the explicit exact-owner TCSS trial gate. The
+ # imported three-port experiment otherwise hides every connected TC port.
+ edit('kern_gen11.cpp','\t\tpinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };',
+      '\t\tpinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };\n'
+      '\t\tif(wexRplReferenceTCSSRequested()) {\n'
+      '\t\t\tpinfo[1].fInfoPortCount=7;\n'
+      '\t\t\tpinfo[1].connectors[3]={3,9,1,1,ConnectorDP,0x201};\n'
+      '\t\t}\n')
  # Keep PCI hardware identity throughout module preparation; on root arm the
  # presentation becomes 9A49. The known exact donor is guarded before this edit.
  edit('kern_gen11.cpp','\t\tNGreen::callback->setRMMIOIfNecessary();\n\t\tSYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");',
