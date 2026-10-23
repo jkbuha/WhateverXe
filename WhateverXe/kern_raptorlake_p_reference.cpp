@@ -89,6 +89,22 @@ const char *backlightPaths[]{"/System/Library/Extensions/AppleBacklight.kext/Con
 KernelPatcher::KextInfo backlightInfo{"com.apple.driver.AppleBacklight",backlightPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
+mach_vm_address_t scanoutMemoryOriginal;
+uint32_t scanoutGate[7]{1}; // schema, hook, calls, forwarded, null refusals, last flags, install error
+
+uint32_t guardedScanoutMemory(void *pipe,void *mode,uint32_t flags){
+ using Allocate=uint32_t (*)(void *,void *,uint32_t);
+ const bool selected=wexRplReferencePanel() && target && state[1];
+ if(selected){
+  __sync_fetch_and_add(&scanoutGate[2],1);scanoutGate[5]=flags;
+  // BA3AA1C0: the machine can call this with getDisplayPipe()==nullptr.
+  // Refuse before forming output pointers at null+0x1298/null+0x12A0.
+  // The native machine caller handles IOReturn and releases its busy lock.
+  if(!pipe){__sync_fetch_and_add(&scanoutGate[4],1);return static_cast<uint32_t>(kIOReturnNotReady);}
+  __sync_fetch_and_add(&scanoutGate[3],1);
+ }
+ return scanoutMemoryOriginal?reinterpret_cast<Allocate>(scanoutMemoryOriginal)(pipe,mode,flags):static_cast<uint32_t>(kIOReturnNotReady);
+}
 
 uint32_t guardedAcceleratorProbe(IOService *owner,uint32_t options){
  using Probe=uint32_t (*)(IOService *,uint32_t);
@@ -235,7 +251,7 @@ uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t byt
 
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
-void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
+void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceScanoutGate",scanoutGate,sizeof(scanoutGate));target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
 void moduleWorker(thread_call_param_t,thread_call_param_t){
  if(!wexRplReferencePanel() || !moduleLoader || !target || !state[1] || state[4] || state[7] || !moduleState[1])return;
  const char *ids[]{"org.b00t0x.AppleIntelTGLCompat","com.apple.driver.AppleIntelTGLGraphicsFramebuffer","com.apple.driver.AppleIntelTGLGraphics"};
@@ -577,6 +593,13 @@ bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &p,size_t i,mach_vm_addr
  if(ok){KernelPatcher::RouteRequest route{name,guardedAcceleratorProbe,acceleratorProbeOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
  acceleratorProbe[1]=ok;acceleratorProbe[6]=ok?0:1;
  if(target)target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));
+ const char *allocate="__ZN18IGAccelDisplayPipe21allocateScanoutMemoryEP19IntelScaledModeDataj";
+ auto allocationEntry=ok?p.solveSymbol(i,allocate,a,n):0;p.clearError();
+ const uint8_t allocationPrefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18};
+ ok=ok && n>=0x7E5B2+sizeof(allocationPrefix) && allocationEntry==a+0x7E5B2 && !memcmp(reinterpret_cast<void *>(allocationEntry),allocationPrefix,sizeof(allocationPrefix));
+ if(ok){KernelPatcher::RouteRequest route{allocate,guardedScanoutMemory,scanoutMemoryOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ scanoutGate[1]=ok;scanoutGate[6]=ok?0:1;
+ if(target)target->setProperty("WhateverXeRPLPReferenceScanoutGate",scanoutGate,sizeof(scanoutGate));
  return ok;
 }
 
@@ -638,12 +661,26 @@ bool wexRplReferencePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size
 bool wexRplReferenceValidate(){
  if(state[1])return !state[7];
  if(state[7] || !RaptorLakeP::Reference::enabled())return false;
- auto info=DeviceInfo::create();if(!info){state[7]=1;return false;}
+ auto info=DeviceInfo::create();if(!info){SYSLOG("rplp","reference admission failed: DeviceInfo unavailable");state[7]=1;return false;}
  auto pci=OSDynamicCast(IOPCIDevice,info->videoBuiltin);
- bool valid=pci && WIOKit::awaitPublishing(pci) && RaptorLakeP::eligible(XELP::deviceProfile(pci),XELP::kernelOS(version),true);
+ const bool published=pci && WIOKit::awaitPublishing(pci);
+ const auto profile=published?XELP::deviceProfile(pci):XELP::Profile{};
+ bool valid=published && RaptorLakeP::eligible(profile,XELP::kernelOS(version),true);
  auto aperture=valid?pci->getDeviceMemoryWithRegister(0x18):nullptr;
- auto layout=aperture?XELPMemory::decode(pci->configRead16(0x50),pci->configRead32(0xC0),pci->configRead32(0xC4),aperture->getLength()):XELPMemory::Layout{};
- valid=valid && RaptorLakeP::Reference::physical(XELP::deviceProfile(pci),XELP::kernelOS(version),layout);
+ const uint16_t ggc=aperture?pci->configRead16(0x50):UINT16_MAX;
+ const uint32_t bsmLow=aperture?pci->configRead32(0xC0):UINT32_MAX;
+ const uint32_t bsmHigh=aperture?pci->configRead32(0xC4):UINT32_MAX;
+ auto layout=aperture?XELPMemory::decode(ggc,bsmLow,bsmHigh,aperture->getLength()):XELPMemory::Layout{};
+ valid=valid && RaptorLakeP::Reference::physical(profile,XELP::kernelOS(version),layout);
+ // Admission is fail-closed. Preserve enough read-only proof to diagnose a
+ // rejected boot even when no target/control service can be published.
+ uint64_t admission[]{1,pci!=nullptr,published,profile.identity,profile.revision,
+  ggc,bsmLow,bsmHigh,layout.valid,layout.bytes,layout.gttBytes,layout.apertureBytes,valid};
+ if(auto registry=IORegistryEntry::getRegistryRoot())registry->setProperty("WhateverXeRPLPAdmission",admission,sizeof(admission));
+ if(pci)pci->setProperty("WhateverXeRPLPAdmission",admission,sizeof(admission));
+ SYSLOG("rplp","reference admission pci=%u published=%u id=%04X rev=%02X ggc=%04X bsm=%08X:%08X valid=%u stolen=%llX gtt=%llX aperture=%llX",
+  pci!=nullptr,published,profile.identity,profile.revision,ggc,bsmHigh,bsmLow,valid,
+  static_cast<unsigned long long>(layout.bytes),static_cast<unsigned long long>(layout.gttBytes),static_cast<unsigned long long>(layout.apertureBytes));
  if(valid){
   target=pci;target->retain();state[1]=1;
   // Record immutable physical proof BEFORE installing a registry/PCI presentation.
@@ -743,6 +780,7 @@ bool enabled(){
 void init(){
 #ifdef WEX_RPLP_REFERENCE_BACKEND
  if(!enabled())return;
+ SYSLOG("rplp","reference backend initialization panel=%u early=%u",wexRplReferencePanel(),earlyRequested());
  if(wexRplReferencePanel())contextLock=IOSimpleLockAlloc();
  monitor=thread_call_allocate(monitorWorker,nullptr);
  if(wexRplReferencePanel())captureWork=thread_call_allocate(captureWorker,nullptr);

@@ -15,6 +15,8 @@ struct FramebufferViewer : public IOFramebuffer {
 static const char *graphicsPath[] { "/System/Library/Extensions/IOGraphicsFamily.kext/IOGraphicsFamily" };
 static KernelPatcher::KextInfo graphics { "com.apple.iokit.IOGraphicsFamily",graphicsPath,arrsize(graphicsPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 void XeHost::init() {
+ if(checkKernelArgument("-wex-rplp-manual-arm"))
+  SYSLOG("rplp","host selection reference=%u panelArg=%u manualArg=%u",RaptorLakeP::Reference::enabled(),checkKernelArgument("-wex-rplp-fb"),checkKernelArgument("-wex-rplp-manual-arm"));
  if(RaptorLakeP::Reference::enabled()){RaptorLakeP::Reference::init();return;}
  RaptorLakeP::Native::init();
  callbackHost=this;
