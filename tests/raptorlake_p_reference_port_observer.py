@@ -24,6 +24,7 @@ uint32_t compatPortMode(void *){++modes;return 3;}
 struct Backend {uint32_t readReg32(unsigned r){assert(r==0x44470||r==0xC4000);++reads;return r==0x44470?0x40000:0x10000;}} backend;
 uint32_t original(void *){++calls;return 77;}mach_vm_address_t portStateOriginal=reinterpret_cast<uintptr_t>(original);
 constexpr uint32_t kIOReturnNotReady=0xE00002D8;
+void *auxProbePort;uintptr_t auxProbeThread;unsigned auxProbePermit;uintptr_t current_thread(){return 1;}
 unsigned hpdCalls,auxCalls;uint32_t hpdOriginal(void *){++hpdCalls;return 1;}
 uint32_t auxOriginal(void *,uint32_t command,uint32_t *data,uint32_t bytes,bool retry){++auxCalls;assert(command==9&&bytes==4&&retry);*data=0x1234;return 0;}
 mach_vm_address_t portHPDOriginal=reinterpret_cast<uintptr_t>(hpdOriginal),portAUXOriginal=reinterpret_cast<uintptr_t>(auxOriginal);
@@ -51,6 +52,11 @@ int main(){
  assert(!observedPortAUX(&port,9,&data,4,true)&&auxCalls==1&&data==0x1234);
  allowed=false;assert(!observedPortHPD(&port)&&observedPortAUX(&port,9,&data,4,true)==kIOReturnNotReady&&auxCalls==1&&hpdCalls==1);
  observe=false;assert(observedPortHPD(&port)==1&&hpdCalls==2);assert(!observedPortAUX(&port,9,&data,4,true)&&auxCalls==2);
+ observe=true;allowed=true;setup(5);auxProbePermit=1;auxProbePort=&port;auxProbeThread=2;
+ assert(observedPortAUX(&port,9,&data,4,true)==kIOReturnNotReady&&auxCalls==2);
+ auxProbeThread=1;auxProbePort=nullptr;assert(observedPortAUX(&port,9,&data,4,true)==kIOReturnNotReady&&auxCalls==2);
+ auxProbePort=&port;assert(!observedPortAUX(&port,9,&data,4,true)&&auxCalls==3);
+ assert(!observedPortHPD(&port));
 }
 '''.replace('BODY',body)
 with tempfile.TemporaryDirectory(prefix='rplp-port-observer-') as d:

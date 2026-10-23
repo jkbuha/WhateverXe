@@ -96,3 +96,7 @@ assert raw[0x2E90A:0x2E917]==bytes.fromhex('554889e541574156534883ec38')
 assert raw[0x2EB0B:0x2EB11]==bytes.fromhex('ff9090010000')
 assert 'if(!wexRplReferencePortHooks(patcher,index,address,size))return false;' in native
 print('PASS exact private external-state observer donor entry and virtual dispatch call; generated hook required before matching')
+
+assert raw[0x28D9E:0x28DAF]==bytes.fromhex('554889e54157415641554154534883ec78')
+assert raw[0x25AB2:0x25AB6]==bytes.fromhex('554889e5')
+print('PASS native TC AUX helper entry signatures and port lookup for exact private donor')

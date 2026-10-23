@@ -170,5 +170,6 @@
   "-wex-rplp-forcewake-balance": [],
   "-wex-rplp-tcss": [],
   "-wex-rplp-early-display": [],
-  "-wex-rplp-tcss-observe": []
+  "-wex-rplp-tcss-observe": [],
+  "-wex-rplp-tcss-aux-probe": []
 }

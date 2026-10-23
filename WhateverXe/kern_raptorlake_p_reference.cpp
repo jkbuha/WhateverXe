@@ -12,6 +12,8 @@
 #include "kern_raptorlake_p_reference_backlight.hpp"
 #include "kern_raptorlake_p_reference_connectors.hpp"
 #include "kern_raptorlake_p_reference_early.hpp"
+#include "kern_raptorlake_p_reference_tc_aux.hpp"
+#include <kern/thread.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_raptorlake_p_reference_shutdown.hpp"
 #include <IOKit/IOLocks.h>
@@ -66,6 +68,8 @@ uint64_t handover[8]{1},displayPipe[8]{1},firmwareScan[8]{1};
 uint64_t panelState[16]{1};
 uint32_t portObserve[67]{1}; // schema, hook, error, then nine [calls,class,dispatch,vtable offset,mode,north,south] records
 mach_vm_address_t portStateOriginal,portHPDOriginal,portAUXOriginal,portImageBase,portImageSize,compatPortEntry,pureVirtualEntry;
+mach_vm_address_t auxReadEntry,getPortEntry;
+uint32_t auxProbeAttempted,auxProbePermit;void *auxProbePort;thread_t auxProbeThread;
 uint32_t portBindings[8]{1}; // schema, repaired slots, failure, original HAL/Diags dispatch, HPD holds, AUX holds, state holds
 uint32_t portModes[37]{1}; // schema, then calls / register / status / mode per DDI
 unsigned monitorSamples;
@@ -196,7 +200,7 @@ uint32_t observedPortHPD(void *port){
  return portHPDOriginal?reinterpret_cast<uint32_t (*)(void *)>(portHPDOriginal)(port):0;
 }
 uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t bytes,bool retry){
- if(observerSelected()){
+ if(observerSelected() && !(auxProbePermit && auxProbePort==port && auxProbeThread==current_thread())){
   uint32_t ddi;if(!observerPort(port,ddi))return static_cast<uint32_t>(kIOReturnNotReady);
   if(ddi){__sync_fetch_and_add(&portBindings[6],1);return static_cast<uint32_t>(kIOReturnNotReady);}
  }
@@ -233,6 +237,33 @@ bool captureAllowed(){
   !nativeOwner->isInactive() && framebufferOwner && !framebufferOwner->isInactive() &&
   wexRplReferenceFBAllowed(framebufferOwner);
 }
+
+void probeTCAux(){
+ using namespace RaptorLakeP::ReferenceTCAux;
+ Result result;
+ if(auxReadEntry && getPortEntry && portBindings[1]==2 && !portBindings[2] && captureAllowed() && observerSelected()){
+  auto port=reinterpret_cast<OSObject *(*)(uint32_t)>(getPortEntry)(5);
+  uint32_t ddi=0;
+  if(observerPort(port,ddi) && ddi==5){
+   port->retain();auxProbePort=port;auxProbeThread=current_thread();
+   struct IO {
+    uint32_t read(uint32_t reg){return backend.readReg32(reg);}
+    void write(uint32_t reg,uint32_t value){backend.writeReg32(reg,value);}
+    void pause(){IOSleep(1);}
+    uint32_t readDPCD(uint8_t *data,unsigned length){
+     using Read=uint32_t (*)(void *,uint32_t,void *,uint32_t);
+     __sync_synchronize();auxProbePermit=1;
+     auto result=reinterpret_cast<Read>(auxReadEntry)(auxProbePort,0,data,length);
+     auxProbePermit=0;__sync_synchronize();return result;
+    }
+   } io;
+   result=probe(io,true);
+   auxProbePermit=0;auxProbeThread=nullptr;auxProbePort=nullptr;port->release();
+  }
+ }
+ if(target)target->setProperty("WhateverXeRPLPReferenceTCAUX",&result,sizeof(result));
+}
+
 void captureWorker(thread_call_param_t,thread_call_param_t){
  if(captureAllowed()){
   struct IO {
@@ -241,6 +272,7 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   } io;
   auto sample=RaptorLakeP::ReferenceSnapshot::capture(io,++captureSequence);
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
+  if(sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1) && checkKernelArgument("-wex-rplp-tcss-aux-probe") && observerSelected() && __sync_bool_compare_and_swap(&auxProbeAttempted,0,1))probeTCAux();
   // Controller lifetime, private image and physical owner are pinned by
   // captureAllowed(). D40 is the same immutable platform table used by the
   // qualified compatibility-port route; never export its kernel pointers.
@@ -521,6 +553,14 @@ bool wexRplReferencePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size
   auto entry=p.solveSymbol(i,names[x],a,n);p.clearError();
   auto prefix=x==2?auxPrefix:shortPrefix;size_t length=x==2?sizeof(auxPrefix):sizeof(shortPrefix);
   ok=entry==a+offsets[x] && n>=offsets[x]+length && !memcmp(reinterpret_cast<void *>(entry),prefix,length);
+ }
+
+ if(ok && checkKernelArgument("-wex-rplp-tcss-aux-probe")){
+  auxReadEntry=p.solveSymbol(i,"__ZN14AppleIntelPort7readAUXEjPvj",a,n);p.clearError();
+  getPortEntry=p.solveSymbol(i,"__ZN14AppleIntelPort12getPortByDDIEj",a,n);p.clearError();
+  ok=n>0x28D9E + sizeof(auxPrefix) && auxReadEntry==a+0x28D9E && getPortEntry==a+0x25AB2 &&
+   !memcmp(reinterpret_cast<void *>(auxReadEntry),auxPrefix,sizeof(auxPrefix)) &&
+   !memcmp(reinterpret_cast<void *>(getPortEntry),auxPrefix,4);
  }
  const char *tables[]{"__ZTV17AppleIntelPortHAL","__ZTV22AppleIntelPortHALDiags"};
  const uint32_t tableOffsets[]{0x13CDA8,0x1415D8};
