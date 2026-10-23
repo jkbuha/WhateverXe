@@ -10,6 +10,7 @@
 #include "kern_raptorlake_p_reference_context.hpp"
 #include "kern_backlight_profile.hpp"
 #include "kern_raptorlake_p_reference_backlight.hpp"
+#include "kern_raptorlake_p_reference_connectors.hpp"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_raptorlake_p_reference_shutdown.hpp"
 #include <IOKit/IOLocks.h>
@@ -127,6 +128,16 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   } io;
   auto sample=RaptorLakeP::ReferenceSnapshot::capture(io,++captureSequence);
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
+  // Controller lifetime, private image and physical owner are pinned by
+  // captureAllowed(). D40 is the same immutable platform table used by the
+  // qualified compatibility-port route; never export its kernel pointers.
+  const uint8_t *platform=nullptr;
+  memcpy(&platform,reinterpret_cast<const uint8_t *>(framebufferOwner)+0xD40,sizeof(platform));
+  struct PlatformView {const uint8_t *base;uint32_t read(unsigned offset){uint32_t value;memcpy(&value,base+offset,4);return value;}} view{platform};
+  auto connectors=RaptorLakeP::ReferenceConnectors::platform(view,platform && !(reinterpret_cast<uintptr_t>(platform)&3));
+  target->setProperty("WhateverXeRPLPReferenceConnectors",&connectors,sizeof(connectors));
+  auto tc=RaptorLakeP::ReferenceConnectors::typeC(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && sample.activePipes);
+  target->setProperty("WhateverXeRPLPReferenceTypeC",&tc,sizeof(tc));
   if(checkKernelArgument("-wex-rplp-backlight")){
    auto pwm=RaptorLakeP::ReferenceBacklight::capture(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1));
    target->setProperty("WhateverXeRPLPBacklightPWM",&pwm,sizeof(pwm));
