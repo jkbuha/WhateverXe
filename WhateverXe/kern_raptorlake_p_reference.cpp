@@ -91,7 +91,7 @@ mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
 mach_vm_address_t scanoutMemoryOriginal;
 uint32_t scanoutGate[7]{1}; // schema, hook, calls, forwarded, null refusals, last flags, install error
-uint32_t displayPipeReadyMask,bootProbe[8]{1}; // schema, timing checks, ready, requested, result, pipe mask, failure, reserved
+uint32_t displayPipeReadyMask,bootProbe[8]{1}; // schema, readiness checks, ready, requested, result, pipe mask, failure, mode-info status
 
 uint32_t guardedScanoutMemory(void *pipe,void *mode,uint32_t flags){
  using Allocate=uint32_t (*)(void *,void *,uint32_t);
@@ -393,18 +393,23 @@ void framebufferWorker(thread_call_param_t,thread_call_param_t){
  target->registerService(kIOServiceAsynchronous);publish();
 }
 bool waitForNativeTimings(){
- for(unsigned elapsed=0;elapsed<=2000;elapsed+=25){
+ for(unsigned elapsed=0;elapsed<=15000;elapsed+=25){
   ++bootProbe[1];
+  const bool controllerStarted=__atomic_load_n(&handover[7],__ATOMIC_ACQUIRE);
   IOService *head=nullptr;
-  if(framebufferOwner && panelState[3]==0x1C48)
+  if(framebufferOwner && panelState[3]==0x1C48 && controllerStarted && panelState[8])
    memcpy(&head,reinterpret_cast<uint8_t *>(framebufferOwner)+0xD60,8);
   if(head && head->getProvider()==target && head->getMetaClass()->getClassSize()==0x4B98){
    uint32_t mode;uintptr_t timings;
    memcpy(&mode,reinterpret_cast<uint8_t *>(head)+0x4250,4);
    memcpy(&timings,reinterpret_cast<uint8_t *>(head)+0x4260,8);
-   if(timings && mode>=0x10000 && mode<0xFFFF0000){bootProbe[2]=1;return true;}
+   if(timings && mode>=0x10000 && mode<0xFFFF0000){
+    IODisplayModeInformation information{};
+    bootProbe[7]=static_cast<IOFramebuffer *>(head)->getInformationForDisplayMode(mode,&information);
+    if(bootProbe[7]==kIOReturnSuccess && information.nominalWidth && information.nominalHeight){bootProbe[2]=1;return true;}
+   }
   }
-  if(elapsed<2000)IOSleep(25);
+  if(elapsed<15000)IOSleep(25);
  }
  return false;
 }
@@ -586,7 +591,7 @@ bool wexRplReferenceAdoptFramebuffer(void *raw){
 void wexRplReferenceFramebufferStarted(void *raw,bool ok){
  if(!wexRplReferencePanel() || raw!=framebufferOwner)return;
  panelState[8]=ok;panelState[9]=ok && (framebufferOwner->getState()&kIOServiceRegisteredState);panelState[1]=ok?6:5;
- handover[7]=ok;if(!ok){panelState[15]=7;handover[6]=7;}publish();
+ __atomic_store_n(&handover[7],uint64_t(ok),__ATOMIC_RELEASE);if(!ok){panelState[15]=7;handover[6]=7;}publish();
 }
 bool wexRplReferenceDisplayPipeInit(void *pipe,void *gpu,void *machine,void *frame,uint32_t index){
  using Init=bool (*)(void *,void *,void *,void *,uint32_t);
