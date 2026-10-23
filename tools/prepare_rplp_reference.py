@@ -18,7 +18,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  apply_recovery(out)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
  gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
- gate+='class KernelPatcher;\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
+ gate+='class KernelPatcher;\nextern bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
  gate+='extern bool wexRplReferenceTCSSSelected();\nextern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
@@ -42,7 +42,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  hw='\t\tthis->tglHWLoaded = true;'
  # It occurs in ICL path too; use full TGL branch context.
  ctx='} else if (kextG11HWT.loadIndex == index || kextG11HWTA.loadIndex == index) {\n'+hw
- edit('kern_gen11.cpp',ctx,ctx.replace(hw,'\t\tif(!wexRplReferenceImage(reinterpret_cast<void *>(address),size,true))return false;\n'+hw))
+ edit('kern_gen11.cpp',ctx,ctx.replace(hw,'\t\tif(!wexRplReferenceImage(reinterpret_cast<void *>(address),size,true))return false;\n\t\tif(!wexRplReferenceAcceleratorProbeHooks(patcher,index,address,size))return false;\n'+hw))
  edit('kern_gen11.cpp','\t\treturn true;\n\t\t\n\t}else if (kextG11HW.loadIndex == index)', '\t\twexRplReferenceLoaded(false);\n\t\treturn true;\n\t\t\n\t}else if (kextG11HW.loadIndex == index)')
  marker='"RPL spoofed — slices=1 subslices=12(6DSS) maxEU/SS=8 totalEU=96 L3=8");'
  edit('kern_gen11.cpp',marker,marker+'\n\t\twexRplReferenceLoaded(true);')

@@ -75,6 +75,8 @@ uint32_t portModes[37]{1}; // schema, then calls / register / status / mode per 
 unsigned monitorSamples;
 
 IOService *nativeOwner;
+mach_vm_address_t acceleratorProbeOriginal;
+uint32_t acceleratorProbe[7]{1}; // schema, hook, calls, allowed, refused, last reason, install error
 uint64_t startup[16]{1}; // schema, stage, allocation, size, init, probe, matched, ID, rev, selector, attached, startEntered, startResult, registered, presented PCI ID, failure
 uint32_t state[9]{1}; // version, physical, FB start blocked, GPU patched, armed, queued, published, failure, IOAF ready
 const char *firmwarePaths[]{"/System/Library/Extensions/IONDRVSupport.kext/Contents/MacOS/IONDRVSupport"};
@@ -87,6 +89,29 @@ const char *backlightPaths[]{"/System/Library/Extensions/AppleBacklight.kext/Con
 KernelPatcher::KextInfo backlightInfo{"com.apple.driver.AppleBacklight",backlightPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
+
+uint32_t guardedAcceleratorProbe(IOService *owner,uint32_t options){
+ using Probe=uint32_t (*)(IOService *,uint32_t);
+ if(!wexRplReferencePanel() || !target || !owner || owner->getProvider()!=target)
+  return acceleratorProbeOriginal?reinterpret_cast<Probe>(acceleratorProbeOriginal)(owner,options):static_cast<uint32_t>(kIOReturnNotReady);
+ __sync_fetch_and_add(&acceleratorProbe[2],1);
+ unsigned reason=0;
+ if(owner!=nativeOwner || owner->getMetaClass()->getClassSize()!=0x1C80)reason=1;
+ else if(!state[1] || !state[4] || state[7] || owner->isInactive())reason=2;
+ else if(!shutdownQuery || shutdownQuery())reason=3;
+ else {
+  // Exact BA3AA1C0 donor: IGHardwareContext::initWithOptions loads its
+  // IGGarbageCollector from task->accelerator +0x1258. A pre-start probe may
+  // reach this before that collector exists, then IGGCObject::init crashes.
+  uintptr_t collector;memcpy(&collector,reinterpret_cast<uint8_t *>(owner)+0x1258,8);
+  if(!collector)reason=4;
+ }
+ acceleratorProbe[5]=reason;
+ if(reason){__sync_fetch_and_add(&acceleratorProbe[4],1);return static_cast<uint32_t>(kIOReturnNotReady);}
+ __sync_fetch_and_add(&acceleratorProbe[3],1);
+ return acceleratorProbeOriginal?reinterpret_cast<Probe>(acceleratorProbeOriginal)(owner,options):static_cast<uint32_t>(kIOReturnNotReady);
+}
+
 bool earlyRequested(){return checkKernelArgument("-wex-rplp-early-display");}
 void earlyPublish(thread_call_param_t,thread_call_param_t){
  if(target)target->setProperty("WhateverXeRPLPEarlyDisplay",earlyState,sizeof(earlyState));
@@ -210,7 +235,7 @@ uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t byt
 
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
-void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
+void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
 void moduleWorker(thread_call_param_t,thread_call_param_t){
  if(!wexRplReferencePanel() || !moduleLoader || !target || !state[1] || state[4] || state[7] || !moduleState[1])return;
  const char *ids[]{"org.b00t0x.AppleIntelTGLCompat","com.apple.driver.AppleIntelTGLGraphicsFramebuffer","com.apple.driver.AppleIntelTGLGraphics"};
@@ -540,6 +565,20 @@ bool wexRplReferenceDisplayPipeInit(void *pipe,void *gpu,void *machine,void *fra
 void wexRplReferenceFBFailure(unsigned code){__sync_bool_compare_and_swap(&panelState[15],0,code);}
 uint32_t wexRplReferenceFBRead(unsigned long reg){return backend.readReg32(reg);}
 
+
+
+bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(!wexRplReferencePanel())return true;
+ const char *name="__ZN16IntelAccelerator12requestProbeEj";
+ bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,true);
+ auto entry=ok?p.solveSymbol(i,name,a,n):0;p.clearError();
+ const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x10,0x49,0x89,0xFE};
+ ok=ok && n>=0x26FEC+sizeof(prefix) && entry==a+0x26FEC && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
+ if(ok){KernelPatcher::RouteRequest route{name,guardedAcceleratorProbe,acceleratorProbeOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ acceleratorProbe[1]=ok;acceleratorProbe[6]=ok?0:1;
+ if(target)target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));
+ return ok;
+}
 
 bool wexRplReferencePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
  if(!wexRplReferenceTCSSSelected() || !checkKernelArgument("-wex-rplp-tcss-observe"))return true;

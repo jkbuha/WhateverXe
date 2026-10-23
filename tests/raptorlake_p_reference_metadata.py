@@ -100,3 +100,10 @@ print('PASS exact private external-state observer donor entry and virtual dispat
 assert raw[0x28D9E:0x28DAF]==bytes.fromhex('554889e54157415641554154534883ec78')
 assert raw[0x25AB2:0x25AB6]==bytes.fromhex('554889e5')
 print('PASS native TC AUX helper entry signatures and port lookup for exact private donor')
+
+gpu=Path('/Library/Extensions/AppleIntelTGLGraphics.kext/Contents/MacOS/AppleIntelTGLGraphics').read_bytes()
+assert gpu[0x26FEC:0x26FFA]==bytes.fromhex('554889e54156534883ec104989fe')
+assert gpu[0x7B9FD:0x7BA01]==bytes.fromhex('488b4610')
+assert gpu[0x7BA60:0x7BA67]==bytes.fromhex('488bb058120000')
+assert 'if(!wexRplReferenceAcceleratorProbeHooks(patcher,index,address,size))return false;' in native
+print('PASS exact native requestProbe entry and task->accelerator->collector1258 access; guard installed before native module matching')
