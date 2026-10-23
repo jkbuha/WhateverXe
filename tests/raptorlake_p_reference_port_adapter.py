@@ -1,7 +1,7 @@
 """Run the actual RPL-P compatibility export with mismatched-owner cases."""
 from pathlib import Path
 import subprocess,tempfile
-r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('uint32_t compatPortMode(void *port)'):s.index('mach_vm_address_t fbOriginal;')]
+r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('uint32_t compatPortMode(void *port)'):s.index('// The observer holds external ports')]
 fixture=r'''#include <cassert>
 #include <cstdint>
 #include <cstring>

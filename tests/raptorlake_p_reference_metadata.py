@@ -91,3 +91,8 @@ assert raw[0x91A18:0x91A31]==bytes.fromhex('4489f0c1e81a4489f9c1e90209c14489fbc1
 nativeTC3=lambda south,north:((south>>26)|(north>>2)|(north>>18))&1
 assert not nativeTC3(0x10000,0x10) and nativeTC3(0x10000,0x40000)==1
 print('PASS native TC3 HPD: original north register sees connected sink; inherited FIA rewrite hides it; power-well bypass retained')
+
+assert raw[0x2E90A:0x2E917]==bytes.fromhex('554889e541574156534883ec38')
+assert raw[0x2EB0B:0x2EB11]==bytes.fromhex('ff9090010000')
+assert 'if(!wexRplReferencePortHooks(patcher,index,address,size))return false;' in native
+print('PASS exact private external-state observer donor entry and virtual dispatch call; generated hook required before matching')

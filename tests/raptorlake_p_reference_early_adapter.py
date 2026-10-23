@@ -24,7 +24,7 @@ int main(){
   memset(earlyState,0,sizeof(earlyState));earlyState[0]=1;originals=queued=0;
   requested=b&1;tcss=b&2;earlyState[1]=bool(b&4);state[1]=bool(b&8);state[7]=bool(b&16);
   auto provider=(b&32)?&gpu:&foreign;owner.meta=(b&64)?&firmwareMeta:&otherMeta;auto object=(b&128)?&owner:nullptr;
-  int32_t score=123;bool blocked=requested&&!tcss&&earlyState[1]&&state[1]&&!state[7]&&(provider==target)&&object&&owner.meta==&firmwareMeta;
+  int32_t score=123;bool blocked=requested&&earlyState[1]&&state[1]&&!state[7]&&(provider==target)&&object&&owner.meta==&firmwareMeta;
   auto got=firmwareProbe(object,provider,&score);
   assert(got==(blocked?nullptr:&result));assert(originals==!blocked&&queued==blocked&&score==(blocked?123:130));assert(earlyState[2]==1&&earlyState[3]==blocked);
  }

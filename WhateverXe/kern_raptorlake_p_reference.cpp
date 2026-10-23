@@ -64,6 +64,9 @@ uint32_t moduleState[8]{1}; // schema, requested, stage, Compat, FB, GPU, comple
 IOService *framebufferOwner,*firmwareOwner;
 uint64_t handover[8]{1},displayPipe[8]{1},firmwareScan[8]{1};
 uint64_t panelState[16]{1};
+uint32_t portObserve[67]{1}; // schema, hook, error, then nine [calls,class,dispatch,vtable offset,mode,north,south] records
+mach_vm_address_t portStateOriginal,portHPDOriginal,portAUXOriginal,portImageBase,portImageSize,compatPortEntry,pureVirtualEntry;
+uint32_t portBindings[8]{1}; // schema, repaired slots, failure, original HAL/Diags dispatch, HPD holds, AUX holds, state holds
 uint32_t portModes[37]{1}; // schema, then calls / register / status / mode per DDI
 unsigned monitorSamples;
 
@@ -80,7 +83,7 @@ const char *backlightPaths[]{"/System/Library/Extensions/AppleBacklight.kext/Con
 KernelPatcher::KextInfo backlightInfo{"com.apple.driver.AppleBacklight",backlightPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
-bool earlyRequested(){return checkKernelArgument("-wex-rplp-early-display") && !checkKernelArgument("-wex-rplp-tcss");}
+bool earlyRequested(){return checkKernelArgument("-wex-rplp-early-display");}
 void earlyPublish(thread_call_param_t,thread_call_param_t){
  if(target)target->setProperty("WhateverXeRPLPEarlyDisplay",earlyState,sizeof(earlyState));
 }
@@ -137,6 +140,70 @@ uint32_t compatPortMode(void *port){
  __sync_fetch_and_add(&portModes[index],1);portModes[index+1]=reg;portModes[index+2]=status;portModes[index+3]=mode;
  return panelState[13]=mode;
 }
+
+// The observer holds external ports disconnected: no Type-C ownership, AUX or
+// link training is permitted until runtime dispatch has been qualified.
+uint32_t observedPortState(void *port){
+ if(!wexRplReferenceTCSSRequested() || !checkKernelArgument("-wex-rplp-tcss-observe"))
+  return portStateOriginal?reinterpret_cast<uint32_t (*)(void *)>(portStateOriginal)(port):0;
+ if(!wexRplReferenceFBAllowed(framebufferOwner) || !port)return 0;
+ auto object=static_cast<OSObject *>(port);
+ if(object->getMetaClass()->getClassSize()!=0x700)return 0;
+ auto bytes=static_cast<uint8_t *>(port),controller=reinterpret_cast<uint8_t *>(framebufferOwner);
+ uintptr_t access,expected,platform,config,table,dispatch;
+ memcpy(&access,bytes+0x578,8);memcpy(&expected,controller+0xC40,8);
+ memcpy(&platform,controller+0xD40,8);memcpy(&config,bytes+0x548,8);
+ if(!access || access!=expected || !RaptorLakeP::ReferenceFB::portRecord(platform,config))return 0;
+ uint32_t ddi;memcpy(&ddi,reinterpret_cast<void *>(config),4);
+ if(ddi!=(config-platform-0x20)/24)return 0;
+ // Internal Combo A retains its complete native path.
+ if(ddi==0)return portStateOriginal?reinterpret_cast<uint32_t (*)(void *)>(portStateOriginal)(port):0;
+ memcpy(&table,bytes,8);memcpy(&dispatch,reinterpret_cast<void *>(table+0x190),8);
+ auto index=3+7*ddi;
+ __sync_fetch_and_add(&portObserve[index],1);
+ const char *name=object->getMetaClass()->getClassName();
+ portObserve[index+1]=!strcmp(name,"AppleIntelPortHALDiags")?1:!strcmp(name,"AppleIntelPortHAL")?2:3;
+ portObserve[index+2]=dispatch==compatPortEntry || dispatch==reinterpret_cast<uintptr_t>(compatPortMode)?1:dispatch==pureVirtualEntry?2:
+  dispatch>=portImageBase && dispatch-portImageBase<portImageSize?3:4;
+ portObserve[index+3]=table>=portImageBase && table-portImageBase<portImageSize?static_cast<uint32_t>(table-portImageBase):~0U;
+ portObserve[index+4]=compatPortMode(port);
+ portObserve[index+5]=backend.readReg32(0x44470);
+ portObserve[index+6]=backend.readReg32(0xC4000);
+ uint32_t disconnected=0;memcpy(bytes+0x554,&disconnected,4);
+ __sync_fetch_and_add(&portBindings[7],1);
+ return 0;
+}
+
+
+bool observerPort(void *port,uint32_t &ddi){
+ if(!wexRplReferenceFBAllowed(framebufferOwner) || !port)return false;
+ auto object=static_cast<OSObject *>(port);
+ if(object->getMetaClass()->getClassSize()!=0x700)return false;
+ auto bytes=static_cast<uint8_t *>(port),controller=reinterpret_cast<uint8_t *>(framebufferOwner);
+ uintptr_t access,expected,platform,config;
+ memcpy(&access,bytes+0x578,8);memcpy(&expected,controller+0xC40,8);
+ memcpy(&platform,controller+0xD40,8);memcpy(&config,bytes+0x548,8);
+ if(!access || access!=expected || !RaptorLakeP::ReferenceFB::portRecord(platform,config))return false;
+ memcpy(&ddi,reinterpret_cast<void *>(config),4);
+ return ddi==(config-platform-0x20)/24;
+}
+bool observerSelected(){return wexRplReferenceTCSSRequested() && checkKernelArgument("-wex-rplp-tcss-observe");}
+uint32_t observedPortHPD(void *port){
+ if(observerSelected()){
+  uint32_t ddi;if(!observerPort(port,ddi))return 0;
+  if(ddi){__sync_fetch_and_add(&portBindings[5],1);return 0;}
+ }
+ return portHPDOriginal?reinterpret_cast<uint32_t (*)(void *)>(portHPDOriginal)(port):0;
+}
+uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t bytes,bool retry){
+ if(observerSelected()){
+  uint32_t ddi;if(!observerPort(port,ddi))return static_cast<uint32_t>(kIOReturnNotReady);
+  if(ddi){__sync_fetch_and_add(&portBindings[6],1);return static_cast<uint32_t>(kIOReturnNotReady);}
+ }
+ using Run=uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t,bool);
+ return portAUXOriginal?reinterpret_cast<Run>(portAUXOriginal)(port,command,data,bytes,retry):static_cast<uint32_t>(kIOReturnNotReady);
+}
+
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
 void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
@@ -185,6 +252,8 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   auto tc=RaptorLakeP::ReferenceConnectors::typeC(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && sample.activePipes);
   target->setProperty("WhateverXeRPLPReferenceTypeC",&tc,sizeof(tc));
   target->setProperty("WhateverXeRPLPReferencePortModes",portModes,sizeof(portModes));
+  target->setProperty("WhateverXeRPLPReferencePortObserver",portObserve,sizeof(portObserve));
+  target->setProperty("WhateverXeRPLPReferencePortBindings",portBindings,sizeof(portBindings));
   if(checkKernelArgument("-wex-rplp-backlight")){
    auto pwm=RaptorLakeP::ReferenceBacklight::capture(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1));
    target->setProperty("WhateverXeRPLPBacklightPWM",&pwm,sizeof(pwm));
@@ -385,6 +454,7 @@ void kext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
   const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x10};
   bool ok=RaptorLakeP::ReferenceFB::compatImage(reinterpret_cast<void *>(a),n);
   auto entry=ok?p.solveSymbol(i,name,a,n):0;p.clearError();
+  compatPortEntry=entry;
   ok=ok && entry>=a && n>=sizeof(prefix) && entry-a<=n-sizeof(prefix) && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
   if(ok){KernelPatcher::RouteRequest route{name,compatPortMode,compatPortOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
   panelState[10]=ok;
@@ -437,6 +507,55 @@ bool wexRplReferenceDisplayPipeInit(void *pipe,void *gpu,void *machine,void *fra
 }
 void wexRplReferenceFBFailure(unsigned code){__sync_bool_compare_and_swap(&panelState[15],0,code);}
 uint32_t wexRplReferenceFBRead(unsigned long reg){return backend.readReg32(reg);}
+
+
+bool wexRplReferencePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(!wexRplReferenceTCSSSelected() || !checkKernelArgument("-wex-rplp-tcss-observe"))return true;
+ bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && panelState[10] && compatPortEntry;
+ pureVirtualEntry=p.solveSymbol(KernelPatcher::KernelID,"___cxa_pure_virtual");p.clearError();
+ const char *names[]{"__ZN14AppleIntelPort14probePortStateEv","__ZN17AppleIntelPortHAL11getHPDStateEv","__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb"};
+ const uint8_t shortPrefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xEC};
+ const uint8_t auxPrefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x78};
+ const uint32_t offsets[]{0x2E90A,0x91836,0x91B64};
+ for(unsigned x=0;ok && x<3;++x){
+  auto entry=p.solveSymbol(i,names[x],a,n);p.clearError();
+  auto prefix=x==2?auxPrefix:shortPrefix;size_t length=x==2?sizeof(auxPrefix):sizeof(shortPrefix);
+  ok=entry==a+offsets[x] && n>=offsets[x]+length && !memcmp(reinterpret_cast<void *>(entry),prefix,length);
+ }
+ const char *tables[]{"__ZTV17AppleIntelPortHAL","__ZTV22AppleIntelPortHALDiags"};
+ const uint32_t tableOffsets[]{0x13CDA8,0x1415D8};
+ mach_vm_address_t slots[2]{};
+ // Exact private tables only. Refuse a foreign binding; never patch the kernel's
+ // shared pure-virtual function or unrelated classes.
+ for(unsigned x=0;ok && x<2;++x){
+  auto table=p.solveSymbol(i,tables[x],a,n);p.clearError();
+  ok=table==a+tableOffsets[x] && n>=tableOffsets[x]+16+0x190+8 && pureVirtualEntry;
+  if(ok){
+   slots[x]=table+16+0x190;mach_vm_address_t bound;memcpy(&bound,reinterpret_cast<void *>(slots[x]),8);
+   portBindings[3+x]=bound==pureVirtualEntry?2:bound==compatPortEntry?1:3;
+   ok=bound==pureVirtualEntry || bound==compatPortEntry;
+  }
+ }
+ if(ok){
+  portImageBase=a;portImageSize=n;
+  KernelPatcher::RouteRequest routes[]{
+   {names[0],observedPortState,portStateOriginal},
+   {names[1],observedPortHPD,portHPDOriginal},
+   {names[2],observedPortAUX,portAUXOriginal}};
+  ok=p.routeMultiple(i,routes,3,a,n);p.clearError();
+ }
+ for(unsigned x=0;ok && x<2;++x){
+  auto replacement=reinterpret_cast<mach_vm_address_t>(compatPortMode);
+  p.routeBlock(slots[x],reinterpret_cast<const uint8_t *>(&replacement),sizeof(replacement));
+  mach_vm_address_t after;memcpy(&after,reinterpret_cast<void *>(slots[x]),8);
+  ok=p.getError()==KernelPatcher::Error::NoError && after==replacement;p.clearError();
+  if(ok)++portBindings[1];
+ }
+ portObserve[1]=ok;portObserve[2]=ok?0:1;portBindings[2]=ok?0:1;
+ if(target){target->setProperty("WhateverXeRPLPReferencePortObserver",portObserve,sizeof(portObserve));target->setProperty("WhateverXeRPLPReferencePortBindings",portBindings,sizeof(portBindings));}
+ return ok;
+}
+
 bool wexRplReferenceValidate(){
  if(state[1])return !state[7];
  if(state[7] || !RaptorLakeP::Reference::enabled())return false;

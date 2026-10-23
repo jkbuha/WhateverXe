@@ -112,7 +112,8 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wex-rplp-native-barriers` | native accelerator の公開後に依存 barrier を有効にする実験的 RPL-P 診断。任意の panel backend と手動 arm が必要で、native context を検証してから従来の startup path を離れます。 |
 | `-wex-rplp-backlight` | 任意の RPL-P panel backend 向けに UID-19・16-bit PWM の輝度 profile を有効にします。Apple または custom profile を保持し、外部 display は対象外です。 |
 | `-wex-rplp-tcss` | 任意の RPL-P panel backend 向けの実験的な ADL-P/RPL-P Type-C 検出です。4 個の TC port slot を公開し、TCSS の ready/DP-alt 状態を使用します。Thunderbolt transport は対象外で、外部 link training は検証中です。 |
-| `-wex-rplp-early-display` | 実験的な RPL-P 起動制御です。検証済み owner の firmware framebuffer binding を遅延し、native framebuffer で最初の desktop を表示します。早期 activation coordinator と recovery 設定が必要です。`-wex-rplp-tcss` とは併用できません。 |
+| `-wex-rplp-tcss-observe` | 実験的 RPL-P TCSS backend で外部 port の dispatch と mode 検出を記録し、外部 port は未接続として保持します。Link training は無効です。 |
+| `-wex-rplp-early-display` | 実験的な RPL-P 起動制御です。検証済み owner の firmware framebuffer binding を遅延し、native framebuffer で最初の desktop を表示します。早期 activation coordinator と recovery 設定が必要です。 |
 | `-wex-rplp-gpu-recovery` | 対応する reference GPU image 向け RPL-P shared render-domain reset recovery。native accelerator の公開後、native reset で状態を失った sibling engine を検証して復元・再実行します。 |
 | `-wex-rplp-forcewake-balance` | 対応する reference GPU image 向け RPL-P forcewake counter balancing。idle hold の自動解放は無効です。 |
 | `-wex-rplp-manual-arm` | 管理者が`WhateverXeRPLPControl` serviceへ`BeginDiagnostic=true`を送信するまでRPL-P native診断を待機させます。既存のnative-probe前提条件が必要です。実験的診断の開始前に動作確認済みboot fileを復元できます。通常のaccelerator admissionは有効にしません。 |
