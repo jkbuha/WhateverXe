@@ -11,6 +11,7 @@
 #include "kern_backlight_profile.hpp"
 #include "kern_raptorlake_p_reference_backlight.hpp"
 #include "kern_raptorlake_p_reference_connectors.hpp"
+#include "kern_raptorlake_p_reference_early.hpp"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_raptorlake_p_reference_shutdown.hpp"
 #include <IOKit/IOLocks.h>
@@ -40,6 +41,9 @@ thread_call_t monitor;
 thread_call_t framebufferWork;
 thread_call_t moduleWork;
 thread_call_t captureWork;
+thread_call_t earlyPublishWork;
+uint32_t earlyState[8]{1}; // schema, hook ready, calls, blocked, foreign, unselected, wrong class, error
+mach_vm_address_t firmwareProbeOriginal;
 uint32_t captureBusy,captureSequence;
 using ShutdownQuery=int (*)();
 using TryRetain=bool (*)(const OSObject *,const void *);
@@ -66,6 +70,8 @@ unsigned monitorSamples;
 IOService *nativeOwner;
 uint64_t startup[16]{1}; // schema, stage, allocation, size, init, probe, matched, ID, rev, selector, attached, startEntered, startResult, registered, presented PCI ID, failure
 uint32_t state[9]{1}; // version, physical, FB start blocked, GPU patched, armed, queued, published, failure, IOAF ready
+const char *firmwarePaths[]{"/System/Library/Extensions/IONDRVSupport.kext/Contents/MacOS/IONDRVSupport"};
+KernelPatcher::KextInfo firmwareInfo{"com.apple.iokit.IONDRVSupport",firmwarePaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 const char *fbPaths[]{"/Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext/Contents/MacOS/AppleIntelTGLGraphicsFramebuffer"};
 KernelPatcher::KextInfo fbInfo{"com.apple.driver.AppleIntelTGLGraphicsFramebuffer",fbPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 const char *compatPaths[]{"/Library/Extensions/AppleIntelTGLCompat.kext/Contents/MacOS/AppleIntelTGLCompat"};
@@ -74,6 +80,39 @@ const char *backlightPaths[]{"/System/Library/Extensions/AppleBacklight.kext/Con
 KernelPatcher::KextInfo backlightInfo{"com.apple.driver.AppleBacklight",backlightPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
+bool earlyRequested(){return checkKernelArgument("-wex-rplp-early-display") && !checkKernelArgument("-wex-rplp-tcss");}
+void earlyPublish(thread_call_param_t,thread_call_param_t){
+ if(target)target->setProperty("WhateverXeRPLPEarlyDisplay",earlyState,sizeof(earlyState));
+}
+IOService *firmwareProbe(IOService *owner,IOService *provider,int32_t *score){
+ __sync_fetch_and_add(&earlyState[2],1);
+ const bool selected=earlyRequested();
+ const bool physical=state[1] && !state[7] && target;
+ const bool own=provider && provider==target;
+ const bool firmware=owner && !strcmp(owner->getMetaClass()->getClassName(),"IONDRVFramebuffer");
+ if(RaptorLakeP::ReferenceEarly::block(selected,earlyState[1],physical,own,firmware)){
+  __sync_fetch_and_add(&earlyState[3],1);
+  // Leave the firmware's running scanout untouched. Refuse only its fallback
+  // driver binding so the first userspace framebuffer can be the native one.
+  // Publish counters later, outside IOKit's probe/matching lock context.
+  if(earlyPublishWork)thread_call_enter(earlyPublishWork);
+  return nullptr;
+ }
+ __sync_fetch_and_add(&earlyState[!selected?5:!own?4:6],1);
+ using Probe=IOService *(*)(IOService *,IOService *,int32_t *);
+ return firmwareProbeOriginal ? reinterpret_cast<Probe>(firmwareProbeOriginal)(owner,provider,score) : nullptr;
+}
+void firmwareKext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(i!=firmwareInfo.loadIndex || !earlyRequested() || !wexRplReferencePanel())return;
+ if(!state[1] || state[7] || !earlyPublishWork){earlyState[7]=1;earlyPublish(nullptr,nullptr);return;}
+ const char *name="__ZN17IONDRVFramebuffer5probeEP9IOServicePi";
+ bool ok=RaptorLakeP::ReferenceEarly::image(reinterpret_cast<void *>(a),n);
+ auto entry=ok?p.solveSymbol(i,name,a,n):0;p.clearError();
+ const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50};
+ ok=ok && entry>=a && n>=sizeof(prefix) && entry-a<=n-sizeof(prefix) && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
+ if(ok){KernelPatcher::RouteRequest route{name,firmwareProbe,firmwareProbeOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ earlyState[1]=ok;earlyState[7]=ok?0:2;earlyPublish(nullptr,nullptr);
+}
 uint32_t compatPortMode(void *port){
  // This export is also shared with the TGL backend. Leave other owners on the
  // original path; the RPL-P binding never opens that backend's hardware gate.
@@ -511,8 +550,10 @@ void init(){
  if(wexRplReferencePanel())captureWork=thread_call_allocate(captureWorker,nullptr);
  if(wexRplReferencePanel())moduleWork=thread_call_allocate(moduleWorker,nullptr);
  if(wexRplReferencePanel())framebufferWork=thread_call_allocate(framebufferWorker,nullptr);
+ if(wexRplReferencePanel() && earlyRequested())earlyPublishWork=thread_call_allocate(earlyPublish,nullptr);
  work=thread_call_allocate(worker,nullptr);if(!work || !monitor || (wexRplReferencePanel() && (!framebufferWork || !captureWork))){state[7]=4;return;}
  lilu.onPatcherLoadForce(kernel,nullptr);
+ if(wexRplReferencePanel() && earlyRequested())lilu.onKextLoadForce(&firmwareInfo,1,firmwareKext,nullptr);
  if(wexRplReferencePanel() && checkKernelArgument("-wex-rplp-backlight"))lilu.onKextLoadForce(&backlightInfo,1,backlightKext,nullptr);
  backend.init();
  XeDataAccess::init();if(!wexRplReferencePanel())lilu.onKextLoadForce(&fbInfo,1,kext,nullptr);

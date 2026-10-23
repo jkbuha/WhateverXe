@@ -168,5 +168,6 @@
   "-wex-rplp-backlight": [],
   "-wex-rplp-gpu-recovery": [],
   "-wex-rplp-forcewake-balance": [],
-  "-wex-rplp-tcss": []
+  "-wex-rplp-tcss": [],
+  "-wex-rplp-early-display": []
 }
