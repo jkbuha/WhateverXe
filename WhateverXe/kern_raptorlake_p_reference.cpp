@@ -12,6 +12,7 @@
 #include "kern_raptorlake_p_reference_backlight.hpp"
 #include "kern_raptorlake_p_reference_connectors.hpp"
 #include "kern_raptorlake_p_reference_early.hpp"
+#include "kern_raptorlake_p_reference_redraw.hpp"
 #include "kern_raptorlake_p_reference_tc_aux.hpp"
 #include <kern/thread.h>
 #include <IOKit/graphics/IOFramebuffer.h>
@@ -87,6 +88,44 @@ const char *compatPaths[]{"/Library/Extensions/AppleIntelTGLCompat.kext/Contents
 KernelPatcher::KextInfo compatInfo{"org.b00t0x.AppleIntelTGLCompat",compatPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
 const char *backlightPaths[]{"/System/Library/Extensions/AppleBacklight.kext/Contents/MacOS/AppleBacklight"};
 KernelPatcher::KextInfo backlightInfo{"com.apple.driver.AppleBacklight",backlightPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
+const char *redrawPaths[]{"/System/Library/Extensions/IOGraphicsFamily.kext/Contents/MacOS/IOGraphicsFamily"};
+KernelPatcher::KextInfo redrawInfo{"com.apple.iokit.IOGraphicsFamily",redrawPaths,1,{true},{},KernelPatcher::KextInfo::Unloaded};
+mach_vm_address_t redrawOriginal;
+uint8_t *redrawVerbose;
+uint32_t redrawState[6]{1}; // schema, installed, calls, reset, foreign, install error
+bool redrawRequested(){unsigned mode=0;return PE_parse_boot_argn("gfxrst",&mode,sizeof(mode)) && mode==1;}
+void redrawFramebuffer(IOFramebuffer *fb){
+ __sync_fetch_and_add(&redrawState[2],1);
+ const bool physical=wexRplReferencePanel() && target && state[1] && !state[7];
+ const bool owned=fb && fb->getProvider()==target;
+ const bool head=owned && fb->getMetaClass()->getClassSize()==0x4B98;
+ uint32_t index=~0U;
+ if(head)memcpy(&index,reinterpret_cast<uint8_t *>(fb)+0x1DC,sizeof(index));
+ const bool selected=RaptorLakeP::ReferenceRedraw::selected(redrawRequested(),physical,owned,head,index==0);
+ if(selected && redrawVerbose){
+  // Same reset/redraw request as WEG gfxrst=1. Never copy or clear the GOP
+  // surface: its linear layout is not the native driver's tiled scanout.
+  const uint8_t previous=*redrawVerbose;*redrawVerbose=1;
+  reinterpret_cast<void (*)(IOFramebuffer *)>(redrawOriginal)(fb);
+  *redrawVerbose=previous;__sync_fetch_and_add(&redrawState[3],1);
+ }else{
+  __sync_fetch_and_add(&redrawState[4],1);
+  reinterpret_cast<void (*)(IOFramebuffer *)>(redrawOriginal)(fb);
+ }
+}
+void redrawKext(void *,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(i!=redrawInfo.loadIndex || !redrawRequested() || !wexRplReferencePanel() || !state[1] || state[7])return;
+ const char *name="__ZN13IOFramebuffer6initFBEv";
+ bool ok=RaptorLakeP::ReferenceRedraw::image(reinterpret_cast<void *>(a),n) && n>0x3F397;
+ auto entry=ok?p.solveSymbol(i,name,a,n):0;p.clearError();
+ auto verbose=ok?p.solveSymbol(i,"__ZL16gIOFBVerboseBoot",a,n):0;p.clearError();
+ const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0x58,0x01,0x00,0x00};
+ ok=ok && entry==a+0x1B9D4 && verbose==a+0x3F397 && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
+ if(ok){redrawVerbose=reinterpret_cast<uint8_t *>(verbose);KernelPatcher::RouteRequest route{name,redrawFramebuffer,redrawOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ redrawState[1]=ok;redrawState[5]=ok?0:1;
+ SYSLOG("rplp","optional framebuffer redraw hook ready=%u",ok);
+ if(target)target->setProperty("WhateverXeRPLPReferenceRedraw",redrawState,sizeof(redrawState));
+}
 mach_vm_address_t backlightOriginal;
 mach_vm_address_t compatPortOriginal;
 mach_vm_address_t scanoutMemoryOriginal;
@@ -252,7 +291,7 @@ uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t byt
 
 mach_vm_address_t fbOriginal;
 bool framebufferStart(IOService *,IOService *){return false;}
-void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceBootProbe",bootProbe,sizeof(bootProbe));target->setProperty("WhateverXeRPLPReferenceScanoutGate",scanoutGate,sizeof(scanoutGate));target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
+void publish(){if(target){target->setProperty("WhateverXeRPLPReferenceRedraw",redrawState,sizeof(redrawState));target->setProperty("WhateverXeRPLPReferenceBootProbe",bootProbe,sizeof(bootProbe));target->setProperty("WhateverXeRPLPReferenceScanoutGate",scanoutGate,sizeof(scanoutGate));target->setProperty("WhateverXeRPLPReferenceProbeGate",acceleratorProbe,sizeof(acceleratorProbe));target->setProperty("WhateverXeRPLPReferenceContext",contextState,sizeof(contextState));target->setProperty("WhateverXeRPLPShutdownGuardReady",shutdownQuery && contextTryRetain && contextLock && wexRplReferenceContextFreeOriginal);target->setProperty("WhateverXeRPLPReferenceBarrier",barrierState,sizeof(barrierState));target->setProperty("WhateverXeRPLPReference",state,sizeof(state));target->setProperty("WhateverXeRPLPReferenceStartup",startup,sizeof(startup));target->setProperty("WhateverXeRPLPReferencePanel",panelState,sizeof(panelState));target->setProperty("WhateverXeRPLPReferenceModules",moduleState,sizeof(moduleState));target->setProperty("WhateverXeRPLPReferenceFirmware",firmwareScan,sizeof(firmwareScan));target->setProperty("WhateverXeRPLPReferenceHandover",handover,sizeof(handover));target->setProperty("WhateverXeRPLPReferenceDisplayPipe",displayPipe,sizeof(displayPipe));}}
 void moduleWorker(thread_call_param_t,thread_call_param_t){
  if(!wexRplReferencePanel() || !moduleLoader || !target || !state[1] || state[4] || state[7] || !moduleState[1])return;
  const char *ids[]{"org.b00t0x.AppleIntelTGLCompat","com.apple.driver.AppleIntelTGLGraphicsFramebuffer","com.apple.driver.AppleIntelTGLGraphics"};
@@ -825,6 +864,7 @@ void init(){
  lilu.onPatcherLoadForce(kernel,nullptr);
  if(wexRplReferencePanel() && earlyRequested())lilu.onKextLoadForce(&firmwareInfo,1,firmwareKext,nullptr);
  if(wexRplReferencePanel() && checkKernelArgument("-wex-rplp-backlight"))lilu.onKextLoadForce(&backlightInfo,1,backlightKext,nullptr);
+ if(wexRplReferencePanel() && redrawRequested())lilu.onKextLoadForce(&redrawInfo,1,redrawKext,nullptr);
  backend.init();
  XeDataAccess::init();if(!wexRplReferencePanel())lilu.onKextLoadForce(&fbInfo,1,kext,nullptr);
  if(wexRplReferencePanel())lilu.onKextLoadForce(&compatInfo,1,kext,nullptr);

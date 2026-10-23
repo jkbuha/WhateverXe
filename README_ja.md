@@ -92,7 +92,7 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 
 | 引数 | 用途 |
 | --- | --- |
-| `gfxrst=` | 起動時framebufferの引継ぎ方式。0：自動（既定）、1：reset、2：copy、3：clear、4：無効。 |
+| `gfxrst=` | 起動時framebufferの引継ぎ方式。0：自動（既定）、1：reset、2：copy、3：clear、4：無効。厳密なmachine判定を行うRPL-P参照backendでは、対応するIOGraphicsFamilyの明示的な `gfxrst=1` のみ有効です。その他の値では引継ぎを変更しません。 |
 | `-wexdbg` | debug buildでログを有効にする。 |
 | `-wexoff` | WhateverXeを無効にする。 |
 | `-wexbeta` | プラグインのOSバージョンチェックを回避する。kernel／driverの一致条件は維持する。 |

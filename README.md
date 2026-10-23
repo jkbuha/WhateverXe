@@ -131,7 +131,7 @@ Alder Lake-N / Twin Lake.
 
 | Argument | Purpose |
 | --- | --- |
-| `gfxrst=` | Boot framebuffer handoff: 0 automatic (default), 1 reset, 2 copy, 3 clear, 4 disable. |
+| `gfxrst=` | Boot framebuffer handoff: 0 automatic (default), 1 reset, 2 copy, 3 clear, 4 disable. The exact-machine RPL-P reference backend supports only explicit `gfxrst=1` on its matching IOGraphicsFamily image; other values leave its handoff unchanged. |
 | `-wexdbg` | Enable debug logging in a debug build. |
 | `-wexoff` | Disable WhateverXe. |
 | `-wexbeta` | Bypass the plugin's OS-version check. Exact kernel/driver checks still apply. |
