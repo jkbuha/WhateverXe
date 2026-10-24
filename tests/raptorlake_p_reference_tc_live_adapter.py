@@ -9,6 +9,8 @@ f=r'''
 #include <cstring>
 #include "kern_raptorlake_p_reference_tc_live.hpp"
 #include "kern_display13_tc.hpp"
+#include "kern_raptorlake_p_reference_voltage.hpp"
+using thread_t=void*;thread_t current_thread(){return (void*)1;}
 using mach_vm_address_t=uintptr_t;
 constexpr uint32_t kIOReturnSuccess=0,kIOReturnNotReady=0xE00002D8,kIOReturnUnsupported=0xE00002C7;
 using IOInterruptState=uintptr_t;struct IOSimpleLock {bool held;} spin;

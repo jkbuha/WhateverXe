@@ -1,11 +1,11 @@
 """Execute actual scoped AGDC callback, pointer binding proof and metadata copy."""
 from pathlib import Path
 import subprocess,tempfile,sys,hashlib
-r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('mach_vm_address_t agdcCallbackOriginal,'):s.index('bool nativeRescanPermitted(){')];body=body.replace('#include "kern_raptorlake_p_training_path.inc"','''struct TrainingPowerIO {};
+r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('mach_vm_address_t agdcCallbackOriginal,'):s.index('bool nativeRescanPermitted(){')];body=body.replace('#include "kern_raptorlake_p_training_path_impl.hpp"','''struct TrainingPowerIO {};
 namespace RaptorLakeP {namespace TrainingRoute {enum class Status {Ready};}}
 struct TrainingLeaseMock {void *path{};bool adopted{},busy{};struct Route {RaptorLakeP::TrainingRoute::Status prepare(TrainingPowerIO&,unsigned){return RaptorLakeP::TrainingRoute::Status::Ready;}}route;}trainingLease;
 uint32_t trainingLeaseState[24]{};void *livePortLock=nullptr;
-void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}uint32_t prepareTrainingPath(void*){return 0;}''');resolver=s[s.index('bool wexRplReferenceAGDCObservationHooks('):s.index('bool wexRplReferenceValidate(){')]
+void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}uint32_t prepareTrainingPath(void*){return 0;}void publishTrainingLease(){}''');resolver=s[s.index('bool wexRplReferenceAGDCObservationHooks('):s.index('bool wexRplReferenceValidate(){')]
 f=r'''
 #include <cassert>
 #include <cstdint>
@@ -24,7 +24,7 @@ bool wexRplReferenceFBAllowed(void*o){return ownerOK&&o==framebufferOwner;}
 bool captureAllowed(){return capturable;}
 bool livePortSelected(void*p){return ownerOK&&portOK&&p==port&&ddi==5;}
 uint32_t nativeAuxBypassRefs(void*p){assert(p==port);return refs;}
-struct Target{std::vector<uint32_t> meta,rows;void setProperty(const char*n,void*p,unsigned bytes){if(!strcmp(n,"WhateverXeRPLPReferenceTrainingLease")){assert(bytes==96);return;}auto&out=!strcmp(n,"WhateverXeRPLPReferenceAGDCMeta")?meta:rows;out.assign((uint32_t*)p,(uint32_t*)p+bytes/4);}} targetObject,*target=&targetObject;
+struct Target{std::vector<uint32_t> meta,rows;void setProperty(const char*n,void*p,unsigned bytes){if(!strcmp(n,"WhateverXeRPLPReferenceTrainingLease")){assert(bytes==128);return;}auto&out=!strcmp(n,"WhateverXeRPLPReferenceAGDCMeta")?meta:rows;out.assign((uint32_t*)p,(uint32_t*)p+bytes/4);}} targetObject,*target=&targetObject;
 unsigned delegates=0;uint32_t returnValue=0;void*lastOwner;unsigned long lastArgument;
 uint32_t delegate(void*o,uint32_t e,unsigned long a,uint32_t v){++delegates;lastOwner=o;lastArgument=a;assert(e==3&&v==7);return returnValue;}
 void*expectedPath=(void*)0x1234;unsigned pathDelegates=0,trainingDelegates=0;

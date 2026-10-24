@@ -2,7 +2,9 @@
 // anonymous namespace after TC3 ownership helpers. No user addresses or modes.
 mach_vm_address_t trainingAllocateAnyOriginal,trainingAllocateFixedOriginal,trainingFreeOriginal;
 mach_vm_address_t trainingResourcesOriginal,trainingPGGet,trainingPGPutOriginal,trainingEndOriginal,trainingPortWriteOriginal;
-uint32_t trainingLeaseState[24]{1};
+uint32_t trainingLeaseState[32]{2};
+mach_vm_address_t trainingConfiguredOriginal,trainingVoltageOriginal,trainingPatternOriginal;
+uint32_t trainingSignal[20]{1};
 struct TrainingPathLease {
  void *path{},*port{};IOService *fb{};OSObject *power{};
  bool logicalPG{},adopted{},freed{},releasing{},busy{};
@@ -29,18 +31,18 @@ bool trainingHardwareIdle(){
  TrainingPowerIO io;
  // Disconnection invalidates the AUX witness but not the separately held
  // PipeB lease. Cleanup reads only that powered bank and the owned DDI.
- auto core=io.read(0x45404);if(core==~0U || (core&0x3000)!=0x3000)return false;
+ auto core=io.read(0x45404);if(core==~0U || (core&0x300F)!=0x300F)return false;
  auto b=io.read(0x64500),p=io.read(0x71008),f=io.read(0x61400),t=io.read(0x61540);
  return b!=~0U&&p!=~0U&&f!=~0U&&t!=~0U && (b&0x80000080U)==0x80U && !(p&0xC0000000U) && !((f|t)&0x80000000U);
 }
 void trainingCleanupPower(){
- if(!trainingLease.power || !trainingLease.freed || trainingLease.logicalPG || trainingPGRefs() || !trainingHardwareIdle())return;
+ if(!trainingLease.power || !trainingLease.freed || trainingLease.logicalPG || trainingLease.busy || trainingLease.adopting || trainingPGRefs() || !trainingHardwareIdle())return;
  TrainingPowerIO io;auto result=Display13Power::release(io,trainingLease.powerState,trainingLease.powerLease);
  trainingLeaseState[17]=static_cast<uint32_t>(result.status);
  if(result.status!=Display13Power::Status::Complete)return;
  trainingLease.fb->release();trainingLease.power->release();static_cast<OSObject *>(trainingLease.port)->release();
  trainingLease.fb=nullptr;trainingLease.power=nullptr;trainingLease.port=nullptr;trainingLease.path=nullptr;
- trainingLease.freed=false;trainingLease.adopted=false;trainingLease.route={};trainingLease.powerState={};++trainingLeaseState[18];
+ trainingLease.freed=false;trainingLease.adopted=false;trainingLease.releasing=false;trainingLease.busy=false;trainingLease.adopting=nullptr;trainingLease.route={};trainingLease.powerState={};++trainingLeaseState[18];
 }
 void trainingGetPG(void *power,uint32_t pg){
  IORecursiveLockLock(livePortLock);reinterpret_cast<void (*)(void *,uint32_t)>(trainingPGGet)(power,pg);IORecursiveLockUnlock(livePortLock);
@@ -65,6 +67,7 @@ uint32_t prepareTrainingPath(void *port){
  if(!livePortSelected(port) || !trainingWorkloop())return 1;
  IORecursiveLockLock(livePortLock);
  auto finish=[&](uint32_t code){trainingLeaseState[3]=code;IORecursiveLockUnlock(livePortLock);return code;};
+ if(trainingLease.freed && !trainingLease.path && !trainingLease.port && !trainingLease.power && !trainingLease.powerLease.owner && !trainingLease.logicalPG && !trainingLease.busy && !trainingLease.adopting){trainingLease.freed=false;++trainingLeaseState[23];}
  if(trainingLease.busy || trainingLease.adopting || trainingLease.freed)return finish(2);
  if(trainingLease.path){if(trainingLease.port!=port)return finish(3);return finish(0);}
  // Existing ordinary native paths are never replaced or commandeered.
@@ -158,4 +161,55 @@ void trainingPortWrite(void *port,uint32_t reg,uint32_t value){
   IORecursiveLockUnlock(livePortLock);return;
  }
  reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(trainingPortWriteOriginal)(port,reg,value);
+}
+
+uint32_t trainingConfiguredLanes(void *port){
+ if(!livePortSelected(port))return reinterpret_cast<uint32_t (*)(void *)>(trainingConfiguredOriginal)(port);
+ IORecursiveLockLock(livePortLock);LivePortIO io{port};uint32_t mask=0;
+ if(livePortLease.witness(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port))){
+  auto raw=io.read(0x16E8C0),assigned=io.read(0x16E8A0);trainingSignal[1]=raw;trainingSignal[18]=assigned;
+  if(raw!=~0U && assigned!=~0U)mask=RaptorLakeP::ReferenceVoltage::physicalMask(raw&15U,assigned&15U);
+  if(mask && liveVoltageThread==current_thread() && liveVoltagePort==port)mask=15;
+ }
+ trainingSignal[2]=mask;IORecursiveLockUnlock(livePortLock);return mask;
+}
+void trainingVoltage(void *port,uint32_t swing,uint32_t emphasis,void *custom){
+ if(!livePortSelected(port) || custom){reinterpret_cast<void (*)(void *,uint32_t,uint32_t,void *)>(trainingVoltageOriginal)(port,swing,emphasis,custom);return;}
+ IORecursiveLockLock(livePortLock);++trainingSignal[3];trainingSignal[4]=swing;trainingSignal[5]=emphasis;
+ uint32_t rate=0;memcpy(&rate,static_cast<uint8_t *>(port)+0x128,4);trainingSignal[6]=rate;
+ RaptorLakeP::ReferenceVoltage::Drive drive{};Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
+ bool valid=RaptorLakeP::ReferenceVoltage::select(swing,emphasis,rate,drive);
+ auto status=valid?RaptorLakeP::ReferenceVoltage::wake(io,coordinates):Display13TC::Status::Invalid;trainingSignal[7]=static_cast<uint32_t>(status);
+ if(status==Display13TC::Status::Complete){
+  auto priorThread=liveVoltageThread;auto priorPort=liveVoltagePort;liveVoltageThread=current_thread();liveVoltagePort=port;
+  trainingSignal[8]=drive.swing;trainingSignal[9]=drive.preshoot;trainingSignal[10]=drive.emphasis;
+  reinterpret_cast<void (*)(void *,uint32_t,uint32_t,void *)>(trainingVoltageOriginal)(port,swing,emphasis,&drive);
+  liveVoltageThread=priorThread;liveVoltagePort=priorPort;
+ }else ++trainingSignal[11];
+ IORecursiveLockUnlock(livePortLock);
+}
+uint32_t trainingPattern(void *path,uint32_t pattern){
+ auto result=reinterpret_cast<uint32_t (*)(void *,uint32_t)>(trainingPatternOriginal)(path,pattern);
+ if(result)return result;
+ IORecursiveLockLock(livePortLock);
+ if(path!=trainingLease.path || !trainingLease.port){IORecursiveLockUnlock(livePortLock);return result;}
+ TrainingPowerIO io;
+ auto port=static_cast<uint8_t *>(trainingLease.port);uint8_t mst=0,enhanced=0;memcpy(&mst,port+0x117,1);memcpy(&enhanced,port+0x11A,1);
+ if(pattern<=5 && !mst && enhanced<=1 && io.powerHeld()){
+  auto before=io.read(0x61540);trainingSignal[12]=before;
+  if(before!=~0U){auto wanted=RaptorLakeP::ReferenceVoltage::framing(before,enhanced);if(wanted!=before){io.write(0x61540,wanted);++trainingSignal[15];}
+   auto after=io.read(0x61540);trainingSignal[13]=after;trainingSignal[14]=enhanced;if(after!=wanted)++trainingSignal[16];
+  }
+ }else ++trainingSignal[17];
+ IORecursiveLockUnlock(livePortLock);return result;
+}
+void publishTrainingLease(){
+ IORecursiveLockLock(livePortLock);
+ trainingLeaseState[24]=(trainingLease.path?1U:0U)|(trainingLease.port?2U:0U)|(trainingLease.power?4U:0U)|(trainingLease.logicalPG?8U:0U)|
+  (trainingLease.adopted?16U:0U)|(trainingLease.freed?32U:0U)|(trainingLease.releasing?64U:0U)|(trainingLease.busy?128U:0U)|(trainingLease.adopting?256U:0U);
+ trainingLeaseState[25]=trainingPGRefs();trainingLeaseState[26]=trainingLease.powerState.owned;trainingLeaseState[27]=trainingLease.powerState.borrowed;
+ trainingLeaseState[28]=trainingLease.powerState.faulted;trainingLeaseState[29]=trainingLease.powerLease.owner?1:0;
+ trainingLeaseState[30]=trainingLease.powerState.refs[static_cast<unsigned>(Display13Power::Domain::PipeB)];trainingLeaseState[31]=trainingLease.powerState.ready;
+ target->setProperty("WhateverXeRPLPReferenceTrainingLease",trainingLeaseState,sizeof(trainingLeaseState));
+ target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));IORecursiveLockUnlock(livePortLock);
 }
