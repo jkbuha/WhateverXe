@@ -495,7 +495,8 @@ bool captureAllowed(){
 // Root-triggered TC3 rescan. The ordinary donor connectionProbe deliberately
 // ignores external heads. Keep this native controller action on its workloop;
 // no arbitrary connector, mode, function pointer or register is user supplied.
-mach_vm_address_t agdcCallbackOriginal;
+mach_vm_address_t agdcCallbackOriginal,pathLookupOriginal,portTrainingOriginal;
+uint32_t trainingPathCalls,trainingPathFound,portTrainingCalls,portTrainingResult;
 uint32_t agdcTraceReady,agdcTraceSequence,agdcTraceRows[32][8]{};
 void recordAGDC(uint32_t kind,uint32_t event,unsigned long argument,uint32_t value,uint32_t result){
  auto seq=__sync_add_and_fetch(&agdcTraceSequence,1);
@@ -510,6 +511,29 @@ uint32_t observedAGDCCallback(void *owner,uint32_t event,unsigned long argument,
  if(own)recordAGDC(2,event,argument,value,result);
  return result;
 }
+void *observedPathLookup(void *port){
+ auto path=reinterpret_cast<void *(*)(void *)>(pathLookupOriginal)(port);
+ if(livePortSelected(port)){
+  __sync_fetch_and_add(&trainingPathCalls,1);if(path)__sync_fetch_and_add(&trainingPathFound,1);
+  recordAGDC(3,0,5,path?1:0,0);
+ }
+ return path;
+}
+uint32_t observedPortTraining(void *port,void *request){
+ const bool own=livePortSelected(port);uint32_t portIndex=~0U,value=0;
+ if(own){
+  __sync_fetch_and_add(&portTrainingCalls,1);
+  if(request){memcpy(&portIndex,request,4);auto bytes=static_cast<uint8_t *>(request);value=bytes[0x13]|(static_cast<uint32_t>(bytes[0x12])<<8);}
+  recordAGDC(4,portIndex,5,value,~0U);
+ }
+ auto result=reinterpret_cast<uint32_t (*)(void *,void *)>(portTrainingOriginal)(port,request);
+ if(own){
+  uint32_t status=~0U;if(request)memcpy(&status,static_cast<uint8_t *>(request)+0x38,4);
+  portTrainingResult=result;recordAGDC(5,portIndex,5,status,result);
+ }
+ return result;
+}
+
 bool nativeAGDCCallbackBound(){
  if(!framebufferOwner || !wexRplReferenceFBAllowed(framebufferOwner))return false;
  uintptr_t function=0,context=0;memcpy(&function,reinterpret_cast<uint8_t *>(framebufferOwner)+0x1C00,8);
@@ -518,7 +542,7 @@ bool nativeAGDCCallbackBound(){
 }
 void publishAGDCObservation(){
  if(!target || !captureAllowed())return;
- uint32_t meta[12]{1,agdcTraceReady,agdcTraceSequence,nativeAGDCCallbackBound(),~0U,~0U,~0U,~0U,~0U,0,0,0};
+ uint32_t meta[16]{2,agdcTraceReady,agdcTraceSequence,nativeAGDCCallbackBound(),~0U,~0U,~0U,~0U,~0U,0,0,0};
  auto port=getPortEntry?reinterpret_cast<OSObject *(*)(uint32_t)>(getPortEntry)(5):nullptr;uint32_t ddi=~0U;
  if(observerPort(port,ddi) && ddi==5){
   memcpy(&meta[4],reinterpret_cast<uint8_t *>(port)+0x120,4);
@@ -529,6 +553,7 @@ void publishAGDCObservation(){
   uint8_t maximum=0;memcpy(&maximum,reinterpret_cast<uint8_t *>(port)+0x11,1);meta[10]=maximum;
   memcpy(&meta[11],reinterpret_cast<uint8_t *>(port)+0x124,4);
  }
+ meta[12]=trainingPathCalls;meta[13]=trainingPathFound;meta[14]=portTrainingCalls;meta[15]=portTrainingResult;
  uint32_t rows[32][8]{};
  for(unsigned i=0;i<32;++i){auto seq=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE);memcpy(rows[i],agdcTraceRows[i],32);if(!seq || seq!=rows[i][0] || seq!=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE))memset(rows[i],0,32);}
  target->setProperty("WhateverXeRPLPReferenceAGDCMeta",meta,sizeof(meta));
@@ -1064,12 +1089,25 @@ bool wexRplReferenceNativeHotplugHooks(KernelPatcher &p,size_t i,mach_vm_address
 
 bool wexRplReferenceAGDCObservationHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
  if(!checkKernelArgument("-wex-rplp-tcss-live"))return true;
- const char *name="__ZN24AppleIntelBaseController12CallBackAGDCE31kAGDCRegisterLinkControlEvent_tmj";
- auto entry=p.solveSymbol(i,name,a,n);p.clearError();
- const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x20};
- bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && __atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) &&
-  n>=0x9F9CA+sizeof(prefix) && entry==a+0x9F9CA && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
- if(ok){KernelPatcher::RouteRequest route{name,observedAGDCCallback,agdcCallbackOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ const char *names[]{"__ZN24AppleIntelBaseController12CallBackAGDCE31kAGDCRegisterLinkControlEvent_tmj",
+  "__ZN21AppleIntelDisplayPath18getFirstPathByPortEP14AppleIntelPort","__ZN14AppleIntelPort12linkTrainingEP18AGDCDPPortConfig_t"};
+ const uint32_t offsets[]{0x9F9CA,0xE9AAA,0x26C54};
+ const uint8_t prefixes[3][20]{
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x20},
+  {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x30,0x48,0xFF,0x05,0xE4,0x48,0x08,0x00,0x49},
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0xB8,0x00,0x00,0x00}};
+ const unsigned lengths[]{15,19,20};
+ bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && __atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE);
+ for(unsigned x=0;ok&&x<3;x++){
+  auto entry=p.solveSymbol(i,names[x],a,n);p.clearError();
+  ok=entry==a+offsets[x] && n>=offsets[x]+lengths[x] && !memcmp(reinterpret_cast<void *>(entry),prefixes[x],lengths[x]);
+ }
+ if(ok){
+  KernelPatcher::RouteRequest routes[]{
+   {names[0],observedAGDCCallback,agdcCallbackOriginal},{names[1],observedPathLookup,pathLookupOriginal},
+   {names[2],observedPortTraining,portTrainingOriginal}};
+  ok=p.routeMultiple(i,routes,3,a,n);p.clearError();
+ }
  agdcTraceReady=ok;return ok;
 }
 
