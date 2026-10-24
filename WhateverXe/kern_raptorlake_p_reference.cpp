@@ -257,6 +257,8 @@ uint32_t livePhyTrace[16]{2,0,0,0,0,0,0,0,~0U,0,0,0};
 // Captured under livePortLock. Retain the first programming sequence and the
 // latest value for every allowed register; no extra hardware reads are added.
 uint32_t livePhyRegisters[22][8]{},livePhyWrites[64][8]{},livePhyWriteCount;
+mach_vm_address_t liveLaneMaskOriginal,liveSetLanesOriginal;
+uint32_t liveLaneState[12]{1},liveAuxTrace[256][8]{},liveAuxTraceCount;
 struct LivePortIO {
  void *port;
  uint32_t read(uint32_t reg){return backend.readReg32(reg);}
@@ -278,6 +280,8 @@ void publishLivePort(){
  livePortState[13]=livePortLease.nativeResult;livePortState[14]=livePortLease.writes;
  if(target)target->setProperty("WhateverXeRPLPReferenceTCLive",livePortState,sizeof(livePortState));
  if(target){
+  target->setProperty("WhateverXeRPLPReferenceTCLanes",liveLaneState,sizeof(liveLaneState));
+  target->setProperty("WhateverXeRPLPReferenceTCAuxTrace",liveAuxTrace,liveAuxTraceCount*sizeof(liveAuxTrace[0]));
   target->setProperty("WhateverXeRPLPReferenceTCPhy",livePhyTrace,sizeof(livePhyTrace));
   target->setProperty("WhateverXeRPLPReferenceTCPhyRegisters",livePhyRegisters,sizeof(livePhyRegisters));
   target->setProperty("WhateverXeRPLPReferenceTCPhyWrites",livePhyWrites,livePhyWriteCount*sizeof(livePhyWrites[0]));
@@ -300,9 +304,15 @@ uint32_t livePortAUX(void *port,uint32_t command,uint32_t *data,uint32_t bytes,b
  if(!livePortSelected(port))return static_cast<uint32_t>(kIOReturnNotReady);
  IORecursiveLockLock(livePortLock);LivePortIO io{port};
  const bool ready=livePortLease.witness(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port));
- uint32_t result=static_cast<uint32_t>(kIOReturnNotReady);
+ uint32_t result=static_cast<uint32_t>(kIOReturnNotReady),request=0;
+ if(data && bytes)memcpy(&request,data,bytes<4?bytes:4);
  if(ready && portAUXOriginal){++livePortState[6];result=reinterpret_cast<uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t,bool)>(portAUXOriginal)(port,command,data,bytes,retry);}
  else ++livePortState[7];
+ if(liveAuxTraceCount<256){
+  auto &row=liveAuxTrace[liveAuxTraceCount];row[0]=liveAuxTraceCount+1;row[1]=command;row[2]=bytes;row[3]=retry;
+  row[4]=request;row[5]=0;if(data && bytes)memcpy(&row[5],data,bytes<4?bytes:4);
+  row[6]=result;row[7]=ready;++liveAuxTraceCount;
+ }
  IORecursiveLockUnlock(livePortLock);return result;
 }
 
@@ -319,6 +329,34 @@ struct LivePhyIO {
  void unlock(IOInterruptState state){IOSimpleLockUnlockEnableInterrupt(livePhyLock,state);}
  void bankFault(){livePhyFault=1;++livePortState[15];}
 };
+// ADLP always uses modular FIA: TC3 belongs to FIA2, slot 0. Native TGL
+// getters/setters instead use FIA1 slot 2. Keep the paired correction scoped
+// to the physically owned TC3 lease; preserve the adjacent port's fields.
+uint32_t livePortLaneMask(void *port){
+ if(!livePortSelected(port))return liveLaneMaskOriginal?reinterpret_cast<uint32_t (*)(void *)>(liveLaneMaskOriginal)(port):0;
+ IORecursiveLockLock(livePortLock);++liveLaneState[1];LivePortIO io{port};uint32_t mask=0;
+ if(livePortLease.witness(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port))){
+  auto raw=io.read(0x16E8A0);liveLaneState[3]=raw;
+  if(raw!=~0U){auto value=raw&15U;if(value==1 || value==2 || value==4 || value==8 || value==3 || value==12 || value==15)mask=value;}
+ }
+ liveLaneState[4]=mask;if(!mask)++liveLaneState[2];IORecursiveLockUnlock(livePortLock);return mask;
+}
+void livePortSetLanes(void *port,uint32_t lanes){
+ if(!livePortSelected(port)){if(liveSetLanesOriginal)reinterpret_cast<void (*)(void *,uint32_t)>(liveSetLanesOriginal)(port,lanes);return;}
+ IORecursiveLockLock(livePortLock);++liveLaneState[5];liveLaneState[6]=lanes;
+ auto mask=livePortLaneMask(port);unsigned capacity=mask==15?4:(mask==3 || mask==12)?2:mask?1:0;
+ LivePortIO io{port};auto buffer=capacity?io.read(0x64500):~0U;
+ // DP-alt lane reversal is invalid in Linux's ADLP programming contract.
+ if((lanes!=1 && lanes!=2 && lanes!=4) || lanes>capacity || buffer==~0U || (buffer&(1U<<16))){++liveLaneState[7];IORecursiveLockUnlock(livePortLock);return;}
+ const auto irq=IOSimpleLockLockDisableInterrupt(livePhyLock);
+ auto before=io.read(0x16E8C0);liveLaneState[8]=before;
+ if(before!=~0U){
+  auto desired=(before&~15U)|((1U<<lanes)-1);io.write(0x16E8C0,desired);++liveLaneState[10];
+  auto after=io.read(0x16E8C0);liveLaneState[9]=after;if(after!=desired)++liveLaneState[11];
+ }else ++liveLaneState[7];
+ IOSimpleLockUnlockEnableInterrupt(livePhyLock,irq);IORecursiveLockUnlock(livePortLock);
+}
+
 void recordPhyAccess(uint32_t index,uint32_t raw,const Display13TC::Result &result,bool write,uint32_t requested){
  ++livePhyTrace[write?2:1];livePhyTrace[3]=index;livePhyTrace[4]=raw;
  livePhyTrace[5]=static_cast<uint32_t>(result.status);livePhyTrace[6]=result.before;livePhyTrace[7]=result.after;
@@ -488,6 +526,8 @@ void publishAGDCObservation(){
   memcpy(&meta[6],reinterpret_cast<uint8_t *>(port)+0x554,4);
   uint8_t sinks=0;memcpy(&sinks,reinterpret_cast<uint8_t *>(port)+0xF8,1);meta[7]=sinks;
   meta[8]=nativeAuxBypassRefs(port);meta[9]=livePortLease.auxRequest;
+  uint8_t maximum=0;memcpy(&maximum,reinterpret_cast<uint8_t *>(port)+0x11,1);meta[10]=maximum;
+  memcpy(&meta[11],reinterpret_cast<uint8_t *>(port)+0x124,4);
  }
  uint32_t rows[32][8]{};
  for(unsigned i=0;i<32;++i){auto seq=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE);memcpy(rows[i],agdcTraceRows[i],32);if(!seq || seq!=rows[i][0] || seq!=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE))memset(rows[i],0,32);}
@@ -977,17 +1017,20 @@ bool wexRplReferenceLivePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,
   portBindings[1]==2 && !portBindings[2] && n>=0x902FA;
  const char *names[]{"__ZN17AppleIntelPortHAL11setPortModeEN14AppleIntelPort8PortModeE",
   "__ZN14AppleIntelPort11setPortModeENS_8PortModeE","__ZN14AppleIntelPort18enablePowerWellAuxEv","__ZN14AppleIntelPort19disablePowerWellAuxEv",
-  "__ZN17AppleIntelPortHAL15ReadDekelPhyRegEj","__ZN17AppleIntelPortHAL16WriteDekelPhyRegEjj"};
- const uint32_t offsets[]{0x8F344,0x262EA,0x2972C,0x29768,0x90234,0x902EA};
- const uint8_t prefixes[6][16]{
+  "__ZN17AppleIntelPortHAL15ReadDekelPhyRegEj","__ZN17AppleIntelPortHAL16WriteDekelPhyRegEjj",
+  "__ZN17AppleIntelPortHAL26getDklPhyLaneConfigBitMaskEv","__ZN17AppleIntelPortHAL15setFIALaneCountEj"};
+ const uint32_t offsets[]{0x8F344,0x262EA,0x2972C,0x29768,0x90234,0x902EA,0x8FAE0,0x8FDC4};
+ const uint8_t prefixes[8][16]{
   {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC},
   {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x20,0x48,0xFF,0x05,0x64,0x35},
   {0x55,0x48,0x89,0xE5,0x48,0xFF,0x05,0x51,0x0B,0x12,0x00,0x48,0xFF,0x05,0x52,0xFF},
   {0x55,0x48,0x89,0xE5,0x48,0xFF,0x05,0x1D,0x0B,0x12,0x00,0x48,0xFF,0x05,0x16,0xFF},
   {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0xFF,0x05,0xB3,0xD2,0x0C},
-  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0xFF,0x05,0x0C,0xD2}};
- mach_vm_address_t entries[6]{};
- for(unsigned x=0;ok&&x<6;x++){
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0xFF,0x05,0x0C,0xD2},
+  {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0xFF,0x05,0xEA,0xD7,0x0C,0x00,0x48,0xFF},
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0xFF,0x05,0xD2,0xD5}};
+ mach_vm_address_t entries[8]{};
+ for(unsigned x=0;ok&&x<8;x++){
   entries[x]=p.solveSymbol(i,names[x],a,n);p.clearError();
   ok=entries[x]==a+offsets[x] && n>=offsets[x]+16 && !memcmp(reinterpret_cast<void *>(entries[x]),prefixes[x],16);
  }
@@ -996,8 +1039,9 @@ bool wexRplReferenceLivePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,
   liveBaseMode=entries[1];liveAuxEnable=entries[2];liveAuxDisable=entries[3];
   KernelPatcher::RouteRequest routes[]{
    {names[0],livePortMode,livePortOriginal},{names[4],livePortReadPhy,liveReadPhyOriginal},
-   {names[5],livePortWritePhy,liveWritePhyOriginal}};
-  ok=p.routeMultiple(i,routes,3,a,n);p.clearError();
+   {names[5],livePortWritePhy,liveWritePhyOriginal},
+   {names[6],livePortLaneMask,liveLaneMaskOriginal},{names[7],livePortSetLanes,liveSetLanesOriginal}};
+  ok=p.routeMultiple(i,routes,5,a,n);p.clearError();
  }
  __atomic_store_n(&livePortReady,ok,__ATOMIC_RELEASE);publishLivePort();
  SYSLOG("rplp","optional TC3 live transition ready=%u; awaiting privileged AUX preflight",ok);
