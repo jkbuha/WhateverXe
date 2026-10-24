@@ -1155,6 +1155,13 @@ bool wexRplReferenceAGDCObservationHooks(KernelPatcher &p,size_t i,mach_vm_addre
  agdcTraceReady=ok;return ok;
 }
 
+bool wexRplReferenceExternalPort(const void *port){
+ return checkKernelArgument("-wex-rplp-training-path") && livePortSelected(const_cast<void *>(port));
+}
+bool wexRplReferenceExternalNeedsMode(const void *owner,const void *head,const void *path){
+ return checkKernelArgument("-wex-rplp-training-path") && trainingExternalNeedsMode(owner,head,path);
+}
+
 bool wexRplReferencePanelMode(const void *owner,const void *head,const void *path){
  if(!wexRplReferencePanel() || !state[1] || state[7] || !owner || owner!=framebufferOwner || !head || !path || !wexRplReferenceFBAllowed(owner))return false;
  auto fb=static_cast<const IOService *>(head);auto meta=fb->getMetaClass();

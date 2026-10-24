@@ -20,6 +20,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceRecoveryExtendedRequested();\nextern bool wexRplReferenceBlitPitchRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
  gate+='class KernelPatcher;\nextern bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceLivePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNativeHotplugHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceAGDCObservationHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNVRAMHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
  gate+='extern bool wexRplReferencePanelMode(const void *,const void *,const void *);\n'
+ gate+='extern bool wexRplReferenceExternalPort(const void *);\nextern bool wexRplReferenceExternalNeedsMode(const void *,const void *,const void *);\n'
  gate+='extern bool wexRplReferenceTCSSSelected();\nextern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
@@ -70,6 +71,38 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  mode_before='\tif (!NGreen::callback->isRealTGL) {\n\t\tNGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A'
  mode_after='\tif (!NGreen::callback->isRealTGL && (!checkKernelArgument("-wex-rplp-training-path") || wexRplReferencePanelMode(that,param_1,param_2))) {\n\t\tNGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A'
  edit('kern_gen11.cpp',mode_before,mode_after)
+
+ # These native Port methods return a bool and IOReturn respectively. The
+ # pinned imported declarations discard both results. Preserve the private
+ # ABI and bypass panel-only lane overrides for the qualified external port.
+ for name in ['kern_gen11.hpp','kern_gen11.cpp']:
+  for fn,result in [('computeLaneCount','uint8_t'),('setupOptimalLaneCount','uint32_t')]:
+   before=('static void '+fn) if name.endswith('.hpp') else ('void Gen11::'+fn)
+   after=('static '+result+' '+fn) if name.endswith('.hpp') else (result+' Gen11::'+fn)
+   edit(name,before,after)
+ start='uint8_t Gen11::computeLaneCount('
+ end='IOReturn Gen11::wrapICLReadAUX('
+ p=out/'kern_gen11.cpp';text=p.read_text();a=text.index(start);b=text.index(end,a);body=text[a:b]
+ body=body.replace('if (!laneCount) return;','if (!laneCount) return 0;')
+ for fn in ['computeLaneCount','setupOptimalLaneCount']:
+  call='FunctionCast('+fn+', callback->o'+fn+')(that, timing, '
+  assert body.count(call)==1
+  body=body.replace(call,'auto nativeResult = '+call)
+ body=body.replace('if (NGreen::callback->isRealTGL)\n\t\treturn;',
+                   'if (NGreen::callback->isRealTGL || wexRplReferenceExternalPort(that))\n\t\treturn nativeResult;')
+ for old,new in [('\t\t*laneCount = hwLanes;\n}', '\t\t*laneCount = hwLanes;\n\treturn nativeResult;\n}'),
+                 ('\t\tcached = hwLanes;\n}', '\t\tcached = hwLanes;\n\treturn nativeResult;\n}')]:
+  assert body.count(old)==1;body=body.replace(old,new)
+ p.write_text(text[:a]+body+text[b:])
+ # Suppressing pipe-A differences is valid only for the retained panel.
+ edit('kern_gen11.cpp','if (!NGreen::callback->isRealTGL && param_3) {',
+      'if (!NGreen::callback->isRealTGL && param_3 && (!checkKernelArgument("-wex-rplp-training-path") || wexRplReferencePanelMode(that,param_1,param_2))) {')
+ # A newly adopted native path may be marked active before its hardware pipe
+ # is enabled. Force the ordinary native full modeset for that exact lease.
+ old='\treturn FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);'
+ new='\tauto nativeResult = FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);\n\treturn wexRplReferenceExternalNeedsMode(that,param_1,param_2) ? 1 : nativeResult;'
+ edit('kern_gen11.cpp',old,new)
+
  # Preserve the qualified panel/pipe/head counts. Only expose the physical
  # ADL-P port domain under the explicit exact-owner TCSS trial gate. The
  # imported three-port experiment otherwise hides every connected TC port.

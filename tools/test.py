@@ -22,6 +22,7 @@ if a.reference_source and a.accelerator:jobs += [('raptorlake_p_reference_recove
 if a.reference_source:jobs += [('raptorlake_p_training_path_installer_donor',[sys.executable,str(R/'tests/raptorlake_p_training_path_installer.py'),str(a.reference_framebuffer.resolve())],None)]
 if a.reference_source:jobs += [('raptorlake_p_reference_tc_agdc_donor',[sys.executable,str(R/'tests/raptorlake_p_reference_tc_agdc.py'),str(a.reference_framebuffer.resolve())],None)]
 if a.reference_source:jobs += [('raptorlake_p_reference_tc_rescan_donor',[sys.executable,str(R/'tests/raptorlake_p_reference_tc_rescan.py'),str(a.reference_framebuffer.resolve())],None)]
+if a.reference_source:jobs += [('raptorlake_p_lane_mode_abi',[sys.executable,str(R/'tests/raptorlake_p_lane_mode_abi.py'),str(a.reference_source.resolve()),str(a.reference_framebuffer.resolve())],None)]
 if a.reference_source:jobs += [('raptorlake_p_reference_metadata',[sys.executable,str(R/'tests/raptorlake_p_reference_metadata.py'),str(a.reference_source.resolve()),str(a.reference_framebuffer.resolve())],None)]
 if a.reference_source:jobs += [('raptorlake_p_reference_refinement',[sys.executable,str(R/'tests/raptorlake_p_reference_refinement.py'),str(a.reference_source.resolve()),str(a.reference_framebuffer.resolve())],None)]
 def check(job):

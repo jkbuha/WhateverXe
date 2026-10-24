@@ -286,6 +286,18 @@ uint32_t trainingPattern(void *path,uint32_t pattern){
  }else ++trainingSignal[17];
  IORecursiveLockUnlock(livePortLock);return result;
 }
+bool trainingExternalNeedsMode(const void *owner,const void *head,const void *path){
+ if(owner!=framebufferOwner || !head || !path || !livePortLock)return false;
+ IORecursiveLockLock(livePortLock);bool needs=false;
+ if(trainingLease.adopted && path==trainingLease.path && head==trainingLease.fb && livePortSelected(trainingLease.port)){
+  TrainingPowerIO io;
+  if(io.powerHeld()){
+   auto conf=io.read(0x71008);trainingLink[12]=conf;++trainingLink[10];
+   needs=conf!=~0U && !(conf&0x80000000U);if(needs)++trainingLink[11];
+  }
+ }
+ IORecursiveLockUnlock(livePortLock);return needs;
+}
 void publishTrainingLease(){
  IORecursiveLockLock(livePortLock);
  trainingLeaseState[24]=(trainingLease.path?1U:0U)|(trainingLease.port?2U:0U)|(trainingLease.power?4U:0U)|(trainingLease.logicalPG?8U:0U)|

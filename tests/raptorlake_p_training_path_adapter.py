@@ -108,6 +108,9 @@ int main(){
  trainingLease.busy=true;assert(!trainingResources(&fbObj,5,0));trainingLease.busy=false;
  assert(!trainingResources(&fbObj,5,1));assert(!trainingResources(&fbObj,4,0));
  assert(trainingResources(&fbObj,5,0)&&trainingLease.adopted&&trainingLease.route.adopted&&!trainingLease.logicalPG&&trainingPGRefs()==1&&allocs==1);
+ assert(trainingExternalNeedsMode(&controller,&fbObj,pathMem)&&trainingLink[11]==1);
+ assert(!trainingExternalNeedsMode(&controller,&portObj,pathMem)&&!trainingExternalNeedsMode(&portObj,&fbObj,pathMem));
+ backend.regs[0x71008]=0xC0000000;assert(!trainingExternalNeedsMode(&controller,&fbObj,pathMem));backend.regs[0x71008]=0;
  assert(!trainingRelease());trainingPutDDI(&powerObj,5);assert(backend.regs[0x45454]==3&&powerObj.refs==1);
  trainingFree(pathMem);assert(trainingLease.power&&powerObj.refs==1);trainingPutPG(&powerObj,3);
  assert(!trainingLease.power&&!fbObj.refs&&!powerObj.refs&&!portObj.refs&&backend.regs[0x45404]==0xC0F);
