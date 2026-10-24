@@ -26,7 +26,7 @@ struct Backend {
 } backend;
 void *framebufferOwner=(void *)1;unsigned nativeModes,baseModes,enables,disables,auxCalls,auxRefs,mode;bool owner=true;unsigned ddi=5;
 bool auxBypass=false;uint32_t nativeAuxBypassRefs(void*){return auxBypass?auxRefs:~0U;}
-struct Target {unsigned publishes;void setProperty(const char *n,void *p,size_t s){assert(p&&((!strcmp(n,"WhateverXeRPLPReferenceTCLive")&&s==64)||(!strcmp(n,"WhateverXeRPLPReferenceTCPhy")&&s==48)));++publishes;}} targetObject,*target=&targetObject;
+struct Target {unsigned publishes;void setProperty(const char *n,void *p,size_t s){assert(p&&((!strcmp(n,"WhateverXeRPLPReferenceTCLive")&&s==64)||(!strcmp(n,"WhateverXeRPLPReferenceTCPhy")&&s==64)||(!strcmp(n,"WhateverXeRPLPReferenceTCPhyRegisters")&&s==22*8*4)||(!strcmp(n,"WhateverXeRPLPReferenceTCPhyWrites")&&s<=64*8*4)));++publishes;}} targetObject,*target=&targetObject;
 bool observerPort(void *p,uint32_t &d){d=ddi;return p==portObject&&owner;}
 uint32_t originalMode(void *,uint32_t){++nativeModes;return 0x77;}
 uint32_t baseMode(void *p,uint32_t m){assert(p==portObject);++baseModes;mode=m;return 0;}
@@ -61,7 +61,16 @@ int main(){
  auxBypass=true;assert(livePortMode(portObject,3)==kIOReturnSuccess&&livePortLease.auxRequest&&auxRefs==1);
  assert(livePortMode(portObject,0)==kIOReturnSuccess&&!livePortLease.owner&&!livePortLease.auxRequest&&!auxRefs&&!(backend.readReg32(0x45444)&0x800));
  assert(livePhyTrace[1]>0&&livePhyTrace[2]>0&&livePhyTrace[11]==2);
- assert(targetObject.publishes>=4);
+ assert(livePhyTrace[0]==2&&livePhyTrace[8]==0x34&&livePhyTrace[9]==1&&livePhyTrace[15]==0);
+ const auto savedFailure=livePhyTrace[8];
+ Display13TC::Result failure;failure.status=Display13TC::Status::Readback;failure.before=0x11;failure.after=0x22;failure.writes=1;
+ for(unsigned i=0;i<100;i++)recordPhyAccess(0x38,0x46030,failure,true,0x33+i);
+ assert(livePhyWriteCount==64&&livePhyWrites[0][1]==0x38&&livePhyWrites[0][3]==0x90000000);
+ assert(livePhyRegisters[4][3]==101&&livePhyRegisters[4][4]==0x33+99&&livePhyRegisters[4][5]==0x11&&livePhyRegisters[4][6]==0x22);
+ assert(livePhyTrace[8]==savedFailure); // First failure is immutable across retries.
+ livePhyTrace[8]=~0U;recordPhyAccess(0x38,0x46030,failure,true,0x99);
+ assert(livePhyTrace[12]==0x11&&livePhyTrace[13]==0x22&&livePhyTrace[14]==0x99&&livePhyTrace[15]==1);
+ publishLivePort();assert(targetObject.publishes>=4);
 }
 '''.replace('BODY',body)
 with tempfile.TemporaryDirectory(prefix='wex-tc-live-') as d:

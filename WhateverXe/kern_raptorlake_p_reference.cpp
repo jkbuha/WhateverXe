@@ -253,7 +253,10 @@ IORecursiveLock *livePortLock;
 RaptorLakeP::ReferenceTCLive::Lease livePortLease;
 mach_vm_address_t livePortOriginal,liveBaseMode,liveAuxEnable,liveAuxDisable;
 uint32_t livePortReady,livePortPermission,livePortState[16]{1};
-uint32_t livePhyTrace[12]{1,0,0,0,0,0,0,0,~0U,0,0,0};
+uint32_t livePhyTrace[16]{2,0,0,0,0,0,0,0,~0U,0,0,0};
+// Captured under livePortLock. Retain the first programming sequence and the
+// latest value for every allowed register; no extra hardware reads are added.
+uint32_t livePhyRegisters[22][8]{},livePhyWrites[64][8]{},livePhyWriteCount;
 struct LivePortIO {
  void *port;
  uint32_t read(uint32_t reg){return backend.readReg32(reg);}
@@ -274,7 +277,11 @@ void publishLivePort(){
  livePortState[11]=livePortLease.aux;livePortState[12]=livePortLease.active;
  livePortState[13]=livePortLease.nativeResult;livePortState[14]=livePortLease.writes;
  if(target)target->setProperty("WhateverXeRPLPReferenceTCLive",livePortState,sizeof(livePortState));
- if(target)target->setProperty("WhateverXeRPLPReferenceTCPhy",livePhyTrace,sizeof(livePhyTrace));
+ if(target){
+  target->setProperty("WhateverXeRPLPReferenceTCPhy",livePhyTrace,sizeof(livePhyTrace));
+  target->setProperty("WhateverXeRPLPReferenceTCPhyRegisters",livePhyRegisters,sizeof(livePhyRegisters));
+  target->setProperty("WhateverXeRPLPReferenceTCPhyWrites",livePhyWrites,livePhyWriteCount*sizeof(livePhyWrites[0]));
+ }
 }
 uint32_t livePortMode(void *port,uint32_t mode){
  if(!livePortSelected(port))return livePortOriginal?reinterpret_cast<uint32_t (*)(void *,uint32_t)>(livePortOriginal)(port,mode):static_cast<uint32_t>(kIOReturnNotReady);
@@ -312,10 +319,22 @@ struct LivePhyIO {
  void unlock(IOInterruptState state){IOSimpleLockUnlockEnableInterrupt(livePhyLock,state);}
  void bankFault(){livePhyFault=1;++livePortState[15];}
 };
-void recordPhyAccess(uint32_t index,uint32_t raw,const Display13TC::Result &result,bool write){
+void recordPhyAccess(uint32_t index,uint32_t raw,const Display13TC::Result &result,bool write,uint32_t requested){
  ++livePhyTrace[write?2:1];livePhyTrace[3]=index;livePhyTrace[4]=raw;
  livePhyTrace[5]=static_cast<uint32_t>(result.status);livePhyTrace[6]=result.before;livePhyTrace[7]=result.after;
- if(result.status!=Display13TC::Status::Complete && livePhyTrace[8]==~0U){livePhyTrace[8]=index;livePhyTrace[9]=raw;livePhyTrace[10]=static_cast<uint32_t>(result.status);}
+ if(result.status!=Display13TC::Status::Complete && livePhyTrace[8]==~0U){
+  livePhyTrace[8]=index;livePhyTrace[9]=raw;livePhyTrace[10]=static_cast<uint32_t>(result.status);
+  livePhyTrace[12]=result.before;livePhyTrace[13]=result.after;livePhyTrace[14]=requested;livePhyTrace[15]=write;
+ }
+ if(index<0x34 || index>0x49)return;
+ auto &row=livePhyRegisters[index-0x34];row[0]=index;row[1]=raw;++row[write?3:2];
+ if(write)row[4]=requested;
+ row[5]=result.before;row[6]=result.after;row[7]=static_cast<uint32_t>(result.status);
+ if(write && livePhyWriteCount<64){
+  auto &entry=livePhyWrites[livePhyWriteCount];entry[0]=livePhyWriteCount+1;entry[1]=index;entry[2]=raw;
+  entry[3]=requested;entry[4]=result.before;entry[5]=result.after;entry[6]=static_cast<uint32_t>(result.status);entry[7]=result.writes;
+  ++livePhyWriteCount;
+ }
 }
 uint32_t livePortReadPhy(void *port,uint32_t index){
  if(!livePortSelected(port))return liveReadPhyOriginal?reinterpret_cast<uint32_t (*)(void *,uint32_t)>(liveReadPhyOriginal)(port,index):0;
@@ -324,7 +343,7 @@ uint32_t livePortReadPhy(void *port,uint32_t index){
  memcpy(&raw,static_cast<uint8_t *>(port)+0x580+4*index,4);
  Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
  const auto result=Display13TC::Dekel::access(io,coordinates,index,raw,false,value);
- recordPhyAccess(index,raw,result,false);
+ recordPhyAccess(index,raw,result,false,0);
  if(result.status!=Display13TC::Status::Complete){value=0;++livePortState[7];}
  IORecursiveLockUnlock(livePortLock);return value;
 }
@@ -334,8 +353,9 @@ void livePortWritePhy(void *port,uint32_t index,uint32_t value){
  IORecursiveLockLock(livePortLock);uint32_t raw=0;
  memcpy(&raw,static_cast<uint8_t *>(port)+0x580+4*index,4);
  Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
+ const auto requested=value;
  const auto result=Display13TC::Dekel::access(io,coordinates,index,raw,true,value);
- recordPhyAccess(index,raw,result,true);
+ recordPhyAccess(index,raw,result,true,requested);
  if(result.status!=Display13TC::Status::Complete)++livePortState[7];
  IORecursiveLockUnlock(livePortLock);
 }
