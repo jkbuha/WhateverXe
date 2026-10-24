@@ -19,6 +19,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
  gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceRecoveryExtendedRequested();\nextern bool wexRplReferenceBlitPitchRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
  gate+='class KernelPatcher;\nextern bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceLivePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNativeHotplugHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceAGDCObservationHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNVRAMHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
+ gate+='extern bool wexRplReferencePanelMode(const void *,const void *,const void *);\n'
  gate+='extern bool wexRplReferenceTCSSSelected();\nextern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
@@ -64,6 +65,11 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
   edit('kern_gen11.cpp','\t\tlilu.onKextLoadForce(&kextG11FBTA);',
        '\t\t// Private debug donor only; never route the production framebuffer ABI.')
  p=out/'kern_gen11.cpp';p.write_text(p.read_text().replace('checkKernelArgument("-ngreentglwithgfx")','wexRplReferencePanel()'))
+ # The reference pre-write repairs only the built-in head. External modes
+ # must not replay that panel-specific TRANS_DDI_FUNC_CTL_A override.
+ mode_before='\tif (!NGreen::callback->isRealTGL) {\n\t\tNGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A'
+ mode_after='\tif (!NGreen::callback->isRealTGL && (!checkKernelArgument("-wex-rplp-training-path") || wexRplReferencePanelMode(that,param_1,param_2))) {\n\t\tNGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A'
+ edit('kern_gen11.cpp',mode_before,mode_after)
  # Preserve the qualified panel/pipe/head counts. Only expose the physical
  # ADL-P port domain under the explicit exact-owner TCSS trial gate. The
  # imported three-port experiment otherwise hides every connected TC port.

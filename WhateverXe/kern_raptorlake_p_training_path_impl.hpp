@@ -5,6 +5,11 @@ mach_vm_address_t trainingResourcesOriginal,trainingPGGet,trainingPGPutOriginal,
 uint32_t trainingLeaseState[32]{2};
 mach_vm_address_t trainingConfiguredOriginal,trainingVoltageOriginal,trainingPatternOriginal;
 uint32_t trainingSignal[20]{1};
+mach_vm_address_t trainingDDIGetOriginal,trainingDDIPutOriginal;
+RaptorLakeP::ReferenceDDI::Request trainingDDIRequest;
+uint32_t trainingDDIState[12]{1},trainingCleanupState[8]{1};
+thread_call_t trainingCleanupWork;uint64_t trainingGeneration;
+
 struct TrainingPathLease {
  void *path{},*port{};IOService *fb{};OSObject *power{};
  bool logicalPG{},adopted{},freed{},releasing{},busy{};
@@ -34,6 +39,51 @@ bool trainingHardwareIdle(){
  auto core=io.read(0x45404);if(core==~0U || (core&0x300F)!=0x300F)return false;
  auto b=io.read(0x64500),p=io.read(0x71008),f=io.read(0x61400),t=io.read(0x61540);
  return b!=~0U&&p!=~0U&&f!=~0U&&t!=~0U && (b&0x80000080U)==0x80U && !(p&0xC0000000U) && !((f|t)&0x80000000U);
+}
+
+struct TrainingDDIIO {
+ OSObject *power;
+ bool qualified(){
+  if(!power || !framebufferOwner || !wexRplReferenceFBAllowed(framebufferOwner) ||
+   strcmp(power->getMetaClass()->getClassName(),"AppleIntelPowerWell") || power->getMetaClass()->getClassSize()!=0x80)return false;
+  uintptr_t owner=0,bound=0;uint8_t always=0;memcpy(&owner,reinterpret_cast<uint8_t *>(power)+0x10,8);
+  memcpy(&bound,reinterpret_cast<uint8_t *>(framebufferOwner)+0xC8,8);memcpy(&always,reinterpret_cast<uint8_t *>(power)+0x18,1);
+  return owner==reinterpret_cast<uintptr_t>(framebufferOwner) && bound==reinterpret_cast<uintptr_t>(power) && always==1;
+ }
+ bool parentHeld(){auto c=backend.readReg32(0x45404);return c!=~0U && (c&15)==15;}
+ uint32_t refs(){uint32_t v=~0U;memcpy(&v,reinterpret_cast<uint8_t *>(power)+0x44,4);return v;}
+ bool idle(){auto b=backend.readReg32(0x64500);return b!=~0U && (b&0x80000080U)==0x80;}
+ uint32_t read(uint32_t reg){return backend.readReg32(reg);}
+ void write(uint32_t reg,uint32_t value){backend.writeReg32(reg,value);}
+ void delayUs(unsigned us){IODelay(us);}
+ void retainOwner(){power->retain();}void releaseOwner(){power->release();}
+};
+void trainingDDICleanup(){
+ if(!trainingDDIRequest.owner)return;
+ auto power=reinterpret_cast<OSObject *>(trainingDDIRequest.owner);TrainingDDIIO io{power};
+ trainingDDIState[8]=io.refs();
+ auto result=trainingDDIRequest.put(io,reinterpret_cast<uintptr_t>(power));trainingDDIState[9]=static_cast<uint32_t>(result);
+ trainingDDIState[10]=trainingDDIRequest.owned;
+}
+void trainingGetDDI(void *object,uint32_t ddi){
+ IORecursiveLockLock(livePortLock);reinterpret_cast<void (*)(void *,uint32_t)>(trainingDDIGetOriginal)(object,ddi);
+ if(ddi==5 && livePortReady && livePortPermission){
+  auto port=getPortEntry?reinterpret_cast<OSObject *(*)(uint32_t)>(getPortEntry)(5):nullptr;
+  if(livePortSelected(port)){
+   ++trainingDDIState[1];TrainingDDIIO io{static_cast<OSObject *>(object)};LivePortIO portIO{port};
+   if(io.qualified() && livePortLease.witness(portIO,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port))){
+    trainingDDIState[3]=io.refs();trainingDDIState[4]=io.read(0x45454);
+    auto result=trainingDDIRequest.get(io,reinterpret_cast<uintptr_t>(object));trainingDDIState[5]=static_cast<uint32_t>(result);
+    trainingDDIState[6]=io.read(0x45454);trainingDDIState[10]=trainingDDIRequest.owned;
+   }else ++trainingDDIState[11];
+  }
+ }
+ IORecursiveLockUnlock(livePortLock);
+}
+void trainingPutDDI(void *object,uint32_t ddi){
+ IORecursiveLockLock(livePortLock);reinterpret_cast<void (*)(void *,uint32_t)>(trainingDDIPutOriginal)(object,ddi);
+ if(ddi==5 && trainingDDIRequest.owner==reinterpret_cast<uintptr_t>(object)){++trainingDDIState[2];trainingDDICleanup();}
+ IORecursiveLockUnlock(livePortLock);
 }
 void trainingCleanupPower(){
  if(!trainingLease.power || !trainingLease.freed || trainingLease.logicalPG || trainingLease.busy || trainingLease.adopting || trainingPGRefs() || !trainingHardwareIdle())return;
@@ -65,10 +115,11 @@ uint32_t prepareTrainingPath(void *port){
  ++trainingLeaseState[2];
  if(!trainingLeaseState[1])return 0;
  if(!livePortSelected(port) || !trainingWorkloop())return 1;
- IORecursiveLockLock(livePortLock);
+ IORecursiveLockLock(livePortLock);++trainingGeneration;
  auto finish=[&](uint32_t code){trainingLeaseState[3]=code;IORecursiveLockUnlock(livePortLock);return code;};
  if(trainingLease.freed && !trainingLease.path && !trainingLease.port && !trainingLease.power && !trainingLease.powerLease.owner && !trainingLease.logicalPG && !trainingLease.busy && !trainingLease.adopting){trainingLease.freed=false;++trainingLeaseState[23];}
  if(trainingLease.busy || trainingLease.adopting || trainingLease.freed)return finish(2);
+ auto ddiPower=backend.readReg32(0x45454);if(ddiPower==~0U || (ddiPower&0xC00)!=0xC00)return finish(12);
  if(trainingLease.path){if(trainingLease.port!=port)return finish(3);return finish(0);}
  // Existing ordinary native paths are never replaced or commandeered.
  if(reinterpret_cast<void *(*)(void *)>(pathLookupOriginal)(port))return finish(0);
@@ -144,12 +195,35 @@ void trainingFree(void *path){
  if(own && !trainingLease.releasing){trainingLease.freed=true;trainingLeaseState[14]++;trainingCleanupPower();}
  IORecursiveLockUnlock(livePortLock);
 }
+IOReturn trainingCleanupAction(OSObject *owner,void *token,void *,void *,void *){
+ if(owner!=framebufferOwner || !trainingWorkloop())return kIOReturnNotReady;
+ IORecursiveLockLock(livePortLock);++trainingCleanupState[1];
+ if(reinterpret_cast<uintptr_t>(token)==trainingGeneration && !trainingLease.busy && !trainingLease.adopted){
+  trainingCleanupState[4]=trainingRelease()?0:1;
+ }else ++trainingCleanupState[3];
+ IORecursiveLockUnlock(livePortLock);return kIOReturnSuccess;
+}
+void trainingCleanupWorker(thread_call_param_t,thread_call_param_t token){
+ auto owner=framebufferOwner;if(!owner || owner->isInactive())return;owner->retain();
+ auto loop=owner->getWorkLoop();if(loop){loop->retain();loop->runAction(trainingCleanupAction,owner,token);loop->release();}owner->release();
+}
 uint32_t trainingEnd(void *controller,void *request){
  auto result=reinterpret_cast<uint32_t (*)(void *,void *)>(trainingEndOriginal)(controller,request);
  uint32_t port=0,keep=~0U;if(request){memcpy(&port,request,4);memcpy(&keep,static_cast<uint8_t *>(request)+8,4);}
- if(controller==framebufferOwner && port==6 && !keep && !result){IORecursiveLockLock(livePortLock);trainingLeaseState[15]++;trainingRelease();IORecursiveLockUnlock(livePortLock);}
+ if(controller==framebufferOwner && port==6 && !keep && !result){
+  IORecursiveLockLock(livePortLock);trainingLeaseState[15]++;
+  if(trainingCleanupWork && trainingLease.path && !trainingLease.adopted && !trainingLease.busy && trainingHardwareIdle()){
+   TrainingPowerIO io;auto status=trainingLease.route.restore(io);trainingLeaseState[16]=static_cast<uint32_t>(status);
+   if(status==RaptorLakeP::TrainingRoute::Status::Ready){
+    auto generation=++trainingGeneration;uint64_t deadline;clock_interval_to_deadline(2000,kMillisecondScale,&deadline);
+    thread_call_enter1_delayed(trainingCleanupWork,reinterpret_cast<thread_call_param_t>(static_cast<uintptr_t>(generation)),deadline);++trainingCleanupState[2];
+   }
+  }
+  IORecursiveLockUnlock(livePortLock);
+ }
  return result;
 }
+
 void trainingPortWrite(void *port,uint32_t reg,uint32_t value){
  if(reg==0x64500 && livePortSelected(port)){
   IORecursiveLockLock(livePortLock);
@@ -158,7 +232,7 @@ void trainingPortWrite(void *port,uint32_t reg,uint32_t value){
    value|=64;++trainingLeaseState[19];
   }
   reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(trainingPortWriteOriginal)(port,reg,value);
-  IORecursiveLockUnlock(livePortLock);return;
+  trainingDDICleanup();IORecursiveLockUnlock(livePortLock);return;
  }
  reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(trainingPortWriteOriginal)(port,reg,value);
 }
@@ -211,5 +285,7 @@ void publishTrainingLease(){
  trainingLeaseState[28]=trainingLease.powerState.faulted;trainingLeaseState[29]=trainingLease.powerLease.owner?1:0;
  trainingLeaseState[30]=trainingLease.powerState.refs[static_cast<unsigned>(Display13Power::Domain::PipeB)];trainingLeaseState[31]=trainingLease.powerState.ready;
  target->setProperty("WhateverXeRPLPReferenceTrainingLease",trainingLeaseState,sizeof(trainingLeaseState));
- target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));IORecursiveLockUnlock(livePortLock);
+ target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));
+ target->setProperty("WhateverXeRPLPReferenceDDI",trainingDDIState,sizeof(trainingDDIState));
+ target->setProperty("WhateverXeRPLPReferenceTrainingCleanup",trainingCleanupState,sizeof(trainingCleanupState));IORecursiveLockUnlock(livePortLock);
 }
