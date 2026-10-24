@@ -10,6 +10,10 @@ RaptorLakeP::ReferenceDDI::Request trainingDDIRequest;
 uint32_t trainingDDIState[12]{1},trainingCleanupState[8]{1};
 thread_call_t trainingCleanupWork;uint64_t trainingGeneration;
 
+mach_vm_address_t trainingSetupOriginal,trainingGetLinkOriginal,trainingSetConfig;
+uint8_t trainingNegotiatedConfig[28]{};bool trainingNegotiatedValid;
+uint32_t trainingNegotiated[32]{1};
+
 struct TrainingPathLease {
  void *path{},*port{};IOService *fb{};OSObject *power{};
  bool logicalPG{},adopted{},freed{},releasing{},busy{};
@@ -91,6 +95,7 @@ void trainingCleanupPower(){
  trainingLeaseState[17]=static_cast<uint32_t>(result.status);
  if(result.status!=Display13Power::Status::Complete)return;
  trainingLease.fb->release();trainingLease.power->release();static_cast<OSObject *>(trainingLease.port)->release();
+ trainingNegotiatedValid=false;
  trainingLease.fb=nullptr;trainingLease.power=nullptr;trainingLease.port=nullptr;trainingLease.path=nullptr;
  trainingLease.freed=false;trainingLease.adopted=false;trainingLease.releasing=false;trainingLease.busy=false;trainingLease.adopting=nullptr;trainingLease.route={};trainingLease.powerState={};++trainingLeaseState[18];
 }
@@ -143,6 +148,7 @@ uint32_t prepareTrainingPath(void *port){
  memcpy(&pipe,pb+0x3640,4);memcpy(&mode,pb+0x3644,4);memcpy(&boundFB,pb+0x32B0,8);memcpy(&boundPort,pb+0x3648,8);
  if(pipe!=1 || mode!=1 || boundPort){reinterpret_cast<void (*)(void *)>(trainingFreeOriginal)(path);return finish(8);}
  trainingLease.fb=fb;trainingLease.port=port;trainingLease.power=power;trainingLease.path=path;
+ trainingNegotiatedValid=false;
  fb->retain();power->retain();static_cast<OSObject *>(port)->retain();
  TrainingPowerIO io;using namespace Display13Power;const auto domains=bit(Domain::PW1)|bit(Domain::PW2)|bit(Domain::PipeB);
  if(!initialize(io,trainingLease.powerState,domains)){trainingLease.freed=true;reinterpret_cast<void (*)(void *)>(trainingFreeOriginal)(path);fb->release();power->release();static_cast<OSObject *>(port)->release();trainingLease.path=nullptr;trainingLease.fb=nullptr;trainingLease.power=nullptr;trainingLease.port=nullptr;trainingLease.freed=false;return finish(9);}
@@ -191,6 +197,7 @@ bool trainingResources(void *fb,uint32_t port,uint32_t stream){
 }
 void trainingFree(void *path){
  IORecursiveLockLock(livePortLock);const bool own=path==trainingLease.path;
+ if(own)trainingNegotiatedValid=false;
  reinterpret_cast<void (*)(void *)>(trainingFreeOriginal)(path);
  if(own && !trainingLease.releasing){trainingLease.freed=true;trainingLeaseState[14]++;trainingCleanupPower();}
  IORecursiveLockUnlock(livePortLock);
@@ -286,6 +293,80 @@ uint32_t trainingPattern(void *path,uint32_t pattern){
  }else ++trainingSignal[17];
  IORecursiveLockUnlock(livePortLock);return result;
 }
+uint32_t prepareNativeTrainingPath(void *port){
+ IORecursiveLockLock(livePortLock);++trainingNegotiated[24];uint32_t result=1;
+ if(trainingLease.port==port && trainingLease.path && trainingLease.adopted && trainingLease.route.adopted && livePortSelected(port)){
+  TrainingPowerIO io;
+  if(io.powerHeld()){
+   uint32_t lanes=0;memcpy(&lanes,static_cast<uint8_t *>(port)+0x124,4);trainingNegotiated[28]=lanes;
+   auto pipe=io.read(0x71008),buffer=io.read(0x64500);trainingNegotiated[29]=buffer;
+   trainingNegotiated[26]=io.read(0x46144);trainingNegotiated[30]=io.read(0x61540);
+   if(pipe!=~0U && buffer!=~0U){
+    // Active native outputs are never rerouted. In a complete modeset the
+    // output is disabled, but its TP generator still needs the PHY clock
+    // before enablePort/linkTraining, not only after native enablePipe.
+    auto status=((pipe&0xC0000000U)||(buffer&0x80000000U))?RaptorLakeP::TrainingRoute::Status::Ready:trainingLease.route.prepare(io,lanes,true);
+    trainingNegotiated[25]=static_cast<uint32_t>(status);result=status==RaptorLakeP::TrainingRoute::Status::Ready?0:40+static_cast<uint32_t>(status);
+   }
+   trainingNegotiated[27]=io.read(0x46144);
+  }
+ }
+ IORecursiveLockUnlock(livePortLock);return result;
+}
+bool trainingActiveLink(uint32_t buffer,uint32_t &rate,uint32_t &lanes){
+ if(buffer==~0U || (buffer&0x80000040U)!=0x80000040U)return false;
+ auto width=(buffer>>1)&7U,code=(buffer>>20)&15U;if(width>1 || code>3)return false;
+ constexpr uint32_t rates[]{6,10,20,30};rate=rates[code];lanes=width+1;return true;
+}
+void recordSuccessfulTraining(void *port){
+ IORecursiveLockLock(livePortLock);++trainingNegotiated[1];
+ if(port==trainingLease.port && trainingLease.path && livePortSelected(port)){
+  TrainingPowerIO io;uint32_t rate=0,lanes=0;auto buffer=io.powerHeld()?io.read(0x64500):~0U;
+  uint8_t config[28];memcpy(config,static_cast<uint8_t *>(port)+0x558,sizeof(config));
+  trainingNegotiated[5]=config[2];trainingNegotiated[6]=config[11];trainingNegotiated[22]=buffer;
+  uint32_t currentRate=0,currentLanes=0;memcpy(&currentRate,static_cast<uint8_t *>(port)+0x128,4);memcpy(&currentLanes,static_cast<uint8_t *>(port)+0x124,4);
+  uint8_t maxRate=0,maxLanes=0;memcpy(&maxRate,static_cast<uint8_t *>(port)+0xF,1);memcpy(&maxLanes,static_cast<uint8_t *>(port)+0x11,1);
+  trainingNegotiated[16]=maxRate|(uint32_t(maxLanes)<<8);
+  if(trainingActiveLink(buffer,rate,lanes) && rate==currentRate && lanes==currentLanes && config[2]==rate &&
+     config[11]>=1 && config[11]<=2 && rate<=maxRate && lanes<=(maxLanes&31U)){
+   config[11]=lanes;memcpy(trainingNegotiatedConfig,config,sizeof(config));trainingNegotiatedValid=true;
+   trainingNegotiated[3]=rate;trainingNegotiated[4]=lanes;trainingNegotiated[7]=0;
+  }else trainingNegotiated[7]=2;
+ }else trainingNegotiated[7]=1;
+ IORecursiveLockUnlock(livePortLock);
+}
+uint32_t trainingSetupPort(void *port){
+ if(!livePortSelected(port))return reinterpret_cast<uint32_t (*)(void *)>(trainingSetupOriginal)(port);
+ IORecursiveLockLock(livePortLock);++trainingNegotiated[8];
+ memcpy(&trainingNegotiated[17],static_cast<uint8_t *>(port)+0x128,4);memcpy(&trainingNegotiated[18],static_cast<uint8_t *>(port)+0x124,4);
+ const auto explicitConfig=static_cast<uint8_t *>(port)[0x116];trainingNegotiated[23]=explicitConfig;
+ if(!explicitConfig && trainingNegotiatedValid && trainingLease.port==port && trainingLease.adopted && trainingLease.route.adopted){
+  TrainingPowerIO io;
+  if(io.powerHeld()){
+   // Use the exact native API and its complete cached AGDC structure. Only
+   // a successful hardware training result can populate this configuration.
+   uint8_t config[28];memcpy(config,trainingNegotiatedConfig,sizeof(config));++trainingNegotiated[9];
+   trainingNegotiated[10]=reinterpret_cast<uint32_t (*)(void *,void *)>(trainingSetConfig)(port,config);
+  }
+ }
+ auto result=reinterpret_cast<uint32_t (*)(void *)>(trainingSetupOriginal)(port);trainingNegotiated[11]=result;
+ memcpy(&trainingNegotiated[19],static_cast<uint8_t *>(port)+0x128,4);memcpy(&trainingNegotiated[20],static_cast<uint8_t *>(port)+0x124,4);
+ trainingNegotiated[23]|=uint32_t(static_cast<uint8_t *>(port)[0x116])<<8;
+ IORecursiveLockUnlock(livePortLock);return result;
+}
+uint32_t trainingGetLink(void *path,void *output){
+ auto result=reinterpret_cast<uint32_t (*)(void *,void *)>(trainingGetLinkOriginal)(path,output);
+ if(result || !output)return result;
+ IORecursiveLockLock(livePortLock);
+ if(path==trainingLease.path && trainingLease.adopted && trainingLease.route.adopted && trainingNegotiatedValid && livePortSelected(trainingLease.port)){
+  ++trainingNegotiated[12];TrainingPowerIO io;uint32_t rate=0,lanes=0;
+  if(io.powerHeld() && trainingActiveLink(io.read(0x64500),rate,lanes)){
+   auto config=static_cast<uint8_t *>(output);trainingNegotiated[13]=config[2];config[2]=rate;config[11]=lanes;
+   trainingNegotiated[14]=rate;trainingNegotiated[15]=lanes;
+  }else ++trainingNegotiated[21];
+ }
+ IORecursiveLockUnlock(livePortLock);return result;
+}
 uint32_t trainingExternalClock(const void *owner,const void *head,const void *path,uint32_t value){
  if(owner!=framebufferOwner || !head || !path || !livePortLock || (value&0xF0000000U)!=0x60000000U)return value;
  IORecursiveLockLock(livePortLock);
@@ -319,6 +400,7 @@ void publishTrainingLease(){
  target->setProperty("WhateverXeRPLPReferenceTrainingLease",trainingLeaseState,sizeof(trainingLeaseState));
  target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));
  target->setProperty("WhateverXeRPLPReferenceLink",trainingLink,sizeof(trainingLink));
+ trainingNegotiated[2]=trainingNegotiatedValid;target->setProperty("WhateverXeRPLPReferenceNegotiatedLink",trainingNegotiated,sizeof(trainingNegotiated));
  target->setProperty("WhateverXeRPLPReferenceDDI",trainingDDIState,sizeof(trainingDDIState));
  target->setProperty("WhateverXeRPLPReferenceTrainingCleanup",trainingCleanupState,sizeof(trainingCleanupState));IORecursiveLockUnlock(livePortLock);
 }

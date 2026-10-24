@@ -5,7 +5,7 @@ r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_referen
 namespace RaptorLakeP {namespace TrainingRoute {enum class Status {Ready};}}
 struct TrainingLeaseMock {void *path{},*port{};bool adopted{},busy{};struct Route {bool adopted{};RaptorLakeP::TrainingRoute::Status prepare(TrainingPowerIO&,unsigned){return RaptorLakeP::TrainingRoute::Status::Ready;}}route;}trainingLease;
 uint32_t trainingLeaseState[24]{};void *livePortLock=nullptr;
-unsigned prepares=0;uint32_t prepareResult=0;void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}uint32_t prepareTrainingPath(void*){++prepares;return prepareResult;}void publishTrainingLease(){}''');resolver=s[s.index('bool wexRplReferenceAGDCObservationHooks('):s.index('bool wexRplReferenceExternalPort(')]
+unsigned prepares=0;uint32_t prepareResult=0;void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}uint32_t prepareTrainingPath(void*){++prepares;return prepareResult;}void publishTrainingLease(){}void recordSuccessfulTraining(void*){}uint32_t prepareNativeTrainingPath(void*){return 0;}''');resolver=s[s.index('bool wexRplReferenceAGDCObservationHooks('):s.index('bool wexRplReferenceExternalPort(')]
 f=r'''
 #include <cassert>
 #include <cstdint>

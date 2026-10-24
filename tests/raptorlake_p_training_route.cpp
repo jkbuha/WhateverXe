@@ -31,6 +31,13 @@ int main(){
   assert(io.regs[0x46144]==0x80000123 && io.regs[0x61400]==(0x32001100|((lanes-1)<<1)));
   assert(r.prepare(io,lanes==1?2:1)==Status::Ready);assert(r.restore(io)==Status::Ready&&io.regs==saved&&!r.active&&!r.captured);
  }
+ {IO io;Route r;assert(r.prepare(io,2,true)==Status::Denied&&io.writes.empty());
+  assert(r.prepare(io,2)==Status::Ready);r.adopted=true;
+  io.regs[0x46144]=0;io.regs[0x61540]=0x80040300;
+  auto nw=io.writes.size();assert(r.prepare(io,2)==Status::Denied&&io.writes.size()==nw);
+  assert(r.prepare(io,2,true)==Status::Ready&&io.regs[0x46144]==0x80000000);
+  nw=io.writes.size();io.regs[0x64500]|=0x80000000;assert(r.prepare(io,2,true)==Status::Busy&&io.writes.size()==nw);
+ }
  for(unsigned mode=0;mode<12;mode++){
   IO io;Route r;if(mode==0)io.powered=false;
   if(mode==1)io.regs[0x46144]=~0U;if(mode==2)io.regs[0x61400]=0x80000000;

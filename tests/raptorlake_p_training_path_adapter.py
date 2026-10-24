@@ -70,6 +70,14 @@ uint32_t configuredNative(void*){return 0xC;}
 void voltageNative(void*p,uint32_t,uint32_t,void*data){assert(p==port);++voltageCalls;assert(data&&trainingConfiguredLanes(p)==15);memcpy(&lastDrive,data,sizeof(lastDrive));}
 uint32_t patternNative(void*,uint32_t p){backend.regs[0x61540]=0x80000000|(p<<8);return 0;}
 
+unsigned setupCalls=0,setConfigCalls=0,getLinkCalls=0;uint32_t setupResult=0;
+uint32_t setupNative(void *p){assert(p==port);++setupCalls;
+ if(portObj.memory[0x116]){put32(portObj.memory,0x128,portObj.memory[0x55A]);put32(portObj.memory,0x124,portObj.memory[0x563]);}
+ return setupResult;
+}
+uint32_t setConfigNative(void *p,void *data){assert(p==port&&data);++setConfigCalls;memcpy(portObj.memory+0x558,data,28);portObj.memory[0x116]=1;return 0;}
+uint32_t getLinkNative(void *p,void *data){assert(p==pathMem&&data);++getLinkCalls;memset(data,0xCC,28);return 0;}
+
 BODY
 bool trainingResourcesNative(void*fb,uint32_t portIndex,uint32_t stream){
  if(portIndex!=5||stream)return false;
@@ -85,6 +93,7 @@ int main(){
  trainingPGGet=(uintptr_t)getPG;trainingPGPutOriginal=(uintptr_t)putPG;trainingResourcesOriginal=(uintptr_t)trainingResourcesNative;trainingEndOriginal=(uintptr_t)end;trainingPortWriteOriginal=(uintptr_t)portWrite;
  trainingConfiguredOriginal=(uintptr_t)configuredNative;trainingVoltageOriginal=(uintptr_t)voltageNative;trainingPatternOriginal=(uintptr_t)patternNative;
  put32(portObj.memory,0x128,20);portObj.memory[0x11A]=1;
+ trainingSetupOriginal=(uintptr_t)setupNative;trainingSetConfig=(uintptr_t)setConfigNative;trainingGetLinkOriginal=(uintptr_t)getLinkNative;
  trainingDDIGetOriginal=(uintptr_t)getDDI;trainingDDIPutOriginal=(uintptr_t)putDDI;trainingCleanupWork=(void*)0x55;
  trainingLeaseState[1]=1;
  trainingGetDDI(&powerObj,5);assert(backend.regs[0x45454]==0xC03&&powerObj.refs==1);
@@ -107,7 +116,26 @@ int main(){
  auto wc=originalWrites;backend.regs[0x64500]&=~64U;trainingPortWrite(port,0x64500,0);assert(originalWrites==wc);backend.regs[0x64500]=0xC0;
  trainingLease.busy=true;assert(!trainingResources(&fbObj,5,0));trainingLease.busy=false;
  assert(!trainingResources(&fbObj,5,1));assert(!trainingResources(&fbObj,4,0));
+ // Capture only successful, physically enabled, in-range electrical settings.
+ portObj.memory[0xF]=20;portObj.memory[0x11]=2;portObj.memory[0x55A]=20;portObj.memory[0x563]=2;
+ put32(portObj.memory,0x128,20);put32(portObj.memory,0x124,2);backend.regs[0x64500]=0x80203642;
+ recordSuccessfulTraining(port);assert(trainingNegotiatedValid&&trainingNegotiatedConfig[2]==20&&trainingNegotiatedConfig[11]==2);
+ backend.regs[0x64500]=0xC0;recordSuccessfulTraining(port);assert(trainingNegotiated[7]==2&&trainingNegotiatedValid);
  assert(trainingResources(&fbObj,5,0)&&trainingLease.adopted&&trainingLease.route.adopted&&!trainingLease.logicalPG&&trainingPGRefs()==1&&allocs==1);
+ backend.regs[0x46144]=0;backend.regs[0x61540]=0x80040300;
+ assert(!prepareNativeTrainingPath(port)&&backend.regs[0x46144]==0x80000000&&trainingNegotiated[26]==0&&trainingNegotiated[27]==0x80000000);
+ auto nativeWrites=backend.writes;backend.regs[0x71008]=0xC0000000;
+ assert(!prepareNativeTrainingPath(port)&&backend.writes==nativeWrites);backend.regs[0x71008]=0;
+ backend.regs[0x61540]=0;
+ portObj.memory[0x116]=0;put32(portObj.memory,0x128,10);put32(portObj.memory,0x124,4);
+ assert(!trainingSetupPort(port)&&setConfigCalls==1&&setupCalls==1&&get32(portObj.memory,0x128)==20&&get32(portObj.memory,0x124)==2);
+ portObj.memory[0x55A]=10;portObj.memory[0x563]=1;auto savedSetCalls=setConfigCalls;
+ assert(!trainingSetupPort(port)&&setConfigCalls==savedSetCalls&&get32(portObj.memory,0x128)==10&&get32(portObj.memory,0x124)==1);
+ portObj.memory[0x55A]=20;portObj.memory[0x563]=2;put32(portObj.memory,0x128,20);put32(portObj.memory,0x124,2);
+ uint8_t reported[28];backend.regs[0x64500]=0x80203642;
+ assert(!trainingGetLink(pathMem,reported)&&reported[2]==20&&reported[11]==2&&reported[3]==0xCC&&getLinkCalls==1);
+ backend.regs[0x64500]=0xC0;assert(!trainingGetLink(pathMem,reported)&&reported[2]==0xCC&&trainingNegotiated[21]==1);
+ setupResult=0xE00002BC;assert(trainingSetupPort(port)==setupResult);setupResult=0;
  assert(trainingExternalClock(&controller,&fbObj,pathMem,0x60000123)==0x80000123);
  assert(trainingExternalClock(&controller,&portObj,pathMem,0x60000123)==0x60000123);
  assert(trainingExternalClock(&controller,&fbObj,pathMem,0x10000123)==0x10000123);
@@ -117,6 +145,7 @@ int main(){
  assert(!trainingRelease());trainingPutDDI(&powerObj,5);assert(backend.regs[0x45454]==3&&powerObj.refs==1);
  trainingFree(pathMem);assert(trainingLease.power&&powerObj.refs==1);trainingPutPG(&powerObj,3);
  assert(!trainingLease.power&&!fbObj.refs&&!powerObj.refs&&!portObj.refs&&backend.regs[0x45404]==0xC0F);
+ assert(!trainingNegotiatedValid);
  put32(fbObj.memory,0x49E8,0);trainingGetDDI(&powerObj,5);trainingLease.freed=true;assert(!prepareTrainingPath(port)&&trainingLeaseState[23]==1);assert(trainingLease.route.prepare(io,1)==RaptorLakeP::TrainingRoute::Status::Ready);
  assert(trainingRelease()&&!trainingLease.power&&backend.regs[0x46144]==0x80000000&&backend.regs[0x61400]==0x32000002);
  trainingPutDDI(&powerObj,5);assert(!fbObj.refs&&!powerObj.refs&&!portObj.refs&&!lock.depth);

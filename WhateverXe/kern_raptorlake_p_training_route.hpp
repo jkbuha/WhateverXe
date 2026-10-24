@@ -24,11 +24,11 @@ inline bool candidate(const Candidate &c){
 struct Route {
  bool captured{},active{},adopted{};
  uint32_t clock{},function{},lastClock{},lastFunction{};
- template<class IO> Status prepare(IO &io,unsigned lanes){
-  if(adopted || !io.powerHeld() || (lanes!=1 && lanes!=2))return Status::Denied;
+ template<class IO> Status prepare(IO &io,unsigned lanes,bool native=false){
+  if(adopted!=native || (native&&!captured) || !io.powerHeld() || (lanes!=1 && lanes!=2))return Status::Denied;
   const auto c=io.read(0x46144),f=io.read(0x61400),t=io.read(0x61540),b=io.read(0x64500),p=io.read(0x71008);
   if(c==~0U || f==~0U || t==~0U || b==~0U || p==~0U)return Status::Unavailable;
-  if(((f|t|b)&0x80000000U) || (p&0xC0000000U) || !(b&0x80))return Status::Busy;
+  if(((f|b)&0x80000000U) || (!native&&(t&0x80000000U)) || (p&0xC0000000U) || !(b&0x80))return Status::Busy;
   if(((c&0xF0000000U) && (c&0xF0000000U)!=0x80000000U) ||
      ((f&0x78000000U) && (f&0x78000000U)!=0x30000000U))return Status::Foreign;
   if(!captured){clock=c;function=f;captured=true;}
