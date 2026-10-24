@@ -46,7 +46,7 @@ struct LivePhyIO{
 struct LivePortIO{void*port;uint32_t read(uint32_t r){return backend.readReg32(r);}};bool allowed=true,healthy=true;
 struct LiveLease{bool phy=true;uintptr_t object;bool witness(LivePortIO&,uintptr_t owner,uintptr_t p){return healthy&&owner==(uintptr_t)framebufferOwner&&p==(uintptr_t)port;}}livePortLease;
 bool livePortSelected(void*p){return allowed&&p==port;}
-uint32_t livePortReady=1,livePortPermission=1;
+uint32_t livePortReady=1,livePortPermission=1,liveSinkMaxRate=20,liveSinkMaxLanes=2;
 bool wexRplReferenceFBAllowed(void*p){return p==framebufferOwner;}
 OSObject*portByDDI(uint32_t d){assert(d==5);return &portObj;}uintptr_t getPortEntry=(uintptr_t)portByDDI;
 void*pathLookupOriginal; // Only the address is consumed by production.
@@ -117,7 +117,7 @@ int main(){
  trainingLease.busy=true;assert(!trainingResources(&fbObj,5,0));trainingLease.busy=false;
  assert(!trainingResources(&fbObj,5,1));assert(!trainingResources(&fbObj,4,0));
  // Capture only successful, physically enabled, in-range electrical settings.
- portObj.memory[0xF]=20;portObj.memory[0x11]=2;portObj.memory[0x55A]=20;portObj.memory[0x563]=2;
+ portObj.memory[0xF]=10;portObj.memory[0x11]=2;portObj.memory[0x55A]=20;portObj.memory[0x563]=2;
  put32(portObj.memory,0x128,20);put32(portObj.memory,0x124,2);backend.regs[0x64500]=0x80203642;
  recordSuccessfulTraining(port);assert(trainingNegotiatedValid&&trainingNegotiatedConfig[2]==20&&trainingNegotiatedConfig[11]==2);
  backend.regs[0x64500]=0xC0;recordSuccessfulTraining(port);assert(trainingNegotiated[7]==2&&trainingNegotiatedValid);
@@ -133,7 +133,7 @@ int main(){
  assert(!trainingSetupPort(port)&&setConfigCalls==savedSetCalls&&get32(portObj.memory,0x128)==10&&get32(portObj.memory,0x124)==1);
  portObj.memory[0x55A]=20;portObj.memory[0x563]=2;put32(portObj.memory,0x128,20);put32(portObj.memory,0x124,2);
  uint8_t reported[28];backend.regs[0x64500]=0x80203642;
- assert(!trainingGetLink(pathMem,reported)&&reported[2]==20&&reported[11]==2&&reported[3]==0xCC&&getLinkCalls==1);
+ assert(!trainingGetLink(pathMem,reported)&&reported[2]==20&&reported[11]==2&&reported[16]==20&&reported[17]==2&&reported[3]==0xCC&&getLinkCalls==1);
  backend.regs[0x64500]=0xC0;assert(!trainingGetLink(pathMem,reported)&&reported[2]==0xCC&&trainingNegotiated[21]==1);
  setupResult=0xE00002BC;assert(trainingSetupPort(port)==setupResult);setupResult=0;
  assert(trainingExternalClock(&controller,&fbObj,pathMem,0x60000123)==0x80000123);

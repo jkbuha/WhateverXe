@@ -6,6 +6,13 @@
 namespace RaptorLakeP {namespace ReferenceTCAux {
 enum Status:uint32_t {Complete,Denied,Preflight,DDIPower,Foreign,Ownership,AuxBusy,AuxPower,Disconnected,DPCD,Rollback};
 struct Result {uint32_t version{1},status{Denied},writes{},nativeResult{~0U},before[4]{},after[4]{},dpcd[4]{};};
+inline bool sinkLimits(const Result &r,uint32_t &rate,uint32_t &lanes){
+ if(r.status!=Complete || r.nativeResult)return false;
+ auto candidateRate=(r.dpcd[0]>>8)&255U,candidateLanes=(r.dpcd[0]>>16)&31U;
+ if((candidateRate!=6 && candidateRate!=10 && candidateRate!=20 && candidateRate!=30) ||
+    (candidateLanes!=1 && candidateLanes!=2 && candidateLanes!=4))return false;
+ rate=candidateRate;lanes=candidateLanes;return true;
+}
 template<class IO> Result probe(IO &io,bool allowed,bool ddiLanes=false){
  Result out;if(!allowed)return out;
  constexpr uint32_t request=1U<<11,state=1U<<10,owned=1U<<6,busy=1U<<31,tbt=1U<<11;

@@ -326,9 +326,9 @@ void recordSuccessfulTraining(void *port){
   trainingNegotiated[5]=config[2];trainingNegotiated[6]=config[11];trainingNegotiated[22]=buffer;
   uint32_t currentRate=0,currentLanes=0;memcpy(&currentRate,static_cast<uint8_t *>(port)+0x128,4);memcpy(&currentLanes,static_cast<uint8_t *>(port)+0x124,4);
   uint8_t maxRate=0,maxLanes=0;memcpy(&maxRate,static_cast<uint8_t *>(port)+0xF,1);memcpy(&maxLanes,static_cast<uint8_t *>(port)+0x11,1);
-  trainingNegotiated[16]=maxRate|(uint32_t(maxLanes)<<8);
+  trainingNegotiated[16]=maxRate|(uint32_t(maxLanes)<<8);trainingNegotiated[31]=liveSinkMaxRate|(liveSinkMaxLanes<<8);
   if(trainingActiveLink(buffer,rate,lanes) && rate==currentRate && lanes==currentLanes && config[2]==rate &&
-     config[11]>=1 && config[11]<=2 && rate<=maxRate && lanes<=(maxLanes&31U)){
+     config[11]>=1 && config[11]<=2 && liveSinkMaxRate && liveSinkMaxLanes && rate<=liveSinkMaxRate && lanes<=liveSinkMaxLanes){
    config[11]=lanes;memcpy(trainingNegotiatedConfig,config,sizeof(config));trainingNegotiatedValid=true;
    trainingNegotiated[3]=rate;trainingNegotiated[4]=lanes;trainingNegotiated[7]=0;
   }else trainingNegotiated[7]=2;
@@ -361,7 +361,7 @@ uint32_t trainingGetLink(void *path,void *output){
  if(path==trainingLease.path && trainingLease.adopted && trainingLease.route.adopted && trainingNegotiatedValid && livePortSelected(trainingLease.port)){
   ++trainingNegotiated[12];TrainingPowerIO io;uint32_t rate=0,lanes=0;
   if(io.powerHeld() && trainingActiveLink(io.read(0x64500),rate,lanes)){
-   auto config=static_cast<uint8_t *>(output);trainingNegotiated[13]=config[2];config[2]=rate;config[11]=lanes;
+   auto config=static_cast<uint8_t *>(output);trainingNegotiated[13]=config[2];config[2]=rate;config[11]=lanes;config[16]=liveSinkMaxRate;config[17]=liveSinkMaxLanes<2?liveSinkMaxLanes:2;
    trainingNegotiated[14]=rate;trainingNegotiated[15]=lanes;
   }else ++trainingNegotiated[21];
  }

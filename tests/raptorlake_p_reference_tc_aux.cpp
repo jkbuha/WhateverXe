@@ -12,6 +12,11 @@ struct IO {
  uint32_t readDPCD(uint8_t *data,unsigned n){++auxCalls;assert(n==16&&(read(0x45454)&0xC00)==0xC00&&(read(0x45444)&0xC00)==0xC00&&(read(0x64500)&0x40)&&!(read(0x64510)&0x800));data[0]=badCaps?0:0x12;data[1]=0x14;data[2]=0x84;if(foreignScanout)regs[0x64500]|=1U<<31;return result;}
 };
 int main(){
+ Result caps;caps.status=Complete;caps.nativeResult=0;caps.dpcd[0]=0x81C21412;
+ uint32_t rate=0,lanes=0;assert(sinkLimits(caps,rate,lanes)&&rate==20&&lanes==2);
+ for(auto fault:{0U,1U,2U,3U}){auto bad=caps;if(fault==0)bad.status=DPCD;if(fault==1)bad.nativeResult=1;if(fault==2)bad.dpcd[0]=0x81C20012;if(fault==3)bad.dpcd[0]=0x81C31412;
+  rate=99;lanes=99;assert(!sinkLimits(bad,rate,lanes)&&rate==99&&lanes==99);
+ }
  IO io;auto r=probe(io,false);assert(r.status==Denied&&!io.reads&&!io.writes);
  io={};r=probe(io,true);assert(r.status==Complete&&r.nativeResult==0&&r.dpcd[0]==0x841412&&io.auxCalls==1&&r.writes==8&&io.regs[0x45454]==3&&io.regs[0x45444]==3&&io.regs[0x64500]==0x80&&io.regs[0x64510]==0x800);
  for(unsigned bit=0;bit<32;++bit){if(bit==10||bit==11)continue;io={};auto extra=1U<<bit;io.regs[0x45454]|=extra;io.regs[0x45444]|=extra;r=probe(io,true);assert(r.status==Complete&&(r.after[0]&extra)&&(r.after[1]&extra));}

@@ -256,7 +256,7 @@ bool observerPort(void *,uint32_t &);
 IORecursiveLock *livePortLock;
 RaptorLakeP::ReferenceTCLive::Lease livePortLease;
 mach_vm_address_t livePortOriginal,liveBaseMode,liveAuxEnable,liveAuxDisable;
-uint32_t livePortReady,livePortPermission,livePortState[16]{1};
+uint32_t livePortReady,livePortPermission,livePortState[16]{1},liveSinkMaxRate,liveSinkMaxLanes;
 uint32_t livePhyTrace[16]{2,0,0,0,0,0,0,0,~0U,0,0,0};
 // Captured under livePortLock. Retain the first programming sequence and the
 // latest value for every allowed register; no extra hardware reads are added.
@@ -644,7 +644,7 @@ void probeTCAux(){
   }
  }
  if(target)target->setProperty("WhateverXeRPLPReferenceTCAUX",&result,sizeof(result));
- if(__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) && result.aux.status==RaptorLakeP::ReferenceTCAux::Complete && result.aux.nativeResult==0){IORecursiveLockLock(livePortLock);__atomic_store_n(&livePortPermission,1,__ATOMIC_RELEASE);publishLivePort();IORecursiveLockUnlock(livePortLock);}
+ if(__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) && result.aux.status==RaptorLakeP::ReferenceTCAux::Complete && result.aux.nativeResult==0){IORecursiveLockLock(livePortLock);RaptorLakeP::ReferenceTCAux::sinkLimits(result.aux,liveSinkMaxRate,liveSinkMaxLanes);__atomic_store_n(&livePortPermission,1,__ATOMIC_RELEASE);publishLivePort();IORecursiveLockUnlock(livePortLock);}
 }
 
 void captureWorker(thread_call_param_t,thread_call_param_t){
