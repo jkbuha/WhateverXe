@@ -12,13 +12,23 @@ struct IO {
  void write(uint32_t r,uint32_t v){assert(r==0x46144||r==0x61400);writes.emplace_back(r,v);if(r!=reject)regs[r]=v;}
 };
 int main(){
+ // RPL-P/ADL-P link-rate field is independent of width, reversal and ownership.
+ for(unsigned rate:{6U,10U,20U,30U}){
+  const unsigned code=rate==6?0:rate==10?1:rate==20?2:3;
+  for(uint32_t bits:{0U,0x80003642U,0xFFFFFFFFU}){
+   uint32_t result=0;assert(bufferLinkRate(bits,rate,result));
+   assert(((result>>20)&15)==code && (result&~0x00F00000U)==(bits&~0x00F00000U));
+  }
+ }
+ for(unsigned rate:{0U,1U,12U,54U}){uint32_t result=0x1234;assert(!bufferLinkRate(0,rate,result)&&result==0x1234);}
+
  Candidate good{true,true,true,false,false,false,0x4B98,1,0,0};assert(candidate(good));
  for(unsigned fault=0;fault<11;fault++){
   auto c=good;switch(fault){case 0:c.owner=false;break;case 1:c.controller=false;break;case 2:c.access=false;break;case 3:c.builtin=true;break;case 4:c.joined=true;break;case 5:c.connected=true;break;case 6:c.classSize--;break;case 7:c.index=0;break;case 8:c.index=3;break;case 9:c.reserved=1;break;case 10:c.assigned=1;break;}assert(!candidate(c));
  }
  for(unsigned lanes:{1U,2U}){
   IO io;auto saved=io.regs;Route r;assert(r.prepare(io,lanes)==Status::Ready);
-  assert(io.regs[0x46144]==0x60000123 && io.regs[0x61400]==(0x32001100|((lanes-1)<<1)));
+  assert(io.regs[0x46144]==0x80000123 && io.regs[0x61400]==(0x32001100|((lanes-1)<<1)));
   assert(r.prepare(io,lanes==1?2:1)==Status::Ready);assert(r.restore(io)==Status::Ready&&io.regs==saved&&!r.active&&!r.captured);
  }
  for(unsigned mode=0;mode<12;mode++){

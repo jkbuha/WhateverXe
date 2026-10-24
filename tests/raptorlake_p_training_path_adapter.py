@@ -31,7 +31,7 @@ struct OSObject {
 };using IOService=OSObject;
 OSObject controller,portObj,fbObj,powerObj;IOService*framebufferOwner=&controller;void*port=&portObj;
 struct Backend {
- std::map<uint32_t,uint32_t> regs{{0x45404,0xC0F},{0x45454,3},{0x45444,0xC03},{0x42000,0x8E380000},{0x46144,0},{0x61400,0},{0x61540,0},{0x64500,0xC0},{0x71008,0},{0x16E8C0,3},{0x16E8A0,0x1C},{0x1010A0,0xAABBCCDD},{0x16AD00,0x1234}};unsigned writes=0;
+ std::map<uint32_t,uint32_t> regs{{0x45404,0xC0F},{0x45454,3},{0x45444,0xC03},{0x42000,0x8E380000},{0x46114,0x80000000},{0x46144,0},{0x61400,0},{0x61540,0},{0x64500,0xC0},{0x71008,0},{0x16E8C0,3},{0x16E8A0,0x1C},{0x1010A0,0xAABBCCDD},{0x16AD00,0x1234}};unsigned writes=0;
  uint32_t readReg32(uint32_t r){assert(regs.count(r));return regs[r];}
  void writeReg32(uint32_t r,uint32_t v){assert(regs.count(r));++writes;if(r==0x45454){regs[r]=(v&~0x400U)|((v&0x800)?0x400:0);}else if(r==0x45404){auto mask=0xA80AU;regs[r]=(v&~(mask>>1))|((v&mask)>>1);}else regs[r]=v;}
 }backend;
@@ -101,7 +101,9 @@ int main(){
  trainingVoltage(port,3,3,nullptr);assert(voltageCalls==1&&trainingSignal[11]==1);
  assert(!trainingPattern(pathMem,1)&&backend.regs[0x61540]==0x80040100&&trainingSignal[15]==1);
  backend.regs[0x61540]=0;
- trainingPortWrite(port,0x64500,0x80000080);assert(backend.regs[0x64500]==0x800000C0);
+ trainingPortWrite(port,0x64500,0x80000080);assert(backend.regs[0x64500]==0x802000C0);
+ assert(trainingLink[1]==1&&trainingLink[2]==20&&trainingLink[6]==0x80000000&&trainingLink[7]==0x80000000);
+ put32(portObj.memory,0x128,0);auto badWrites=originalWrites;trainingPortWrite(port,0x64500,0x800000C0);assert(originalWrites==badWrites&&trainingLink[8]==1);put32(portObj.memory,0x128,20);
  auto wc=originalWrites;backend.regs[0x64500]&=~64U;trainingPortWrite(port,0x64500,0);assert(originalWrites==wc);backend.regs[0x64500]=0xC0;
  trainingLease.busy=true;assert(!trainingResources(&fbObj,5,0));trainingLease.busy=false;
  assert(!trainingResources(&fbObj,5,1));assert(!trainingResources(&fbObj,4,0));
@@ -110,7 +112,7 @@ int main(){
  trainingFree(pathMem);assert(trainingLease.power&&powerObj.refs==1);trainingPutPG(&powerObj,3);
  assert(!trainingLease.power&&!fbObj.refs&&!powerObj.refs&&!portObj.refs&&backend.regs[0x45404]==0xC0F);
  put32(fbObj.memory,0x49E8,0);trainingGetDDI(&powerObj,5);trainingLease.freed=true;assert(!prepareTrainingPath(port)&&trainingLeaseState[23]==1);assert(trainingLease.route.prepare(io,1)==RaptorLakeP::TrainingRoute::Status::Ready);
- assert(trainingRelease()&&!trainingLease.power&&backend.regs[0x46144]==0x60000000&&backend.regs[0x61400]==0x32000002);
+ assert(trainingRelease()&&!trainingLease.power&&backend.regs[0x46144]==0x80000000&&backend.regs[0x61400]==0x32000002);
  trainingPutDDI(&powerObj,5);assert(!fbObj.refs&&!powerObj.refs&&!portObj.refs&&!lock.depth);
  trainingGetDDI(&powerObj,5);assert(!prepareTrainingPath(port));assert(trainingLease.route.prepare(io,2)==RaptorLakeP::TrainingRoute::Status::Ready);
  uint8_t endRequest[12]{};put32(endRequest,0,6);

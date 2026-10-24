@@ -4,7 +4,7 @@ mach_vm_address_t trainingAllocateAnyOriginal,trainingAllocateFixedOriginal,trai
 mach_vm_address_t trainingResourcesOriginal,trainingPGGet,trainingPGPutOriginal,trainingEndOriginal,trainingPortWriteOriginal;
 uint32_t trainingLeaseState[32]{2};
 mach_vm_address_t trainingConfiguredOriginal,trainingVoltageOriginal,trainingPatternOriginal;
-uint32_t trainingSignal[20]{1};
+uint32_t trainingSignal[20]{1},trainingLink[16]{1};
 mach_vm_address_t trainingDDIGetOriginal,trainingDDIPutOriginal;
 RaptorLakeP::ReferenceDDI::Request trainingDDIRequest;
 uint32_t trainingDDIState[12]{1},trainingCleanupState[8]{1};
@@ -230,8 +230,17 @@ void trainingPortWrite(void *port,uint32_t reg,uint32_t value){
   if(livePortLease.phy && livePortLease.object==reinterpret_cast<uintptr_t>(port)){
    auto before=backend.readReg32(reg);if(before==~0U || !(before&64)){++trainingLeaseState[20];IORecursiveLockUnlock(livePortLock);return;}
    value|=64;++trainingLeaseState[19];
+   if(value&0x80000000U){
+    uint32_t rate=0;memcpy(&rate,static_cast<uint8_t *>(port)+0x128,4);
+    ++trainingLink[1];trainingLink[2]=rate;trainingLink[3]=value;trainingLink[5]=before;
+    if(!RaptorLakeP::TrainingRoute::bufferLinkRate(value,rate,value)){
+     ++trainingLink[8];IORecursiveLockUnlock(livePortLock);return;
+    }
+    trainingLink[4]=value;trainingLink[6]=backend.readReg32(0x46114);trainingLink[7]=backend.readReg32(0x46144);
+   }
   }
   reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(trainingPortWriteOriginal)(port,reg,value);
+  trainingLink[9]=backend.readReg32(reg);
   trainingDDICleanup();IORecursiveLockUnlock(livePortLock);return;
  }
  reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(trainingPortWriteOriginal)(port,reg,value);
@@ -286,6 +295,7 @@ void publishTrainingLease(){
  trainingLeaseState[30]=trainingLease.powerState.refs[static_cast<unsigned>(Display13Power::Domain::PipeB)];trainingLeaseState[31]=trainingLease.powerState.ready;
  target->setProperty("WhateverXeRPLPReferenceTrainingLease",trainingLeaseState,sizeof(trainingLeaseState));
  target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));
+ target->setProperty("WhateverXeRPLPReferenceLink",trainingLink,sizeof(trainingLink));
  target->setProperty("WhateverXeRPLPReferenceDDI",trainingDDIState,sizeof(trainingDDIState));
  target->setProperty("WhateverXeRPLPReferenceTrainingCleanup",trainingCleanupState,sizeof(trainingCleanupState));IORecursiveLockUnlock(livePortLock);
 }
