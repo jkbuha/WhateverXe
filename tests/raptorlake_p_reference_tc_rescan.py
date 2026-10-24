@@ -5,7 +5,7 @@ import subprocess,tempfile,sys
 r=Path(__file__).resolve().parents[1]
 s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text()
 code=s[s.index('bool nativeRescanPermitted(){'):s.index('void nativeRescanWorker(')]
-resolver=s[s.index('bool wexRplReferenceNativeHotplugHooks('):s.index('bool wexRplReferenceAGDCObservationHooks(')]
+resolver=s[s.index('bool wexRplReferenceNativeHotplugHooks('):s.index('bool wexRplReferenceTrainingPathHooks(')]
 harness=r'''
 #include <cassert>
 #include <cstdint>

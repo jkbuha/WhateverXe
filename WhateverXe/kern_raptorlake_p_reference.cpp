@@ -16,6 +16,8 @@
 #include "kern_raptorlake_p_reference_tc_aux.hpp"
 #include "kern_raptorlake_p_reference_tc_live.hpp"
 #include "kern_display13_tc.hpp"
+#include "kern_display13_power.hpp"
+#include "kern_raptorlake_p_training_route.hpp"
 #include <kern/thread.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_raptorlake_p_reference_shutdown.hpp"
@@ -497,6 +499,7 @@ bool captureAllowed(){
 // no arbitrary connector, mode, function pointer or register is user supplied.
 mach_vm_address_t agdcCallbackOriginal,pathLookupOriginal,portTrainingOriginal;
 uint32_t trainingPathCalls,trainingPathFound,portTrainingCalls,portTrainingResult;
+#include "kern_raptorlake_p_training_path.inc"
 uint32_t agdcTraceReady,agdcTraceSequence,agdcTraceRows[32][8]{};
 void recordAGDC(uint32_t kind,uint32_t event,unsigned long argument,uint32_t value,uint32_t result){
  auto seq=__sync_add_and_fetch(&agdcTraceSequence,1);
@@ -526,7 +529,18 @@ uint32_t observedPortTraining(void *port,void *request){
   if(request){memcpy(&portIndex,request,4);auto bytes=static_cast<uint8_t *>(request);value=bytes[0x13]|(static_cast<uint32_t>(bytes[0x12])<<8);}
   recordAGDC(4,portIndex,5,value,~0U);
  }
- auto result=reinterpret_cast<uint32_t (*)(void *,void *)>(portTrainingOriginal)(port,request);
+ uint32_t prepare=0;
+ if(own && trainingLeaseState[1]){
+  prepare=prepareTrainingPath(port);
+  if(!prepare && trainingLease.path && !trainingLease.adopted){
+   IORecursiveLockLock(livePortLock);uint32_t lanes=0;memcpy(&lanes,static_cast<uint8_t *>(port)+0x124,4);
+   TrainingPowerIO io;auto route=trainingLease.route.prepare(io,lanes);trainingLeaseState[10]=static_cast<uint32_t>(route);
+   if(route!=RaptorLakeP::TrainingRoute::Status::Ready)prepare=20+static_cast<uint32_t>(route);else trainingLease.busy=true;
+   IORecursiveLockUnlock(livePortLock);
+  }
+ }
+ auto result=prepare?static_cast<uint32_t>(kIOReturnNotReady):reinterpret_cast<uint32_t (*)(void *,void *)>(portTrainingOriginal)(port,request);
+ if(own && trainingLeaseState[1]){IORecursiveLockLock(livePortLock);trainingLease.busy=false;IORecursiveLockUnlock(livePortLock);}
  if(own){
   uint32_t status=~0U;if(request)memcpy(&status,static_cast<uint8_t *>(request)+0x38,4);
   portTrainingResult=result;recordAGDC(5,portIndex,5,status,result);
@@ -558,6 +572,7 @@ void publishAGDCObservation(){
  for(unsigned i=0;i<32;++i){auto seq=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE);memcpy(rows[i],agdcTraceRows[i],32);if(!seq || seq!=rows[i][0] || seq!=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE))memset(rows[i],0,32);}
  target->setProperty("WhateverXeRPLPReferenceAGDCMeta",meta,sizeof(meta));
  target->setProperty("WhateverXeRPLPReferenceAGDCTrace",rows,sizeof(rows));
+ target->setProperty("WhateverXeRPLPReferenceTrainingLease",trainingLeaseState,sizeof(trainingLeaseState));
 }
 
 bool nativeRescanPermitted(){
@@ -1087,6 +1102,25 @@ bool wexRplReferenceNativeHotplugHooks(KernelPatcher &p,size_t i,mach_vm_address
  nativeRescanState[1]=ok;publishNativeRescan();return ok;
 }
 
+bool wexRplReferenceTrainingPathHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(!checkKernelArgument("-wex-rplp-training-path"))return true;
+ bool ok=livePortReady && wexRplReferenceImage(reinterpret_cast<void *>(a),n,false);
+ const char *names[]{"__ZN21AppleIntelDisplayPath12allocatePathEv","__ZN21AppleIntelDisplayPath12allocatePathEj","__ZN21AppleIntelDisplayPath8freePathEv","__ZN21AppleIntelFramebuffer28allocateDisplayPathResourcesEjj","__ZN19AppleIntelPowerWell18disablePowerWellPGEj","__ZN24AppleIntelBaseController17doLinkTrainingEndEP23AGDCDPLinkTrainingEnd_t","__ZN14AppleIntelPort15writeRegister32Ejj","__ZN19AppleIntelPowerWell17enablePowerWellPGEj"};
+ const uint32_t offsets[]{0xe914c,0xe9302,0xe9f2c,0x9c150,0x89428,0xa250e,0x2f49e,0x8a5fa};
+ const uint8_t prefixes[8][20]{{0x55,0x48,0x89,0xE5,0x53,0x48,0x83,0xEC,0x28,0x48,0xFF,0x05,0x74,0x50,0x08,0x00,0x48,0xFF,0x05,0xED},{0x55,0x48,0x89,0xE5,0x53,0x48,0x83,0xEC,0x28,0x48,0xFF,0x05,0x16,0x4F,0x08,0x00,0x89,0xFB,0x48,0xFF},{0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x20,0x48,0xFF,0x05,0x52,0x45,0x08,0x00,0x49,0x89},{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x30,0x48,0xFF,0x05,0xE2,0x37},{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x30,0x48,0xFF,0x05,0xC2,0x28},{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xEC,0x38,0x48,0xFF,0x05,0xF6,0xE4,0x0B,0x00},{0x55,0x48,0x89,0xE5,0x48,0xFF,0x05,0xBF,0xBF,0x11,0x00,0x48,0x8B,0xBF,0x78,0x05,0x00,0x00,0x89,0xF6},{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xEC,0x38,0x48,0xFF,0x05,0x9A,0x1B,0x0D,0x00}};
+ mach_vm_address_t entries[8]{};
+ for(unsigned x=0;ok&&x<8;x++){entries[x]=p.solveSymbol(i,names[x],a,n);p.clearError();ok=entries[x]==a+offsets[x] && n>=offsets[x]+20 && !memcmp(reinterpret_cast<void *>(entries[x]),prefixes[x],20);}
+ if(ok){
+  KernelPatcher::RouteRequest routes[]{
+   {names[0],trainingAllocateAny,trainingAllocateAnyOriginal},{names[1],trainingAllocateFixed,trainingAllocateFixedOriginal},
+   {names[2],trainingFree,trainingFreeOriginal},{names[3],trainingResources,trainingResourcesOriginal},
+   {names[4],trainingPutPG,trainingPGPutOriginal},{names[5],trainingEnd,trainingEndOriginal},
+   {names[6],trainingPortWrite,trainingPortWriteOriginal},{names[7],trainingGetPG,trainingPGGet}};
+  ok=p.routeMultiple(i,routes,8,a,n);p.clearError();
+ }
+ trainingLeaseState[1]=ok;return ok;
+}
+
 bool wexRplReferenceAGDCObservationHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
  if(!checkKernelArgument("-wex-rplp-tcss-live"))return true;
  const char *names[]{"__ZN24AppleIntelBaseController12CallBackAGDCE31kAGDCRegisterLinkControlEvent_tmj",
@@ -1108,6 +1142,7 @@ bool wexRplReferenceAGDCObservationHooks(KernelPatcher &p,size_t i,mach_vm_addre
    {names[2],observedPortTraining,portTrainingOriginal}};
   ok=p.routeMultiple(i,routes,3,a,n);p.clearError();
  }
+ if(ok)ok=wexRplReferenceTrainingPathHooks(p,i,a,n);
  agdcTraceReady=ok;return ok;
 }
 
