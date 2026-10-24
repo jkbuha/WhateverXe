@@ -108,6 +108,9 @@ int main(){
  trainingLease.busy=true;assert(!trainingResources(&fbObj,5,0));trainingLease.busy=false;
  assert(!trainingResources(&fbObj,5,1));assert(!trainingResources(&fbObj,4,0));
  assert(trainingResources(&fbObj,5,0)&&trainingLease.adopted&&trainingLease.route.adopted&&!trainingLease.logicalPG&&trainingPGRefs()==1&&allocs==1);
+ assert(trainingExternalClock(&controller,&fbObj,pathMem,0x60000123)==0x80000123);
+ assert(trainingExternalClock(&controller,&portObj,pathMem,0x60000123)==0x60000123);
+ assert(trainingExternalClock(&controller,&fbObj,pathMem,0x10000123)==0x10000123);
  assert(trainingExternalNeedsMode(&controller,&fbObj,pathMem)&&trainingLink[11]==1);
  assert(!trainingExternalNeedsMode(&controller,&portObj,pathMem)&&!trainingExternalNeedsMode(&portObj,&fbObj,pathMem));
  backend.regs[0x71008]=0xC0000000;assert(!trainingExternalNeedsMode(&controller,&fbObj,pathMem));backend.regs[0x71008]=0;

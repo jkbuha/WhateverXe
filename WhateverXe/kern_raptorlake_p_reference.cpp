@@ -535,7 +535,14 @@ uint32_t observedPortTraining(void *port,void *request){
  }
  uint32_t prepare=0;
  if(own && trainingLeaseState[1]){
-  prepare=prepareTrainingPath(port);
+  // Native ownership is established only after the FB/port binding and its
+  // extra power reference pass adoption verification. Ordinary native
+  // modesets may run outside the temporary reservation's controller gate.
+  IORecursiveLockLock(livePortLock);
+  const bool nativeOwned=trainingLease.adopted && trainingLease.route.adopted && trainingLease.port==port;
+  if(nativeOwned)++trainingLeaseState[21];
+  IORecursiveLockUnlock(livePortLock);
+  if(!nativeOwned)prepare=prepareTrainingPath(port);
   if(!prepare && trainingLease.path && !trainingLease.adopted){
    IORecursiveLockLock(livePortLock);uint32_t lanes=0;memcpy(&lanes,static_cast<uint8_t *>(port)+0x124,4);
    TrainingPowerIO io;auto route=trainingLease.route.prepare(io,lanes);trainingLeaseState[10]=static_cast<uint32_t>(route);
@@ -1160,6 +1167,10 @@ bool wexRplReferenceExternalPort(const void *port){
 }
 bool wexRplReferenceExternalNeedsMode(const void *owner,const void *head,const void *path){
  return checkKernelArgument("-wex-rplp-training-path") && trainingExternalNeedsMode(owner,head,path);
+}
+
+uint32_t wexRplReferenceExternalClock(const void *owner,const void *head,const void *path,uint32_t value){
+ return checkKernelArgument("-wex-rplp-training-path")?trainingExternalClock(owner,head,path,value):value;
 }
 
 bool wexRplReferencePanelMode(const void *owner,const void *head,const void *path){

@@ -3,9 +3,9 @@ from pathlib import Path
 import subprocess,tempfile,sys,hashlib
 r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('mach_vm_address_t agdcCallbackOriginal,'):s.index('bool nativeRescanPermitted(){')];body=body.replace('#include "kern_raptorlake_p_training_path_impl.hpp"','''struct TrainingPowerIO {};
 namespace RaptorLakeP {namespace TrainingRoute {enum class Status {Ready};}}
-struct TrainingLeaseMock {void *path{};bool adopted{},busy{};struct Route {RaptorLakeP::TrainingRoute::Status prepare(TrainingPowerIO&,unsigned){return RaptorLakeP::TrainingRoute::Status::Ready;}}route;}trainingLease;
+struct TrainingLeaseMock {void *path{},*port{};bool adopted{},busy{};struct Route {bool adopted{};RaptorLakeP::TrainingRoute::Status prepare(TrainingPowerIO&,unsigned){return RaptorLakeP::TrainingRoute::Status::Ready;}}route;}trainingLease;
 uint32_t trainingLeaseState[24]{};void *livePortLock=nullptr;
-void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}uint32_t prepareTrainingPath(void*){return 0;}void publishTrainingLease(){}''');resolver=s[s.index('bool wexRplReferenceAGDCObservationHooks('):s.index('bool wexRplReferenceExternalPort(')]
+unsigned prepares=0;uint32_t prepareResult=0;void IORecursiveLockLock(void*){}void IORecursiveLockUnlock(void*){}uint32_t prepareTrainingPath(void*){++prepares;return prepareResult;}void publishTrainingLease(){}''');resolver=s[s.index('bool wexRplReferenceAGDCObservationHooks('):s.index('bool wexRplReferenceExternalPort(')]
 f=r'''
 #include <cassert>
 #include <cstdint>
@@ -62,6 +62,12 @@ int main(){
  assert(observedPortTraining(port,req)==0xE00002BC&&portTrainingCalls==1&&portTrainingResult==0xE00002BC);
  auto priorSeq=agdcTraceSequence;ownerOK=false;assert(!observedPathLookup(port));assert(observedPortTraining(port,req)==0xE00002BC&&portTrainingCalls==1&&agdcTraceSequence==priorSeq);ownerOK=true;
  assert(pathDelegates==3&&trainingDelegates==2);publishAGDCObservation();assert(targetObject.meta[12]==2&&targetObject.meta[13]==1&&targetObject.meta[14]==1&&targetObject.meta[15]==0xE00002BC);
+ trainingLeaseState[1]=1;trainingLease.adopted=trainingLease.route.adopted=true;trainingLease.port=port;
+ prepareResult=1;auto beforePrepares=prepares;
+ assert(observedPortTraining(port,req)==0xE00002BC&&prepares==beforePrepares&&trainingDelegates==3&&trainingLeaseState[21]==1);
+ trainingLease.route.adopted=false;
+ assert(observedPortTraining(port,req)==kIOReturnNotReady&&prepares==beforePrepares+1&&trainingDelegates==3);
+ trainingLease.adopted=false;trainingLeaseState[1]=0;prepareResult=0;
  std::vector<uint8_t> image(0xF0000);uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x20};memcpy(image.data()+0x9F9CA,prefix,sizeof(prefix));uint8_t pathPrefix[]{0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0x83,0xec,0x30,0x48,0xff,0x05,0xe4,0x48,0x08,0,0x49};
  uint8_t trainPrefix[]{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0xb8,0,0,0};
  memcpy(image.data()+0xE9AAA,pathPrefix,sizeof(pathPrefix));memcpy(image.data()+0x26C54,trainPrefix,sizeof(trainPrefix));

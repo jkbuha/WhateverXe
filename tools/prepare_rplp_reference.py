@@ -21,6 +21,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  gate+='class KernelPatcher;\nextern bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceLivePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNativeHotplugHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceAGDCObservationHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNVRAMHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
  gate+='extern bool wexRplReferencePanelMode(const void *,const void *,const void *);\n'
  gate+='extern bool wexRplReferenceExternalPort(const void *);\nextern bool wexRplReferenceExternalNeedsMode(const void *,const void *,const void *);\n'
+ gate+='extern unsigned wexRplReferenceExternalClock(const void *,const void *,const void *,unsigned);\n'
  gate+='extern bool wexRplReferenceTCSSSelected();\nextern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
@@ -100,8 +101,13 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  # A newly adopted native path may be marked active before its hardware pipe
  # is enabled. Force the ordinary native full modeset for that exact lease.
  old='\treturn FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);'
- new='\tauto nativeResult = FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);\n\treturn wexRplReferenceExternalNeedsMode(that,param_1,param_2) ? 1 : nativeResult;'
+ new='\tif(param_3)param_3->TRANS_CLK_SEL=wexRplReferenceExternalClock(that,param_1,param_2,param_3->TRANS_CLK_SEL);\n\tauto nativeResult = FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);\n\tif(checkKernelArgument("-wex-rplp-training-path") && wexRplReferencePanelMode(that,param_1,param_2))return 0;\n\treturn wexRplReferenceExternalNeedsMode(that,param_1,param_2) ? 1 : nativeResult;'
  edit('kern_gen11.cpp',old,new)
+ # The debug donor's f10 patch unconditionally skips full modesets. With
+ # the exact training-path trial, keep its original conditional branch and
+ # preserve the built-in panel's old partial path in the scoped hook above.
+ edit('kern_gen11.cpp','{activeKext, f10, r10, arrsize(f10),\t1},',
+      '{activeKext, f10, checkKernelArgument("-wex-rplp-training-path")?f10:r10, arrsize(f10),\t1},')
 
  # Preserve the qualified panel/pipe/head counts. Only expose the physical
  # ADL-P port domain under the explicit exact-owner TCSS trial gate. The

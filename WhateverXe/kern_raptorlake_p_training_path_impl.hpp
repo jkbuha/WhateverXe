@@ -286,6 +286,17 @@ uint32_t trainingPattern(void *path,uint32_t pattern){
  }else ++trainingSignal[17];
  IORecursiveLockUnlock(livePortLock);return result;
 }
+uint32_t trainingExternalClock(const void *owner,const void *head,const void *path,uint32_t value){
+ if(owner!=framebufferOwner || !head || !path || !livePortLock || (value&0xF0000000U)!=0x60000000U)return value;
+ IORecursiveLockLock(livePortLock);
+ if(trainingLease.adopted && path==trainingLease.path && head==trainingLease.fb && livePortSelected(trainingLease.port)){
+  TrainingPowerIO io;
+  if(io.powerHeld()){
+   ++trainingLink[13];trainingLink[14]=value;value=(value&0x0FFFFFFFU)|0x80000000U;trainingLink[15]=value;
+  }
+ }
+ IORecursiveLockUnlock(livePortLock);return value;
+}
 bool trainingExternalNeedsMode(const void *owner,const void *head,const void *path){
  if(owner!=framebufferOwner || !head || !path || !livePortLock)return false;
  IORecursiveLockLock(livePortLock);bool needs=false;

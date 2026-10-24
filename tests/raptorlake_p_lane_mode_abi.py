@@ -6,6 +6,9 @@ from prepare_rplp_reference import prepare
 with tempfile.TemporaryDirectory() as d:
  p=Path(d);out=p/'generated';prepare(Path(sys.argv[1]),out,Path(sys.argv[2]))
  s=(out/'kern_gen11.cpp').read_text()
+ assert '{activeKext, f10, checkKernelArgument("-wex-rplp-training-path")?f10:r10, arrsize(f10),' in s
+ donor=Path(sys.argv[2])/'Contents/MacOS/AppleIntelTGLGraphicsFramebuffer'
+ raw=donor.read_bytes();pattern=bytes.fromhex('e8afe2ffff84c0745b');assert raw.count(pattern)==1 and raw[0x75028:0x75031]==pattern
  lanes=s[s.index('uint8_t Gen11::computeLaneCount('):s.index('IOReturn Gen11::wrapICLReadAUX(')]
  modes=s[s.index('uint8_t Gen11::hwRegsNeedUpdate\n'):s.index('int Gen11::wrapHwSetupMemory(')]
  h=(out/'kern_gen11.hpp').read_text();assert 'static uint8_t computeLaneCount' in h and 'static uint32_t setupOptimalLaneCount' in h
@@ -19,7 +22,7 @@ struct IODetailedTimingInformationV2{};
 namespace AppleIntel {
 struct AppleIntelBaseController{alignas(16)uint8_t bytes[0x800]{};};
 struct AppleIntelFramebuffer{};struct AppleIntelDisplayPath{};
-struct CRTCParams{uint32_t TRANS_DDI_FUNC_CTL,TRANS_CONF;};struct SCALERPARAMS{};
+struct CRTCParams{uint32_t TRANS_CLK_SEL,TRANS_DDI_FUNC_CTL,TRANS_CONF;};struct SCALERPARAMS{};
 }
 using namespace AppleIntel;
 struct CB {bool isRealTGL=false,dmcIsAdlp=true;unsigned reads=0;uint32_t readReg32(unsigned r){++reads;return r==0x64000?6:0xC0000000;}void adlpDcExit(const char*){}}cb;
@@ -29,6 +32,7 @@ bool wexRplReferenceExternalPort(const void*){return external;}
 bool wexRplReferencePanelMode(const void*,const void*,const void*){return panel;}
 bool wexRplReferenceExternalNeedsMode(const void*,const void*,const void*){return full;}
 bool checkKernelArgument(const char*){return trial;}
+unsigned wexRplReferenceExternalClock(const void*,const void*,const void*,unsigned value){return !panel&&(value&0xF0000000)==0x60000000?(value&0x0FFFFFFF)|0x80000000:value;}
 template<class T>T& getMember(AppleIntelBaseController*p,unsigned o){return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(p)+o);}
 uint8_t nativeOK=1;uint32_t nativeError=0,expectedBpp=24,expectedRate=20;unsigned laneCalls=0,optimalCalls=0;
 uint8_t nativeCompute(AppleIntelBaseController*,const IODetailedTimingInformationV2*,unsigned bpp,unsigned rate,unsigned *lanes){assert(bpp==expectedBpp&&rate==expectedRate);++laneCalls;*lanes=2;return nativeOK;}
@@ -51,10 +55,10 @@ int main(){
  for(unsigned error:{0U,0xE00002C7U}){nativeError=error;assert(Gen11::setupOptimalLaneCount(&port,&timing,24)==error);assert(getMember<unsigned>(&port,0x148)==0xABCD);}
  assert(!cb.reads&&laneCalls==2&&optimalCalls==2);
  external=false;nativeOK=1;assert(Gen11::computeLaneCount(&port,&timing,24,20,&n)==1&&n==4);
- nativeOK=0;AppleIntelFramebuffer head;AppleIntelDisplayPath path;SCALERPARAMS scaler;CRTCParams params{0xB2030002,0x80000024};
- assert(!Gen11::hwRegsNeedUpdate(&port,&head,&path,&params,&timing,&scaler));assert(params.TRANS_CONF==0x80000024&&params.TRANS_DDI_FUNC_CTL==0xB2030002);
+ nativeOK=0;AppleIntelFramebuffer head;AppleIntelDisplayPath path;SCALERPARAMS scaler;CRTCParams params{0x60000123,0xB2030002,0x80000024};
+ assert(!Gen11::hwRegsNeedUpdate(&port,&head,&path,&params,&timing,&scaler));assert(params.TRANS_CLK_SEL==0x80000123&&params.TRANS_CONF==0x80000024&&params.TRANS_DDI_FUNC_CTL==0xB2030002);
  full=true;assert(Gen11::hwRegsNeedUpdate(&port,&head,&path,&params,&timing,&scaler)==1);full=false;
- panel=true;assert(!Gen11::hwRegsNeedUpdate(&port,&head,&path,&params,&timing,&scaler));assert(params.TRANS_CONF==0xC0000000&&params.TRANS_DDI_FUNC_CTL==0xB2020002);
+ nativeOK=1;panel=true;assert(!Gen11::hwRegsNeedUpdate(&port,&head,&path,&params,&timing,&scaler));assert(params.TRANS_CONF==0xC0000000&&params.TRANS_DDI_FUNC_CTL==0xB2020002);
 }
 '''.replace('LANES',lanes).replace('MODES',modes).replace('#include <cstring>','#include <cstring>\n#include <initializer_list>')
  (p/'test.cpp').write_text(test)
