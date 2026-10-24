@@ -2,8 +2,8 @@
 from pathlib import Path
 import subprocess,tempfile
 r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text()
-body=s[s.index('uint32_t observedPortState('):s.index('bool observerPort(')]
-body+=s[s.index('bool observerPort('):s.index('mach_vm_address_t fbOriginal;')]
+body=s[s.index('uint32_t observedPortState('):s.index('bool observerPort(void *port,uint32_t &ddi){')]
+body+=s[s.index('bool observerPort(void *port,uint32_t &ddi){'):s.index('mach_vm_address_t fbOriginal;')]
 fixture=r'''
 #include <cassert>
 #include <cstdint>
@@ -21,6 +21,8 @@ bool wexRplReferenceTCSSRequested(){return tcss;}
 bool checkKernelArgument(const char *s){assert(!strcmp(s,"-wex-rplp-tcss-observe"));return observe;}
 bool wexRplReferenceFBAllowed(void *p){return allowed&&p==controller;}
 uint32_t compatPortMode(void *){++modes;return 3;}
+bool livePortSelected(void *){return false;}
+uint32_t livePortAUX(void *,uint32_t,uint32_t *,uint32_t,bool){assert(false);return 0;}
 struct Backend {uint32_t readReg32(unsigned r){assert(r==0x44470||r==0xC4000);++reads;return r==0x44470?0x40000:0x10000;}} backend;
 uint32_t original(void *){++calls;return 77;}mach_vm_address_t portStateOriginal=reinterpret_cast<uintptr_t>(original);
 constexpr uint32_t kIOReturnNotReady=0xE00002D8;

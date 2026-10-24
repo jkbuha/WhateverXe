@@ -17,8 +17,8 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  from prepare_rplp_recovery import apply as apply_recovery
  apply_recovery(out)
  gate='#pragma once\nextern bool wexRplReferenceValidate();\nextern bool wexRplReferenceArmed();\nextern bool wexRplReferenceImage(const void *,unsigned long,bool);\nextern void wexRplReferenceLoaded(bool);\nextern void wexRplReferenceIOAF(bool);\nclass OSDictionary;\nextern bool wexRplReferenceQueue(OSDictionary *);\nextern void wexRplReferenceRuntime(unsigned *,unsigned);\nextern bool wexRplReferencePanel();\nextern bool wexRplReferenceFBAllowed(const void *);\nextern void wexRplReferenceFilteredWrite(unsigned long,unsigned);\n'
- gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
- gate+='class KernelPatcher;\nextern bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
+ gate+='extern bool wexRplReferenceRecoveryRequested();\nextern bool wexRplReferenceRecoveryExtendedRequested();\nextern bool wexRplReferenceBlitPitchRequested();\nextern bool wexRplReferenceForceWakeRequested();\nextern bool wexRplReferenceRuntimeOwner(const void *);\nextern bool wexRplReferenceForceWakeOwner(const void *);\n'
+ gate+='class KernelPatcher;\nextern bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferencePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceLivePortHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNativeHotplugHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceAGDCObservationHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\nextern bool wexRplReferenceNVRAMHooks(KernelPatcher &,size_t,mach_vm_address_t,size_t);\n'
  gate+='extern bool wexRplReferenceTCSSSelected();\nextern bool wexRplReferenceTCSSRequested();\n'
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
@@ -60,7 +60,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
        '"com.apple.driver.AppleIntelTGLGraphicsFramebuffer", pathsTGLFB')
   edit('kern_gen11.cpp','"/Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext/Contents/MacOS/AppleIntelTGLGraphicsFramebuffer",',
        '"/Library/WhateverXeDevelopment/panel/WhateverXeRPLPFramebuffer.kext/Contents/MacOS/AppleIntelTGLGraphicsFramebuffer",')
-  edit('kern_gen11.cpp',fb,'\t\tif(!wexRplReferencePortHooks(patcher,index,address,size))return false;\n'+fb)
+  edit('kern_gen11.cpp',fb,'\t\tif(!wexRplReferenceNVRAMHooks(patcher,index,address,size))return false;\n\t\tif(!wexRplReferencePortHooks(patcher,index,address,size))return false;\n\t\tif(!wexRplReferenceLivePortHooks(patcher,index,address,size))return false;\n\t\tif(!wexRplReferenceNativeHotplugHooks(patcher,index,address,size))return false;\n\t\tif(!wexRplReferenceAGDCObservationHooks(patcher,index,address,size))return false;\n'+fb)
   edit('kern_gen11.cpp','\t\tlilu.onKextLoadForce(&kextG11FBTA);',
        '\t\t// Private debug donor only; never route the production framebuffer ABI.')
  p=out/'kern_gen11.cpp';p.write_text(p.read_text().replace('checkKernelArgument("-ngreentglwithgfx")','wexRplReferencePanel()'))

@@ -1,7 +1,7 @@
 """Run actual exact-image/table validation and pointer repairs with mocks."""
 from pathlib import Path
 import subprocess,tempfile
-r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('bool wexRplReferencePortHooks('):s.index('bool wexRplReferenceValidate(){')]
+r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_raptorlake_p_reference.cpp').read_text();body=s[s.index('bool wexRplReferencePortHooks('):s.index('bool wexRplReferenceLivePortHooks(')]
 f=r'''
 #include <cassert>
 #include <cstdint>

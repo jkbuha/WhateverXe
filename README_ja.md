@@ -30,6 +30,8 @@ WEXはOSのABIとGPUバックエンドを独立して選択します。OS別の�
 
 対応状況は機種やコネクタ構成によって異なります。この表はバックエンドの実装範囲を示すもので、すべての機種での動作を保証するものではありません。詳細な選択条件と上書き設定は[デバイス選択](docs/device-selection.md)を参照してください。
 
+任意のRPL-P参照buildは、Tahoe上の物理`A7A0` revision 4と、厳密に対応する参照driver imageに限定されます。Type-C経路は引き続き実験段階です。他のlaptop機種やGPU IDでは、memory layout、ACPI、display routing、driver ABIを個別に検証する必要があり、このbuildが自動的に受け入れることはありません。
+
 ## 必須構成
 
 [Releases](https://github.com/b00t0x/WhateverXe/releases)から **RELEASE** ZIPをダウンロードしてください。DEBUG ZIPは問題調査用です。各ZIPには`WhateverXe.kext`と対応するdSYMのみを収録し、両ZIPのチェックサムは`SHA256SUMS`で配布します。各版の変更点は[CHANGELOG](CHANGELOG.md)を参照してください。
@@ -113,9 +115,12 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wex-rplp-backlight` | 任意の RPL-P panel backend 向けに UID-19・16-bit PWM の輝度 profile を有効にします。Apple または custom profile を保持し、外部 display は対象外です。 |
 | `-wex-rplp-tcss` | 任意の RPL-P panel backend 向けの実験的な ADL-P/RPL-P Type-C 検出です。4 個の TC port slot を公開し、TCSS の ready/DP-alt 状態を使用します。Thunderbolt transport は対象外で、外部 link training は検証中です。 |
 | `-wex-rplp-tcss-aux-probe` | RPL-P TCSS observer と併用し、特権 snapshot から TC3 PHY/AUX 電源と受信機 capability の読み取りを 1 回だけ検証します。取得した電源・ownership request は終了後に戻し、video link training は行いません。 |
-| `-wex-rplp-tcss-observe` | 実験的 RPL-P TCSS backend で外部 port の dispatch と mode 検出を記録し、外部 port は未接続として保持します。Link training は無効です。 |
+| `-wex-rplp-tcss-live` | TCSS observer と AUX probe を併用する実験的な TC3 専用 native link training。特権 AUX snapshot の成功後にだけ経路を許可し、他の外部 port は未接続として保持します。Native AUX 参照数を維持し、ADL-P/RPL-P の ownership sequence を使用します。 |
+| `-wex-rplp-tcss-observe` | 実験的 RPL-P TCSS backend で外部 port の dispatch と mode 検出を記録し、外部 port は未接続として保持します。別の live 試験を明示的に選択しない限り、link training は無効です。 |
 | `-wex-rplp-early-display` | 実験的な RPL-P 起動制御です。検証済み owner の firmware framebuffer binding を遅延し、native framebuffer で最初の desktop を表示します。早期 activation coordinator と recovery 設定が必要です。 |
 | `-wex-rplp-gpu-recovery` | 対応する reference GPU image 向け RPL-P shared render-domain reset recovery。native accelerator の公開後、native reset で状態を失った sibling engine を検証して復元・再実行します。 |
+| `-wex-rplp-gpu-recovery-v2` | `-wex-rplp-gpu-recovery` の実験的な拡張です。shared render-domain reset 後、command replay の前に compute engine の有効状態と関連 register を復元します。両方の引数と対応する reference image が必要です。 |
+| `-wex-rplp-blit-pitch` | 対応する row stride が 64 byte の倍数でない大きな IOSurface copy を copy engine に送る実験的な設定です。対応する RPL-P reference image と native accelerator の ownership が必要です。 |
 | `-wex-rplp-forcewake-balance` | 対応する reference GPU image 向け RPL-P forcewake counter balancing。idle hold の自動解放は無効です。 |
 | `-wex-rplp-manual-arm` | 管理者が`WhateverXeRPLPControl` serviceへ`BeginDiagnostic=true`を送信するまでRPL-P native診断を待機させます。既存のnative-probe前提条件が必要です。実験的診断の開始前に動作確認済みboot fileを復元できます。通常のaccelerator admissionは有効にしません。 |
 | `-wex-rplp-subranges` | native descriptorの割り当て・枯渇・backing RAMの共有・復元・解放と再利用、およびcustom eventを使わないpage-pool登録を検証する実験的診断。factory全体とcache-shadow診断の成功が必要です。所有RAMのみを使用し、子descriptorの所有権が不明な場合は再起動までmanagerを保持します。accelerationは有効にしません。 |

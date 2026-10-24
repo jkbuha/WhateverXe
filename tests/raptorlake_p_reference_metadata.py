@@ -107,3 +107,12 @@ assert gpu[0x7B9FD:0x7BA01]==bytes.fromhex('488b4610')
 assert gpu[0x7BA60:0x7BA67]==bytes.fromhex('488bb058120000')
 assert 'if(!wexRplReferenceAcceleratorProbeHooks(patcher,index,address,size))return false;' in native
 print('PASS exact native requestProbe entry and task->accelerator->collector1258 access; guard installed before native module matching')
+
+for offset,pattern in [(0x8F344,'554889e54157415641554154534883ec'),(0x262EA,'554889e54156534883ec2048ff056435'),(0x2972C,'554889e548ff05510b120048ff0552ff'),(0x29768,'554889e548ff051d0b120048ff0516ff')]:
+ assert raw[offset:offset+16]==bytes.fromhex(pattern)
+assert 'if(!wexRplReferenceLivePortHooks(patcher,index,address,size))return false;' in native
+print('PASS exact TC3 mode/base/native AUX entry guards and generated live hook boundary')
+
+for offset,pattern in [(0x90234,'554889e541574156535048ff05b3d20c'),(0x902EA,'554889e54157415641545348ff050cd2')]:
+ assert raw[offset:offset+16]==bytes.fromhex(pattern)
+print('PASS exact TC3 Dekel read/write donor entry guards')

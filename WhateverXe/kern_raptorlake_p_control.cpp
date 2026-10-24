@@ -28,10 +28,12 @@ IOReturn WhateverXeRPLPControl::setProperties(OSObject *properties) {
     if(!dict || dict->getCount()!=1)return kIOReturnUnsupported;
     const bool modules=dict->getObject("LoadReferenceModules")==kOSBooleanTrue;
     const bool capture=dict->getObject("CaptureReferenceState")==kOSBooleanTrue;
-    if(!modules && !capture && dict->getObject("BeginDiagnostic")!=kOSBooleanTrue)return kIOReturnUnsupported;
+    const bool rescan=dict->getObject("RescanExternalTC3")==kOSBooleanTrue;
+    if(!modules && !capture && !rescan && dict->getObject("BeginDiagnostic")!=kOSBooleanTrue)return kIOReturnUnsupported;
     if(IOUserClient::clientHasPrivilege(current_task(),kIOClientPrivilegeAdministrator)!=kIOReturnSuccess)return kIOReturnNotPrivileged;
     if(modules)return RaptorLakeP::Reference::loadModules() ? kIOReturnSuccess : kIOReturnNotReady;
     if(capture)return RaptorLakeP::Reference::captureState() ? kIOReturnSuccess : kIOReturnNotReady;
+    if(rescan)return RaptorLakeP::Reference::rescanTC3() ? kIOReturnSuccess : kIOReturnNotReady;
     const bool accepted=RaptorLakeP::Reference::enabled() ? RaptorLakeP::Reference::arm() : RaptorLakeP::Native::requestRemoteArm();
     return accepted ? kIOReturnSuccess : kIOReturnNotReady;
 }

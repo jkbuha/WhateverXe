@@ -4,8 +4,9 @@ import subprocess
 
 def apply(out: Path):
  root=Path(__file__).resolve().parents[1]
- patch=root/'Reference/JulioNectar/813d2e6.patch'
- subprocess.run(['/usr/bin/patch','-s','-f','-F','0','-p1','-d',str(out),'-i',str(patch)],check=True)
+ for name in ['813d2e6.patch','df7ab78.patch']:
+  patch=root/'Reference/JulioNectar'/name
+  subprocess.run(['/usr/bin/patch','-s','-f','-F','0','-p1','-d',str(out),'-i',str(patch)],check=True)
  p=out/'kern_gen11.cpp';s=p.read_text()
  def edit(a,b):
   nonlocal s
@@ -49,5 +50,26 @@ def apply(out: Path):
  edit('bool ok = rge && gRecSfw && gRecGetDef && gRecS5Proc && sig1 && sig2 && sig3 && sig4 && sig5;',
       'bool ok = rge && span(gRecSfw,1) && span(gRecGetDef,1) && gRecS5Proc && sig1 && sig2 && sig3 && sig4 && sig5;')
  edit('SYSLOG("ngreen", "XE-RC6FW: sym=%d sig=%d/%d route=%d idle=%u drop=%d",', 'IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeRPLPForceWakeBalanceReady",gRc6FwOn==1);\n\t\t\t\tSYSLOG("ngreen", "XE-RC6FW: sym=%d sig=%d/%d route=%d idle=%u drop=%d",')
- edit('SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d route=%d",', 'IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeRPLPResetRecoveryReady",gRecOn==1);\n\tSYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d route=%d",')
+ edit('SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",', 'IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeRPLPResetRecoveryReady",gRecOn==1);\n\tIORegistryEntry::getRegistryRoot()->setProperty("WhateverXeRPLPResetRecoveryExtendedReady",gRecExOn==1);\n\tSYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",')
+ # v2 and row-stride routing are separate, explicit exact-RPL trials. Keep
+ # existing recovery/forcewake owner and BAR checks around the imported code.
+ edit('#include "kern_gen11.hpp"', '#include "kern_gen11.hpp"\n#include "kern_raptorlake_p_blit_pitch.hpp"\n#include <kern/thread.h>')
+ edit('if (okba && !checkKernelArgument("-ngreennoblitfix")) {', 'if (okba && wexRplReferenceBlitPitchRequested()) {')
+ edit('if (gRecOn == 1 && sig6 && !checkKernelArgument("-ngreennogpurecex")) {', 'if (gRecOn == 1 && sig6 && wexRplReferenceRecoveryExtendedRequested()) {')
+ edit('static volatile uint32_t gRecExFix = 0, gRecExLastRcu = 0xffffffffu;', 'static volatile uint32_t gRecExFix = 0, gRecExLastRcu = 0xffffffffu;\nstatic volatile uint32_t gRecExBusy=0;\nstatic thread_t gRecPendThread=nullptr;')
+ edit('uint32_t v[5];\n\tfor (int i = 0; i < 5; i++) v[i] = xeRecRd(mmio, kXeRecEx[i]);', 'uint32_t v[5];\n\tgRecExSnapOk=false;\n\tif(!wexRplReferenceRuntimeOwner(acc) || !mmio || NGreen::callback->mmioLength()<0x1A4D4)return;\n\tfor (int i = 0; i < 5; i++){v[i] = xeRecRd(mmio, kXeRecEx[i]);if(v[i]==UINT32_MAX)return;}')
+ edit('if (gRecExOn != 1 || !acc || !mmio) return 0;', 'if (gRecExOn != 1 || !acc || !mmio || !wexRplReferenceRuntimeOwner(acc) || NGreen::callback->mmioLength()<0x1A4D4) return 0;')
+ edit('gRecExLastRcu = rcu;', 'gRecExLastRcu = rcu;\n\tif(rcu==UINT32_MAX)return 0;')
+ edit('uint32_t cur = xeRecRd(mmio, kXeRecEx[i]);', 'uint32_t cur = xeRecRd(mmio, kXeRecEx[i]);\n\t\tif(cur==UINT32_MAX)continue;')
+ edit('if (gRecPendAcc && gRecPendMmio) xeRecExFix(gRecPendAcc, gRecPendMmio);', 'auto *acc=gRecPendAcc;\n\tif(acc && gRecPendMmio && gRecPendThread==current_thread() && type<=1 && wexRplReferenceRuntimeOwner(acc) && *reinterpret_cast<void **>(static_cast<uint8_t *>(acc)+0x1250)==sched)xeRecExFix(acc,gRecPendMmio);')
+ edit('xeRecExSnapshot(acc, mmio);\n\tgRecPendAcc = acc; gRecPendMmio = mmio;', 'const bool extended=gRecExOn==1 && OSCompareAndSwap(0,1,&gRecExBusy);\n\tif(extended){xeRecExSnapshot(acc,mmio);gRecPendThread=current_thread();gRecPendAcc=acc;gRecPendMmio=mmio;}')
+ edit('gRecPendAcc = nullptr; gRecPendMmio = nullptr;\n\tuint32_t exDid = xeRecExFix(acc, mmio);', 'uint32_t exDid=0;\n\tif(extended){gRecPendAcc=nullptr;gRecPendMmio=nullptr;gRecPendThread=nullptr;exDid=xeRecExFix(acc,mmio);__sync_lock_release(&gRecExBusy);}')
+ edit('auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gBfAcc));', 'if(!wexRplReferenceRuntimeOwner(gBfAcc))return;\n\tauto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gBfAcc));')
+ edit('gBfAcc = acc;   //', 'if(!wexRplReferenceRuntimeOwner(acc))return;\n\tgBfAcc = acc;   //')
+ edit('const uint32_t bpp = p[0xa0];\n\tconst uint64_t bytes = px * bpp;', 'if(!p)return false;\n\tconst auto rd32=[p](size_t offset){uint32_t value;memcpy(&value,p+offset,4);return value;};\n\tconst uint32_t bpp = p[0xa0];\n\tif(!bpp || px>UINT64_MAX/bpp)return false;\n\tconst uint64_t bytes = px * bpp;')
+ edit('*reinterpret_cast<const uint32_t *>(p) + *reinterpret_cast<const uint32_t *>(p + 0x2c)', 'rd32(0)+rd32(0x2c)')
+ edit('*reinterpret_cast<const uint32_t *>(p + 0x48) + *reinterpret_cast<const uint32_t *>(p + 0x74)', 'rd32(0x48)+rd32(0x74)')
+ edit('*reinterpret_cast<const uint32_t *>(p + 0x8), dp = *reinterpret_cast<const uint32_t *>(p + 0x50)', 'rd32(8), dp=rd32(0x50)')
+ edit('if ((sp | dp) & 0x3f) {', 'if (RaptorLakeP::BlitPitch::divert(wexRplReferenceBlitPitchRequested() && wexRplReferenceRuntimeOwner(acc),bpp,px,sp,dp)) {')
+ edit('if (!gBfTc) gBfTc = thread_call_allocate(xeBlitFixPublish, nullptr);', 'if(!wexRplReferenceBlitPitchRequested() || v2Size!=60 || size<0x2C264 || memcmp(reinterpret_cast<const void *>(address+0x2C228),v2,60))return false;\n\tif (!gBfTc) gBfTc = thread_call_allocate(xeBlitFixPublish, nullptr);')
  p.write_text(s)

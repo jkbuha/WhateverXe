@@ -4,20 +4,17 @@
 
 namespace XeDataPolicy {
 enum class Client { None, Compiler, WebKitGPU };
+// Identity comes from the running process's kernel code-signing state, never
+// Info.plist, a basename, or caller-provided metadata. Safari updates and moves
+// must not require enumerating executable locations.
+inline bool webKitGPU(const char *identity, bool platformBinary, bool valid) {
+    return platformBinary && valid && identity && !strcmp(identity, "com.apple.WebKit.GPU");
+}
 inline bool service(const char *path, Client client = Client::Compiler) {
-    if (!path || client == Client::None) return false;
-    // WebKit's executable vnode is on the OS Cryptex on newer systems.
-    // Accept only the two OS mount roots, followed by the exact service path.
-    if (client == Client::WebKitGPU) {
-        constexpr const char os[] = "/System/Volumes/Preboot/Cryptexes/OS";
-        constexpr const char incoming[] = "/System/Volumes/Preboot/Cryptexes/Incoming/OS";
-        if (!strncmp(path, os, sizeof(os)-1)) path += sizeof(os)-1;
-        else if (!strncmp(path, incoming, sizeof(incoming)-1)) path += sizeof(incoming)-1;
-    }
-    if (client == Client::WebKitGPU) return path && !strcmp(path,
-        "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/"
-        "com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU");
-    return path && !strcmp(path, "/System/Library/Frameworks/Metal.framework/Versions/A/"
+    // Compiler access keeps its original exact-path contract. WebKit has no
+    // path-based fallback: even a familiar location must pass signature checks.
+    return client == Client::Compiler && path && !strcmp(path,
+        "/System/Library/Frameworks/Metal.framework/Versions/A/"
         "XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService");
 }
 inline bool file(const char *path, bool executable) {

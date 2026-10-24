@@ -171,5 +171,8 @@
   "-wex-rplp-tcss": [],
   "-wex-rplp-early-display": [],
   "-wex-rplp-tcss-observe": [],
-  "-wex-rplp-tcss-aux-probe": []
+  "-wex-rplp-tcss-aux-probe": [],
+  "-wex-rplp-gpu-recovery-v2": [],
+  "-wex-rplp-blit-pitch": [],
+  "-wex-rplp-tcss-live": []
 }

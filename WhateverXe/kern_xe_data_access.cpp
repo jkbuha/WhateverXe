@@ -14,6 +14,9 @@ void *(*executableVnode)(void *);
 void *(*fileVnode)(void *);
 int (*getPath)(void *, char *, int *);
 int (*putVnode)(void *);
+const char *(*signingIdentity)(void *);
+int (*platformBinary)(void *);
+int (*signatureValid)(void *);
 using Open = int (*)(void *, void *, void *, int);
 using Map = int (*)(void *, void *, void *, int, int, uint64_t, int *);
 Open originalOpen;
@@ -23,7 +26,7 @@ volatile SInt32 readGrants, mapGrants;
 
 bool knownOS() {
     const auto v = getKernelVersion();
-    return v >= KernelVersion::Sonoma && v <= KernelVersion::Tahoe;
+    return v >= KernelVersion::BigSur && v <= KernelVersion::Tahoe;
 }
 bool allowed(void *vnode, bool executable) {
     if (!ready || !vnode) return false;
@@ -34,7 +37,17 @@ bool allowed(void *vnode, bool executable) {
     const auto client = XeDataPolicy::clientForFile(path, executable);
     if (client == XeDataPolicy::Client::None) return false;
     auto process = currentProcess();
-    auto image = process ? executableVnode(process) : nullptr;
+    if (!process) return false;
+    if (client == XeDataPolicy::Client::WebKitGPU) {
+        // Current process lifetime covers these kernel queries; do not cache by
+        // PID/path (exec and PID reuse would invalidate such a cache).
+        return signingIdentity && platformBinary && signatureValid &&
+            XeDataPolicy::webKitGPU(signingIdentity(process),
+                platformBinary(process) != 0, signatureValid(process) != 0);
+    }
+    // The native compiler exception is only needed on Sonoma and later.
+    if (getKernelVersion() < KernelVersion::Sonoma) return false;
+    auto image = executableVnode(process);
     if (!image) return false;
     length = sizeof(path);
     const auto error = getPath(image, path, &length);
@@ -74,6 +87,14 @@ void XeDataAccess::processKernel(KernelPatcher &p) {
     p.clearError();
     putVnode = reinterpret_cast<decltype(putVnode)>(p.solveSymbol(KernelPatcher::KernelID, "_vnode_put"));
     p.clearError();
+    signingIdentity = reinterpret_cast<decltype(signingIdentity)>(p.solveSymbol(KernelPatcher::KernelID, "_csproc_get_identity"));
+    p.clearError();
+    platformBinary = reinterpret_cast<decltype(platformBinary)>(p.solveSymbol(KernelPatcher::KernelID, "_csproc_get_platform_binary"));
+    p.clearError();
+    signatureValid = reinterpret_cast<decltype(signatureValid)>(p.solveSymbol(KernelPatcher::KernelID, "_cs_valid"));
+    p.clearError();
+    IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeWebKitIdentitySymbols",
+        signingIdentity && platformBinary && signatureValid);
     enabled = currentProcess && executableVnode && fileVnode && getPath && putVnode;
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessSymbols", enabled);
 }

@@ -15,6 +15,8 @@ with tempfile.TemporaryDirectory(prefix='wex-recovery-') as td:
 #include <array>
 #include <cstdio>
 using mach_vm_address_t=uintptr_t;
+using thread_t=void*;thread_t current_thread(){return reinterpret_cast<void*>(0x1234);}
+bool OSCompareAndSwap(uint32_t a,uint32_t b,volatile uint32_t*p){return __sync_bool_compare_and_swap(p,a,b);}
 #define FunctionCast(name,p) reinterpret_cast<decltype(&name)>(p)
 #define IOLog(...) ((void)0)
 template<class T>T& field(void*p,size_t o){return *reinterpret_cast<T*>(static_cast<uint8_t*>(p)+o);}
@@ -80,7 +82,7 @@ int main(){for(mode=0;mode<16;++mode){
  if(mode==2)field<uint32_t>(engine,0xa4)=4;
  field<void*>(acc,0x1250)=sched;field<void*>(sched,0)=vt;field<void*>(sched,0xca0+8*sib)=cs;field<void*>(cs,0x28)=desc;desc[0]=sib;
  gOrgRge=reinterpret_cast<uintptr_t>(original);gRecSfw=reinterpret_cast<uintptr_t>(sfw);gRecGetDef=reinterpret_cast<uintptr_t>(getDef);gRecS5Proc=reinterpret_cast<uintptr_t>(replay);
- gRecOn=1;gRecResets=gRecSibRestores=gRecSibReplays=gRecOwnFix=gRecSkipKick=0;originals=replays=holds=0;owner=mode!=4;expectedAcc=acc;
+ gRecOn=1;gRecExOn=1;gRecExBusy=0;gRecResets=gRecSibRestores=gRecSibReplays=gRecOwnFix=gRecSkipKick=0;originals=replays=holds=0;owner=mode!=4;expectedAcc=acc;
  if(mode==5)lists[sib][1]=1;
  if(mode==6)lists[sib][0]=65;
  if(mode==7)field<uint32_t>(data[sib],0x24)=0x200000;
@@ -89,7 +91,7 @@ int main(){for(mode=0;mode<16;++mode){
  if(mode==10)vt[0x190/8]=0;
  if(mode==11 || mode==12){field<uint32_t>(mmio,sib?0x1a080:0x2080)=0;if(mode==11){gRecGoodOk[sib]=true;gRecGood[sib][0]=0x40006000;gRecGood[sib][1]=0x8000;}}
  if(mode==13)gRecOn=0;if(mode==14)field<uint32_t>(mmio,sib?0x1a080:0x2080)=UINT32_MAX;if(mode==15)field<uint32_t>(mmio,ownIndex?0x1a080:0x2080)=0x123;
- auto result=xeRecResetGraphicsEngine(ring,nullptr);assert(originals==1&&result==(mode!=3)&&!holds);
+ auto result=xeRecResetGraphicsEngine(ring,nullptr);assert(originals==1&&result==(mode!=3)&&!holds&&!gRecExBusy&&!gRecPendAcc&&!gRecPendMmio&&!gRecPendThread);
  bool restores=mode==0||mode==1||mode==10||mode==11;
  assert(gRecSibRestores==(restores?1:0));assert(replays==(restores&&mode!=10?1:0));
  if(restores){assert(field<uint32_t>(mmio,sib?0x1a080:0x2080));assert(field<uint32_t>(mmio,sib?0x1a29c:0x229c)==0xffff8000);}
@@ -126,4 +128,5 @@ int main(){for(mode=0;mode<16;++mode){
  for p in ['sGdrst','sProc','sFlags']:assert pattern(p) in at(rg,0x320)[0x10:]
  assert at('__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext',4+len(pattern('sS5')))[4:]==pattern('sS5')
  assert pattern('sCs5') in at('__ZN26IGHardwareCommandStreamer515processGPUResetEv',0x40)
+ for p in ['sRcu','sNp']:assert pattern(p) in at('__ZN16IntelAccelerator17initModeRegistersEv',0x120)
  print('PASS generated forcewake transitions/underflow/overflow/owner exclusions, 16 reset-domain cases, and seven exact donor signatures')

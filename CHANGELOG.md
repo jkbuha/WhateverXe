@@ -7,8 +7,11 @@ Xe-LP graphics compatibility for the configurations described in the [README](ht
 - One WEX binary supports Big Sur through Tahoe on the implemented Tiger Lake and Alder Lake-N / Twin Lake backends.
 - Graphics installation uses the signed [WhateverXe Graphics pkg](https://github.com/b00t0x/WhateverXe-Graphics/releases), with no Xe System-volume patch or OCLP dependency.
 - Includes cross-version OS/driver ABI adaptations, OpenCL compatibility and late semaphore mapping invalidation fixes.
+- Preserve WebKit GPU access across Safari installation and update locations by validating its Apple platform signing identity.
 - Supports signed Data graphics bundles with Mod AMFIPass, without `amfi=0x80` or `ipc_control_port_options=0`.
 - Preserve debug information in the bundled dSYM before stripping the kext.
+- The optional RPL-P reference backend corrects the framebuffer NVRAM dispatch on Tahoe and provides separately enabled experimental compute-reset restoration and IOSurface row-stride copy routing.
+- Adds opt-in RPL-P TC3 transport diagnostics and experimental native link training with scoped power ownership and Display-13 PHY register access.
 - Tiger Lake and Alder Lake-N have completed the six-OS functional checks described in the README. Known issues and hardware coverage limits still apply.
 
 ## 0.2.3

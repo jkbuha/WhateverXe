@@ -41,6 +41,8 @@ Support varies by system and connector layout. The table includes implemented
 backends, not a guarantee for every machine. See [device selection](docs/device-selection.md)
 for detailed selection conditions and overrides.
 
+The optional RPL-P reference build is restricted to physical `A7A0` revision 4 on Tahoe and its exact reference driver images. Its Type-C path remains experimental. Other laptop models and GPU identities need separate qualification of memory layout, ACPI, display routing, and driver ABI; the reference build does not automatically admit them.
+
 ## Required components
 
 Download the **RELEASE** ZIP from [Releases](https://github.com/b00t0x/WhateverXe/releases).
@@ -152,9 +154,12 @@ Alder Lake-N / Twin Lake.
 | `-wex-rplp-backlight` | Opt-in UID-19, 16-bit PWM brightness profile for the optional RPL-P panel backend. Preserves Apple/custom profiles and excludes external displays. |
 | `-wex-rplp-tcss` | Experimental ADL-P/RPL-P Type-C discovery for the optional RPL-P panel backend. Exposes the four TC port slots and uses TCSS ready/DP-alt status. Thunderbolt transport is excluded; external link training remains under qualification. |
 | `-wex-rplp-tcss-aux-probe` | With the RPL-P TCSS observer, permits one privileged snapshot to test TC3 PHY/AUX power and read receiver capabilities. Restores its power/ownership requests afterward; does not train a video link. |
-| `-wex-rplp-tcss-observe` | With the experimental RPL-P TCSS backend, records external-port dispatch and mode detection while holding external ports disconnected. Link training is deliberately disabled. |
+| `-wex-rplp-tcss-live` | Experimental TC3-only native link training with the TCSS observer and AUX probe. A successful privileged AUX snapshot must authorize the path first; other external ports stay disconnected. Preserves native AUX references and uses the ADL-P/RPL-P ownership sequence. |
+| `-wex-rplp-tcss-observe` | With the experimental RPL-P TCSS backend, records external-port dispatch and mode detection while holding external ports disconnected. Link training remains disabled unless the separate live trial is explicitly selected. |
 | `-wex-rplp-early-display` | Experimental coordinated RPL-P startup: defers firmware framebuffer binding on the exact supported owner so the native framebuffer can present the first desktop. Requires an early activation coordinator and a recovery configuration. |
 | `-wex-rplp-gpu-recovery` | Opt-in RPL-P shared render-domain reset recovery for the exact reference GPU image. Restores and replays a qualified sibling engine after a native reset; requires native accelerator publication. |
+| `-wex-rplp-gpu-recovery-v2` | Experimental extension to `-wex-rplp-gpu-recovery`. Restores the compute-engine enable state and associated registers before command replay after a shared render-domain reset. Requires both arguments and the exact reference image. |
+| `-wex-rplp-blit-pitch` | Experimental copy-engine routing for large IOSurface copies with supported row strides that are not multiples of 64 bytes. Requires the exact RPL-P reference image and native accelerator ownership. |
 | `-wex-rplp-forcewake-balance` | Opt-in RPL-P forcewake counter balancing for the exact reference GPU image. Automatic release of idle holds remains disabled. |
 | `-wex-rplp-manual-arm` | Hold the RPL-P native diagnostic until an administrator signals the `WhateverXeRPLPControl` service with `BeginDiagnostic=true`. Requires the existing native-probe prerequisites. Allows restoring working boot files before an experimental diagnostic starts. Does not grant normal accelerator admission. |
 | `-wex-rplp-subranges` | Experimental native descriptor allocation, exhaustion, mapped backing-memory aliasing, restoration, release/reuse and non-custom page-pool registration. Requires the complete factory and successful cache-shadow diagnostics. Uses an owned RAM page; uncertain child ownership retains its manager until reboot. Does not enable acceleration. |

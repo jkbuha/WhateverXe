@@ -3,3 +3,6 @@ Patch derived from JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe commit 813d2e6a
 https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/commit/813d2e6adca277dd349ebe9674233953cce66342
 The patch and generated reference sources retain the upstream source license; they are separate from the BSD integration layer. The generated source tree includes LICENSE, NOTICE.md and LICENSE-NootedGreen from the pinned reference checkout.
 Local guard and policy changes are applied by tools/prepare_rplp_recovery.py.
+Additional recovery-v2 and row-stride copy changes derive from commit df7ab78f79d08a8a792292982b46d2bcf110f052 (2026-10-23).
+https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe/commit/df7ab78f79d08a8a792292982b46d2bcf110f052
+These optional changes retain the same upstream license and are gated separately by the BSD integration layer.

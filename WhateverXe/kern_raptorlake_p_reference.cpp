@@ -14,10 +14,14 @@
 #include "kern_raptorlake_p_reference_early.hpp"
 #include "kern_raptorlake_p_reference_redraw.hpp"
 #include "kern_raptorlake_p_reference_tc_aux.hpp"
+#include "kern_raptorlake_p_reference_tc_live.hpp"
+#include "kern_display13_tc.hpp"
 #include <kern/thread.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_raptorlake_p_reference_shutdown.hpp"
+#include "kern_raptorlake_p_reference_nvram.hpp"
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOWorkLoop.h>
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_raptorlake_p_native_core.hpp"
@@ -43,7 +47,9 @@ thread_call_t work;
 thread_call_t monitor;
 thread_call_t framebufferWork;
 thread_call_t moduleWork;
-thread_call_t captureWork;
+thread_call_t captureWork,nativeRescanWork;
+mach_vm_address_t nativeHotplugEntry;
+uint32_t nativeRescanBusy,nativeRescanUsed,nativeRescanState[8]{1};
 thread_call_t earlyPublishWork;
 uint32_t earlyState[8]{1}; // schema, hook ready, calls, blocked, foreign, unselected, wrong class, error
 mach_vm_address_t firmwareProbeOriginal;
@@ -226,6 +232,114 @@ uint32_t compatPortMode(void *port){
  return panelState[13]=mode;
 }
 
+bool observerPort(void *,uint32_t &);
+uint32_t nativeAuxBypassRefs(void *port){
+ uint32_t ddi=~0U;
+ if(!observerPort(port,ddi) || ddi!=5)return ~0U;
+ OSObject *power=nullptr;memcpy(&power,reinterpret_cast<uint8_t *>(framebufferOwner)+0xC8,8);
+ if(!power || power->getMetaClass()->getClassSize()!=0x80 ||
+  strcmp(power->getMetaClass()->getClassName(),"AppleIntelPowerWell"))return ~0U;
+ IOService *owner=nullptr;memcpy(&owner,reinterpret_cast<uint8_t *>(power)+0x10,8);
+ uint8_t alwaysOn=0;memcpy(&alwaysOn,reinterpret_cast<uint8_t *>(power)+0x18,1);
+ if(owner!=framebufferOwner || alwaysOn!=1)return ~0U;
+ uint32_t refs;memcpy(&refs,reinterpret_cast<uint8_t *>(power)+0x68,4);return refs;
+}
+
+// Optional TC3 training remains closed until a privileged, successful AUX
+// preflight. The private TGL mode routine must not write modular-FIA registers
+// for an ADL-P/RPL-P Type-C PHY.
+bool observerPort(void *,uint32_t &);
+IORecursiveLock *livePortLock;
+RaptorLakeP::ReferenceTCLive::Lease livePortLease;
+mach_vm_address_t livePortOriginal,liveBaseMode,liveAuxEnable,liveAuxDisable;
+uint32_t livePortReady,livePortPermission,livePortState[16]{1};
+uint32_t livePhyTrace[12]{1,0,0,0,0,0,0,0,~0U,0,0,0};
+struct LivePortIO {
+ void *port;
+ uint32_t read(uint32_t reg){return backend.readReg32(reg);}
+ void write(uint32_t reg,uint32_t value){backend.writeReg32(reg,value);}
+ void pause(){IOSleep(1);}
+ uint32_t baseMode(uint32_t mode){return reinterpret_cast<uint32_t (*)(void *,uint32_t)>(liveBaseMode)(port,mode);}
+ void auxEnable(){reinterpret_cast<void (*)(void *)>(liveAuxEnable)(port);}
+ void auxDisable(){reinterpret_cast<void (*)(void *)>(liveAuxDisable)(port);}
+ uint32_t auxBypassRefs(){return nativeAuxBypassRefs(port);}
+};
+bool livePortSelected(void *port){
+ if(!__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) || !__atomic_load_n(&livePortPermission,__ATOMIC_ACQUIRE) || !livePortLock)return false;
+ uint32_t ddi=~0U;return observerPort(port,ddi) && ddi==5;
+}
+void publishLivePort(){
+ livePortState[1]=__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE);livePortState[2]=__atomic_load_n(&livePortPermission,__ATOMIC_ACQUIRE);
+ livePortState[9]=livePortLease.parent;livePortState[10]=livePortLease.phy;
+ livePortState[11]=livePortLease.aux;livePortState[12]=livePortLease.active;
+ livePortState[13]=livePortLease.nativeResult;livePortState[14]=livePortLease.writes;
+ if(target)target->setProperty("WhateverXeRPLPReferenceTCLive",livePortState,sizeof(livePortState));
+ if(target)target->setProperty("WhateverXeRPLPReferenceTCPhy",livePhyTrace,sizeof(livePhyTrace));
+}
+uint32_t livePortMode(void *port,uint32_t mode){
+ if(!livePortSelected(port))return livePortOriginal?reinterpret_cast<uint32_t (*)(void *,uint32_t)>(livePortOriginal)(port,mode):static_cast<uint32_t>(kIOReturnNotReady);
+ if(mode!=0 && mode!=3)return static_cast<uint32_t>(kIOReturnUnsupported);
+ IORecursiveLockLock(livePortLock);
+ ++livePortState[3];LivePortIO io{port};
+ using namespace RaptorLakeP::ReferenceTCLive;
+ Status result;
+ if(mode==3){++livePortState[4];result=livePortLease.acquire(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port),true);}
+ else {++livePortState[5];if(livePortLease.owner)result=livePortLease.release(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port));else {livePortLease.nativeResult=io.baseMode(0);result=livePortLease.nativeResult?Status::BaseMode:Status::Ready;}}
+ livePortState[8]=static_cast<uint32_t>(result);publishLivePort();
+ IORecursiveLockUnlock(livePortLock);
+ return result==Status::Ready?static_cast<uint32_t>(kIOReturnSuccess):static_cast<uint32_t>(kIOReturnNotReady);
+}
+uint32_t livePortAUX(void *port,uint32_t command,uint32_t *data,uint32_t bytes,bool retry){
+ if(!livePortSelected(port))return static_cast<uint32_t>(kIOReturnNotReady);
+ IORecursiveLockLock(livePortLock);LivePortIO io{port};
+ const bool ready=livePortLease.witness(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port));
+ uint32_t result=static_cast<uint32_t>(kIOReturnNotReady);
+ if(ready && portAUXOriginal){++livePortState[6];result=reinterpret_cast<uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t,bool)>(portAUXOriginal)(port,command,data,bytes,retry);}
+ else ++livePortState[7];
+ IORecursiveLockUnlock(livePortLock);return result;
+}
+
+IOSimpleLock *livePhyLock;
+mach_vm_address_t liveReadPhyOriginal,liveWritePhyOriginal;
+uint32_t livePhyFault;
+struct LivePhyIO {
+ void *port;
+ bool powerHeld(){LivePortIO io{port};return !livePhyFault && livePortLease.witness(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port));}
+ bool readable(uint32_t reg){return !(reg&3) && reg<=0x1000000-4;}
+ uint32_t read(uint32_t reg){return backend.readReg32(reg);}
+ void write(uint32_t reg,uint32_t value){backend.writeReg32(reg,value);}
+ IOInterruptState lock(){return IOSimpleLockLockDisableInterrupt(livePhyLock);}
+ void unlock(IOInterruptState state){IOSimpleLockUnlockEnableInterrupt(livePhyLock,state);}
+ void bankFault(){livePhyFault=1;++livePortState[15];}
+};
+void recordPhyAccess(uint32_t index,uint32_t raw,const Display13TC::Result &result,bool write){
+ ++livePhyTrace[write?2:1];livePhyTrace[3]=index;livePhyTrace[4]=raw;
+ livePhyTrace[5]=static_cast<uint32_t>(result.status);livePhyTrace[6]=result.before;livePhyTrace[7]=result.after;
+ if(result.status!=Display13TC::Status::Complete && livePhyTrace[8]==~0U){livePhyTrace[8]=index;livePhyTrace[9]=raw;livePhyTrace[10]=static_cast<uint32_t>(result.status);}
+}
+uint32_t livePortReadPhy(void *port,uint32_t index){
+ if(!livePortSelected(port))return liveReadPhyOriginal?reinterpret_cast<uint32_t (*)(void *,uint32_t)>(liveReadPhyOriginal)(port,index):0;
+ if(index<0x34 || index>0x49){__sync_fetch_and_add(&livePhyTrace[11],1);return 0;}
+ IORecursiveLockLock(livePortLock);uint32_t raw=0,value=0;
+ memcpy(&raw,static_cast<uint8_t *>(port)+0x580+4*index,4);
+ Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
+ const auto result=Display13TC::Dekel::access(io,coordinates,index,raw,false,value);
+ recordPhyAccess(index,raw,result,false);
+ if(result.status!=Display13TC::Status::Complete){value=0;++livePortState[7];}
+ IORecursiveLockUnlock(livePortLock);return value;
+}
+void livePortWritePhy(void *port,uint32_t index,uint32_t value){
+ if(!livePortSelected(port)){if(liveWritePhyOriginal)reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(liveWritePhyOriginal)(port,index,value);return;}
+ if(index<0x34 || index>0x49){__sync_fetch_and_add(&livePhyTrace[11],1);return;}
+ IORecursiveLockLock(livePortLock);uint32_t raw=0;
+ memcpy(&raw,static_cast<uint8_t *>(port)+0x580+4*index,4);
+ Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
+ const auto result=Display13TC::Dekel::access(io,coordinates,index,raw,true,value);
+ recordPhyAccess(index,raw,result,true);
+ if(result.status!=Display13TC::Status::Complete)++livePortState[7];
+ IORecursiveLockUnlock(livePortLock);
+}
+
 // The observer holds external ports disconnected: no Type-C ownership, AUX or
 // link training is permitted until runtime dispatch has been qualified.
 uint32_t observedPortState(void *port){
@@ -254,6 +368,7 @@ uint32_t observedPortState(void *port){
  portObserve[index+4]=compatPortMode(port);
  portObserve[index+5]=backend.readReg32(0x44470);
  portObserve[index+6]=backend.readReg32(0xC4000);
+ if(livePortSelected(port))return portStateOriginal?reinterpret_cast<uint32_t (*)(void *)>(portStateOriginal)(port):0;
  uint32_t disconnected=0;memcpy(bytes+0x554,&disconnected,4);
  __sync_fetch_and_add(&portBindings[7],1);
  return 0;
@@ -276,14 +391,14 @@ bool observerSelected(){return wexRplReferenceTCSSRequested() && checkKernelArgu
 uint32_t observedPortHPD(void *port){
  if(observerSelected()){
   uint32_t ddi;if(!observerPort(port,ddi))return 0;
-  if(ddi){__sync_fetch_and_add(&portBindings[5],1);return 0;}
+  if(ddi && !livePortSelected(port)){__sync_fetch_and_add(&portBindings[5],1);return 0;}
  }
  return portHPDOriginal?reinterpret_cast<uint32_t (*)(void *)>(portHPDOriginal)(port):0;
 }
 uint32_t observedPortAUX(void *port,uint32_t command,uint32_t *data,uint32_t bytes,bool retry){
  if(observerSelected() && !(auxProbePermit && auxProbePort==port && auxProbeThread==current_thread())){
   uint32_t ddi;if(!observerPort(port,ddi))return static_cast<uint32_t>(kIOReturnNotReady);
-  if(ddi){__sync_fetch_and_add(&portBindings[6],1);return static_cast<uint32_t>(kIOReturnNotReady);}
+  if(ddi){if(livePortSelected(port))return livePortAUX(port,command,data,bytes,retry);__sync_fetch_and_add(&portBindings[6],1);return static_cast<uint32_t>(kIOReturnNotReady);}
  }
  using Run=uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t,bool);
  return portAUXOriginal?reinterpret_cast<Run>(portAUXOriginal)(port,command,data,bytes,retry):static_cast<uint32_t>(kIOReturnNotReady);
@@ -319,9 +434,84 @@ bool captureAllowed(){
   wexRplReferenceFBAllowed(framebufferOwner);
 }
 
+// Root-triggered TC3 rescan. The ordinary donor connectionProbe deliberately
+// ignores external heads. Keep this native controller action on its workloop;
+// no arbitrary connector, mode, function pointer or register is user supplied.
+mach_vm_address_t agdcCallbackOriginal;
+uint32_t agdcTraceReady,agdcTraceSequence,agdcTraceRows[32][8]{};
+void recordAGDC(uint32_t kind,uint32_t event,unsigned long argument,uint32_t value,uint32_t result){
+ auto seq=__sync_add_and_fetch(&agdcTraceSequence,1);
+ uint32_t row[]{0,kind,event,argument<=9?static_cast<uint32_t>(argument):~0U,value,result,state[6],0};
+ auto store=[&](uint32_t *to){__atomic_store_n(to,0U,__ATOMIC_RELEASE);memcpy(to+1,row+1,28);__atomic_store_n(to,seq,__ATOMIC_RELEASE);};
+ store(agdcTraceRows[16+(seq%16)]);if(seq<=16)store(agdcTraceRows[seq-1]);
+}
+uint32_t observedAGDCCallback(void *owner,uint32_t event,unsigned long argument,uint32_t value){
+ const bool own=owner==framebufferOwner && wexRplReferenceFBAllowed(framebufferOwner);
+ if(own)recordAGDC(1,event,argument,value,~0U);
+ auto result=reinterpret_cast<uint32_t (*)(void *,uint32_t,unsigned long,uint32_t)>(agdcCallbackOriginal)(owner,event,argument,value);
+ if(own)recordAGDC(2,event,argument,value,result);
+ return result;
+}
+bool nativeAGDCCallbackBound(){
+ if(!framebufferOwner || !wexRplReferenceFBAllowed(framebufferOwner))return false;
+ uintptr_t function=0,context=0;memcpy(&function,reinterpret_cast<uint8_t *>(framebufferOwner)+0x1C00,8);
+ memcpy(&context,reinterpret_cast<uint8_t *>(framebufferOwner)+0x1C08,8);
+ return function && context;
+}
+void publishAGDCObservation(){
+ if(!target || !captureAllowed())return;
+ uint32_t meta[12]{1,agdcTraceReady,agdcTraceSequence,nativeAGDCCallbackBound(),~0U,~0U,~0U,~0U,~0U,0,0,0};
+ auto port=getPortEntry?reinterpret_cast<OSObject *(*)(uint32_t)>(getPortEntry)(5):nullptr;uint32_t ddi=~0U;
+ if(observerPort(port,ddi) && ddi==5){
+  memcpy(&meta[4],reinterpret_cast<uint8_t *>(port)+0x120,4);
+  memcpy(&meta[5],reinterpret_cast<uint8_t *>(port)+0x550,4);
+  memcpy(&meta[6],reinterpret_cast<uint8_t *>(port)+0x554,4);
+  uint8_t sinks=0;memcpy(&sinks,reinterpret_cast<uint8_t *>(port)+0xF8,1);meta[7]=sinks;
+  meta[8]=nativeAuxBypassRefs(port);meta[9]=livePortLease.auxRequest;
+ }
+ uint32_t rows[32][8]{};
+ for(unsigned i=0;i<32;++i){auto seq=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE);memcpy(rows[i],agdcTraceRows[i],32);if(!seq || seq!=rows[i][0] || seq!=__atomic_load_n(agdcTraceRows[i],__ATOMIC_ACQUIRE))memset(rows[i],0,32);}
+ target->setProperty("WhateverXeRPLPReferenceAGDCMeta",meta,sizeof(meta));
+ target->setProperty("WhateverXeRPLPReferenceAGDCTrace",rows,sizeof(rows));
+}
+
+bool nativeRescanPermitted(){
+ return nativeHotplugEntry && nativeRescanWork && captureAllowed() && shutdownQuery && !shutdownQuery() &&
+  __atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) && __atomic_load_n(&livePortPermission,__ATOMIC_ACQUIRE) &&
+  !livePortLease.owner && !livePortLease.active;
+}
+void publishNativeRescan(){if(target)target->setProperty("WhateverXeRPLPReferenceTCRescan",nativeRescanState,sizeof(nativeRescanState));}
+IOReturn nativeRescanAction(OSObject *owner,void *,void *,void *,void *){
+ if(owner!=framebufferOwner || !nativeRescanPermitted() || !nativeAGDCCallbackBound())return kIOReturnNotReady;
+ auto loop=framebufferOwner->getWorkLoop();
+ if(!loop || !loop->inGate() || !getPortEntry)return kIOReturnNotReady;
+ auto port=reinterpret_cast<OSObject *(*)(uint32_t)>(getPortEntry)(5);
+ uint32_t ddi=~0U;
+ if(!observerPort(port,ddi) || ddi!=5 || !livePortSelected(port))return kIOReturnNotReady;
+ auto tc=backend.readReg32(0x161508),hpd=backend.readReg32(0x44470);
+ if(tc==~0U || (tc&7)!=5 || hpd==~0U || !(hpd&(1U<<18)) || (hpd&(1U<<2)))return kIOReturnNotReady;
+ memcpy(&nativeRescanState[5],reinterpret_cast<uint8_t *>(port)+0x550,4);
+ port->retain();++nativeRescanState[4];
+ reinterpret_cast<void (*)(void *,uint32_t,uint32_t)>(nativeHotplugEntry)(framebufferOwner,5,3);
+ memcpy(&nativeRescanState[6],reinterpret_cast<uint8_t *>(port)+0x550,4);
+ memcpy(&nativeRescanState[7],reinterpret_cast<uint8_t *>(port)+0x554,4);
+ port->release();publishLivePort();return kIOReturnSuccess;
+}
+void nativeRescanWorker(thread_call_param_t,thread_call_param_t){
+ IOReturn result=kIOReturnNotReady;
+ if(nativeRescanPermitted()){
+  auto owner=framebufferOwner;owner->retain();
+  auto loop=owner->getWorkLoop();
+  if(loop){loop->retain();result=loop->runAction(nativeRescanAction,owner);loop->release();}
+  owner->release();
+ }
+ nativeRescanState[3]=result;publishNativeRescan();
+ __sync_synchronize();nativeRescanBusy=0;
+}
+
 void probeTCAux(){
  using namespace RaptorLakeP::ReferenceTCAux;
- Result result;
+ ParentResult result;
  if(auxReadEntry && getPortEntry && portBindings[1]==2 && !portBindings[2] && captureAllowed() && observerSelected()){
   auto port=reinterpret_cast<OSObject *(*)(uint32_t)>(getPortEntry)(5);
   uint32_t ddi=0;
@@ -338,11 +528,12 @@ void probeTCAux(){
      auxProbePermit=0;__sync_synchronize();return result;
     }
    } io;
-   result=probe(io,true);
+   result=probeWithParent(io,true);
    auxProbePermit=0;auxProbeThread=nullptr;auxProbePort=nullptr;port->release();
   }
  }
  if(target)target->setProperty("WhateverXeRPLPReferenceTCAUX",&result,sizeof(result));
+ if(__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) && result.aux.status==RaptorLakeP::ReferenceTCAux::Complete && result.aux.nativeResult==0){IORecursiveLockLock(livePortLock);__atomic_store_n(&livePortPermission,1,__ATOMIC_RELEASE);publishLivePort();IORecursiveLockUnlock(livePortLock);}
 }
 
 void captureWorker(thread_call_param_t,thread_call_param_t){
@@ -364,6 +555,8 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   target->setProperty("WhateverXeRPLPReferenceConnectors",&connectors,sizeof(connectors));
   auto tc=RaptorLakeP::ReferenceConnectors::typeC(io,sample.status==RaptorLakeP::ReferenceSnapshot::Complete && sample.activePipes);
   target->setProperty("WhateverXeRPLPReferenceTypeC",&tc,sizeof(tc));
+  if(livePortLock){IORecursiveLockLock(livePortLock);publishLivePort();IORecursiveLockUnlock(livePortLock);}
+  publishAGDCObservation();
   target->setProperty("WhateverXeRPLPReferencePortModes",portModes,sizeof(portModes));
   target->setProperty("WhateverXeRPLPReferencePortObserver",portObserve,sizeof(portObserve));
   target->setProperty("WhateverXeRPLPReferencePortBindings",portBindings,sizeof(portBindings));
@@ -676,6 +869,32 @@ bool wexRplReferenceAcceleratorProbeHooks(KernelPatcher &p,size_t i,mach_vm_addr
  return ok;
 }
 
+bool wexRplReferenceNVRAMHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ using namespace RaptorLakeP::ReferenceNVRAM;
+ if(!wexRplReferencePanel() || !state[1] || !target || XELP::kernelOS(version)!=XELP::OS::Tahoe)return false;
+ bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && n>=Call+sizeof(Before);
+ auto method=p.solveSymbol(i,"__ZN24AppleIntelBaseController11hwSaveNVRAMEv",a,n);p.clearError();
+ auto table=p.solveSymbol(KernelPatcher::KernelID,"__ZTV18IODTPlatformExpert");p.clearError();
+ auto writer=p.solveSymbol(KernelPatcher::KernelID,"__ZN18IODTPlatformExpert18writeNVRAMPropertyEP15IORegistryEntryPK8OSSymbolP6OSData");p.clearError();
+ auto reserved=p.solveSymbol(KernelPatcher::KernelID,"__ZN18IODTPlatformExpert28_RESERVEDIODTPlatformExpert1Ev");p.clearError();
+ uintptr_t oldBinding=0,newBinding=0;
+ if(table && writer && reserved){
+  memcpy(&oldBinding,reinterpret_cast<void *>(table+16+OldSlot),sizeof(oldBinding));
+  memcpy(&newBinding,reinterpret_cast<void *>(table+16+WriteSlot),sizeof(newBinding));
+ }
+ ok=ok && method>=a && accepts(reinterpret_cast<const uint8_t *>(a+Call),sizeof(Before),method-a,
+                             oldBinding,reserved,newBinding,writer);
+ if(ok){
+  // Preserve native NVRAM construction, write, status and cleanup. Only fix
+  // the obsolete virtual dispatch slot that calls a reserved method on Tahoe.
+  p.routeBlock(a+Call,After,sizeof(After));
+  ok=p.getError()==KernelPatcher::Error::NoError && !memcmp(reinterpret_cast<void *>(a+Call),After,sizeof(After));
+  p.clearError();
+ }
+ target->setProperty("WhateverXeRPLPNVRAMABIReady",ok);
+ SYSLOG("rplp","reference framebuffer NVRAM ABI ready=%u",ok);
+ return ok;
+}
 bool wexRplReferencePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
  if(!wexRplReferenceTCSSSelected() || !checkKernelArgument("-wex-rplp-tcss-observe"))return true;
  bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && panelState[10] && compatPortEntry;
@@ -729,6 +948,65 @@ bool wexRplReferencePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size
  portObserve[1]=ok;portObserve[2]=ok?0:1;portBindings[2]=ok?0:1;
  if(target){target->setProperty("WhateverXeRPLPReferencePortObserver",portObserve,sizeof(portObserve));target->setProperty("WhateverXeRPLPReferencePortBindings",portBindings,sizeof(portBindings));}
  return ok;
+}
+
+bool wexRplReferenceLivePortHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(!checkKernelArgument("-wex-rplp-tcss-live"))return true;
+ bool ok=wexRplReferenceTCSSSelected() && checkKernelArgument("-wex-rplp-tcss-observe") &&
+  checkKernelArgument("-wex-rplp-tcss-aux-probe") && wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) &&
+  portBindings[1]==2 && !portBindings[2] && n>=0x902FA;
+ const char *names[]{"__ZN17AppleIntelPortHAL11setPortModeEN14AppleIntelPort8PortModeE",
+  "__ZN14AppleIntelPort11setPortModeENS_8PortModeE","__ZN14AppleIntelPort18enablePowerWellAuxEv","__ZN14AppleIntelPort19disablePowerWellAuxEv",
+  "__ZN17AppleIntelPortHAL15ReadDekelPhyRegEj","__ZN17AppleIntelPortHAL16WriteDekelPhyRegEjj"};
+ const uint32_t offsets[]{0x8F344,0x262EA,0x2972C,0x29768,0x90234,0x902EA};
+ const uint8_t prefixes[6][16]{
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC},
+  {0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x48,0x83,0xEC,0x20,0x48,0xFF,0x05,0x64,0x35},
+  {0x55,0x48,0x89,0xE5,0x48,0xFF,0x05,0x51,0x0B,0x12,0x00,0x48,0xFF,0x05,0x52,0xFF},
+  {0x55,0x48,0x89,0xE5,0x48,0xFF,0x05,0x1D,0x0B,0x12,0x00,0x48,0xFF,0x05,0x16,0xFF},
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0xFF,0x05,0xB3,0xD2,0x0C},
+  {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0xFF,0x05,0x0C,0xD2}};
+ mach_vm_address_t entries[6]{};
+ for(unsigned x=0;ok&&x<6;x++){
+  entries[x]=p.solveSymbol(i,names[x],a,n);p.clearError();
+  ok=entries[x]==a+offsets[x] && n>=offsets[x]+16 && !memcmp(reinterpret_cast<void *>(entries[x]),prefixes[x],16);
+ }
+ if(ok){livePortLock=IORecursiveLockAlloc();livePhyLock=livePortLock?IOSimpleLockAlloc():nullptr;ok=livePortLock && livePhyLock;}
+ if(ok){
+  liveBaseMode=entries[1];liveAuxEnable=entries[2];liveAuxDisable=entries[3];
+  KernelPatcher::RouteRequest routes[]{
+   {names[0],livePortMode,livePortOriginal},{names[4],livePortReadPhy,liveReadPhyOriginal},
+   {names[5],livePortWritePhy,liveWritePhyOriginal}};
+  ok=p.routeMultiple(i,routes,3,a,n);p.clearError();
+ }
+ __atomic_store_n(&livePortReady,ok,__ATOMIC_RELEASE);publishLivePort();
+ SYSLOG("rplp","optional TC3 live transition ready=%u; awaiting privileged AUX preflight",ok);
+ return ok;
+}
+
+bool wexRplReferenceNativeHotplugHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(!checkKernelArgument("-wex-rplp-tcss-live"))return true;
+ const char *name="__ZN24AppleIntelBaseController20invokeHotplugHandlerEjN14AppleIntelPort8PortModeE";
+ auto entry=p.solveSymbol(i,name,a,n);p.clearError();
+ const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC};
+ const uint8_t lookup[]{0x44,0x89,0xE7,0xE8,0x96,0x5B,0xF7,0xFF,0x48,0x85,0xC0,0x0F};
+ const bool ok=nativeRescanWork && __atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) &&
+  wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && n>=0xB0C9A && entry==a+0xAFE6C &&
+  !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix)) &&
+  !memcmp(reinterpret_cast<void *>(a+0xAFF14),lookup,sizeof(lookup));
+ if(ok)nativeHotplugEntry=entry;
+ nativeRescanState[1]=ok;publishNativeRescan();return ok;
+}
+
+bool wexRplReferenceAGDCObservationHooks(KernelPatcher &p,size_t i,mach_vm_address_t a,size_t n){
+ if(!checkKernelArgument("-wex-rplp-tcss-live"))return true;
+ const char *name="__ZN24AppleIntelBaseController12CallBackAGDCE31kAGDCRegisterLinkControlEvent_tmj";
+ auto entry=p.solveSymbol(i,name,a,n);p.clearError();
+ const uint8_t prefix[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xEC,0x20};
+ bool ok=wexRplReferenceImage(reinterpret_cast<void *>(a),n,false) && __atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) &&
+  n>=0x9F9CA+sizeof(prefix) && entry==a+0x9F9CA && !memcmp(reinterpret_cast<void *>(entry),prefix,sizeof(prefix));
+ if(ok){KernelPatcher::RouteRequest route{name,observedAGDCCallback,agdcCallbackOriginal};ok=p.routeMultiple(i,&route,1,a,n);p.clearError();}
+ agdcTraceReady=ok;return ok;
 }
 
 bool wexRplReferenceValidate(){
@@ -807,6 +1085,8 @@ void wexRplReferenceContextFree(void *object){
  reinterpret_cast<void (*)(void *)>(wexRplReferenceContextFreeOriginal)(object);
 }
 bool wexRplReferenceRecoveryRequested(){return wexRplReferencePanel() && state[1] && !state[7] && checkKernelArgument("-wex-rplp-gpu-recovery");}
+bool wexRplReferenceRecoveryExtendedRequested(){return wexRplReferenceRecoveryRequested() && checkKernelArgument("-wex-rplp-gpu-recovery-v2");}
+bool wexRplReferenceBlitPitchRequested(){return wexRplReferencePanel() && state[1] && !state[7] && checkKernelArgument("-wex-rplp-blit-pitch");}
 bool wexRplReferenceForceWakeRequested(){return wexRplReferencePanel() && state[1] && !state[7] && checkKernelArgument("-wex-rplp-forcewake-balance");}
 bool wexRplReferenceForceWakeOwner(const void *owner){
  return wexRplReferenceForceWakeRequested() && state[4] && owner && owner==nativeOwner && shutdownQuery && !shutdownQuery();
@@ -857,6 +1137,7 @@ void init(){
  if(wexRplReferencePanel())contextLock=IOSimpleLockAlloc();
  monitor=thread_call_allocate(monitorWorker,nullptr);
  if(wexRplReferencePanel())captureWork=thread_call_allocate(captureWorker,nullptr);
+ if(wexRplReferencePanel() && checkKernelArgument("-wex-rplp-tcss-live"))nativeRescanWork=thread_call_allocate(nativeRescanWorker,nullptr);
  if(wexRplReferencePanel())moduleWork=thread_call_allocate(moduleWorker,nullptr);
  if(wexRplReferencePanel())framebufferWork=thread_call_allocate(framebufferWorker,nullptr);
  if(wexRplReferencePanel() && earlyRequested())earlyPublishWork=thread_call_allocate(earlyPublish,nullptr);
@@ -884,6 +1165,15 @@ bool captureState(){
 #ifdef WEX_RPLP_REFERENCE_BACKEND
  if(!captureWork || !captureAllowed() || !__sync_bool_compare_and_swap(&captureBusy,0,1))return false;
  thread_call_enter(captureWork);return true;
+#else
+ return false;
+#endif
+}
+bool rescanTC3(){
+#ifdef WEX_RPLP_REFERENCE_BACKEND
+ if(!nativeRescanPermitted() || !__sync_bool_compare_and_swap(&nativeRescanBusy,0,1))return false;
+ if(!__sync_bool_compare_and_swap(&nativeRescanUsed,0,1)){nativeRescanBusy=0;return false;}
+ ++nativeRescanState[2];publishNativeRescan();thread_call_enter(nativeRescanWork);return true;
 #else
  return false;
 #endif
