@@ -22,7 +22,7 @@ void IORecursiveLockLock(IORecursiveLock *l){assert(l==&lock);++l->depth;if(l->d
 void IORecursiveLockUnlock(IORecursiveLock *l){assert(l==&lock&&l->depth);--l->depth;}
 void IOSleep(unsigned n){assert(n==1);}
 struct Backend {
- std::map<uint32_t,uint32_t> regs{{0x45404,0xC03},{0x42000,1U<<25},{0x161508,0x35},{0x44470,0x40000},{0x45454,3},{0x45444,3},{0x64500,0x80},{0x64510,0x40000800},{0x16E8A0,0x00005A0C},{0x16E8C0,0xA5A5A5A0}};
+ std::map<uint32_t,uint32_t> regs{{0x46048,0},{0x45404,0xC03},{0x42000,1U<<25},{0x161508,0x35},{0x44470,0x40000},{0x45454,3},{0x45444,3},{0x64500,0x80},{0x64510,0x40000800},{0x16E8A0,0x00005A0C},{0x16E8C0,0xA5A5A5A0}};
  uint32_t readReg32(uint32_t r){assert(regs.count(r));auto v=regs[r];if(r==0x45404)v=(v&~4U)|((v&8)?4:0);if(r==0x45444)v=(v&~0x400U)|((v&0x800)?0x400:0);return v;}
  void writeReg32(uint32_t r,uint32_t v){assert(r==0x45444||r==0x45404||r==0x64500||r==0x64510||r==0x1010A0||r==0x46048||r==0x16E8C0||(r>=0x16A000&&r<0x16B000));if(r==0x64510){auto w1c=(1U<<30)|(1U<<28)|(1U<<25);assert(!(v&w1c));regs[r]=(v&~w1c)|(regs[r]&w1c);}else regs[r]=r==0x45404?v&~4U:v;}
 } backend;
@@ -65,6 +65,15 @@ int main(){
  uint32_t foreign=1;memcpy(portMemory+0x580+4*0x34,&foreign,4);assert(livePortReadPhy(portObject,0x34)==0);memcpy(portMemory+0x580+4*0x34,table,4);
 
  assert(!livePortAUX(portObject,9,&data,4,true)&&data==0x1234&&auxCalls==1&&enables==1&&lock.maximum==2&&!lock.depth);
+ // A falling HPD must allow native direct PLL shutdown, while leaving
+ // banked PHY programming and PLL enable requests blocked.
+ backend.regs[0x161508]=4;backend.regs[0x44470]=0;
+ assert(livePortReadPhy(portObject,0x38)==0x90000000);
+ assert(!livePortReadPhy(portObject,0x34));
+ livePortWritePhy(portObject,0x34,0xAABBCCDD);assert(backend.regs[0x16A0D4]==0x11223344);
+ livePortWritePhy(portObject,0x38,0x80000000);assert(backend.regs[0x46048]==0x90000000);
+ livePortWritePhy(portObject,0x38,0);assert(!backend.regs[0x46048]);
+ backend.regs[0x161508]=0x35;backend.regs[0x44470]=0x40000;
  backend.regs[0x64500]&=~64U;assert(livePortAUX(portObject,9,&data,4,true)==kIOReturnNotReady&&auxCalls==1);backend.regs[0x64500]|=64;
  backend.regs[0x64500]|=1U<<31;assert(livePortMode(portObject,0)==kIOReturnNotReady&&livePortLease.aux&&!disables);backend.regs[0x64500]&=~(1U<<31);
  assert(livePortMode(portObject,0)==kIOReturnSuccess&&!livePortLease.owner&&disables==1&&baseModes==2&&mode==0&&backend.regs[0x45404]==0xC03&&!lock.depth);
@@ -75,9 +84,10 @@ int main(){
  assert(livePhyTrace[0]==2&&livePhyTrace[8]==0x34&&livePhyTrace[9]==1&&livePhyTrace[15]==0);
  const auto savedFailure=livePhyTrace[8];
  Display13TC::Result failure;failure.status=Display13TC::Status::Readback;failure.before=0x11;failure.after=0x22;failure.writes=1;
+ const auto priorPLLWrites=livePhyRegisters[4][3];
  for(unsigned i=0;i<100;i++)recordPhyAccess(0x38,0x46030,failure,true,0x33+i);
  assert(livePhyWriteCount==64&&livePhyWrites[0][1]==0x38&&livePhyWrites[0][3]==0x90000000);
- assert(livePhyRegisters[4][3]==101&&livePhyRegisters[4][4]==0x33+99&&livePhyRegisters[4][5]==0x11&&livePhyRegisters[4][6]==0x22);
+ assert(livePhyRegisters[4][3]==priorPLLWrites+100&&livePhyRegisters[4][4]==0x33+99&&livePhyRegisters[4][5]==0x11&&livePhyRegisters[4][6]==0x22);
  assert(livePhyTrace[8]==savedFailure); // First failure is immutable across retries.
  livePhyTrace[8]=~0U;recordPhyAccess(0x38,0x46030,failure,true,0x99);
  assert(livePhyTrace[12]==0x11&&livePhyTrace[13]==0x22&&livePhyTrace[14]==0x99&&livePhyTrace[15]==1);

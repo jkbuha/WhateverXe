@@ -4,7 +4,7 @@
 #include "kern_raptorlake_p_reference_tc_live.hpp"
 using namespace RaptorLakeP::ReferenceTCLive;
 struct IO {
- std::map<uint32_t,uint32_t> regs{{0x45404,0xC03},{0x42000,1U<<25},{0x161508,0x35},{0x44470,0x40000},{0x45454,3},{0x45444,3},{0x64500,0x80},{0x64510,0x40000800}};
+ std::map<uint32_t,uint32_t> regs{{0x46048,0},{0x45404,0xC03},{0x42000,1U<<25},{0x161508,0x35},{0x44470,0x40000},{0x45454,3},{0x45444,3},{0x64500,0x80},{0x64510,0x40000800}};
  unsigned reads{},writes{},pauses{},auxRefs{},enables{},disables{},mode{};uint32_t failedReg{},baseFailure{};bool fuse=true,ownership=true,disconnectOnAux=false,bypass=false,proof=true;unsigned baseCalls{};
  uint32_t read(uint32_t r){assert(regs.count(r));++reads;auto v=regs[r];if(r==0x42000&&!fuse)return 0;if(r==0x161508&&disconnectOnAux&&enables)return 4;
   if(r==0x45404&&failedReg!=r)v=(v&~4U)|((v&8)?4:0);
@@ -22,6 +22,22 @@ struct IO {
  uint32_t auxBypassRefs(){return bypass&&proof?auxRefs:~0U;}
 };
 int main(){
+
+ {IO x;Lease p;assert(p.acquire(x,1,2,true)==Status::Ready);
+  x.regs[0x161508]=4;x.regs[0x44470]=0;
+  assert(!p.witness(x,1,2)&&p.teardownWitness(x,1,2));
+  assert(!p.teardownWitness(x,3,2)&&!p.teardownWitness(x,1,3));
+  x.regs[0x64500]|=0x80000000;assert(!p.teardownWitness(x,1,2));x.regs[0x64500]&=~0x80000000U;
+  x.regs[0x46048]=0xCC000000;
+  assert(p.release(x,1,2)==Status::Busy&&p.phy&&p.active&&x.auxRefs==1&&p.aux&&(x.regs[0x64500]&64));
+  assert(p.teardownWitness(x,1,2));
+  auto savedAux=x.regs[0x45444];x.regs[0x45444]=3;
+  assert(p.teardownWitness(x,1,2)); // Direct PLL readout needs retained PW2/PHY, not AUX.
+  x.regs[0x45444]=savedAux;
+  x.regs[0x46048]=0x40000000;assert(p.release(x,1,2)==Status::Busy&&p.phy);
+  x.regs[0x46048]=0;assert(p.release(x,1,2)==Status::Ready&&!p.owner&&!p.phy);
+  assert(!p.teardownWitness(x,1,2));
+ }
  IO io;Lease l;assert(l.acquire(io,1,2,false)==Status::Denied&&!io.reads&&!io.writes);
  assert(l.acquire(io,0,2,true)==Status::Denied&&!io.reads);
  io={};l={};assert(l.acquire(io,1,2,true)==Status::Ready&&l.active&&l.parent&&l.phy&&l.aux&&l.base&&io.auxRefs==1&&io.mode==3);assert(!(io.regs[0x64510]&0x800));assert(io.regs[0x64510]&(1U<<30));

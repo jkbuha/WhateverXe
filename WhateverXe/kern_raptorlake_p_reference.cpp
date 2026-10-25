@@ -325,8 +325,12 @@ mach_vm_address_t liveReadPhyOriginal,liveWritePhyOriginal;
 uint32_t livePhyFault;
 thread_t liveVoltageThread;void *liveVoltagePort;
 struct LivePhyIO {
- void *port;
- bool powerHeld(){LivePortIO io{port};return !livePhyFault && livePortLease.witness(io,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(port));}
+ void *port;bool teardownPLL{};
+ bool powerHeld(){
+  if(livePhyFault)return false;
+  LivePortIO io{port};auto who=reinterpret_cast<uintptr_t>(framebufferOwner),object=reinterpret_cast<uintptr_t>(port);
+  return livePortLease.witness(io,who,object) || (teardownPLL && livePortLease.teardownWitness(io,who,object));
+ }
  bool readable(uint32_t reg){return !(reg&3) && reg<=0x1000000-4;}
  uint32_t read(uint32_t reg){return backend.readReg32(reg);}
  void write(uint32_t reg,uint32_t value){backend.writeReg32(reg,value);}
@@ -384,7 +388,7 @@ uint32_t livePortReadPhy(void *port,uint32_t index){
  if(index<0x34 || index>0x49){__sync_fetch_and_add(&livePhyTrace[11],1);return 0;}
  IORecursiveLockLock(livePortLock);uint32_t raw=0,value=0;
  memcpy(&raw,static_cast<uint8_t *>(port)+0x580+4*index,4);
- Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
+ Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port,index==0x38};
  const auto result=Display13TC::Dekel::access(io,coordinates,index,raw,false,value);
  recordPhyAccess(index,raw,result,false,0);
  if(result.status!=Display13TC::Status::Complete){value=0;++livePortState[7];}
@@ -395,7 +399,7 @@ void livePortWritePhy(void *port,uint32_t index,uint32_t value){
  if(index<0x34 || index>0x49){__sync_fetch_and_add(&livePhyTrace[11],1);return;}
  IORecursiveLockLock(livePortLock);uint32_t raw=0;
  memcpy(&raw,static_cast<uint8_t *>(port)+0x580+4*index,4);
- Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port};
+ Display13TC::Port coordinates;Display13TC::Port::resolve(5,coordinates);LivePhyIO io{port,index==0x38 && !(value&0x80000000U)};
  if(liveVoltageThread==current_thread() && liveVoltagePort==port && (index==0x44 || index==0x47))value=RaptorLakeP::ReferenceVoltage::dpControl(value);
  const auto requested=value;
  const auto result=Display13TC::Dekel::access(io,coordinates,index,raw,true,value);

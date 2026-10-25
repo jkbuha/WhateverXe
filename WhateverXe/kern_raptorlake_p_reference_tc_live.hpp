@@ -19,6 +19,15 @@ struct Lease {
   auto b=io.read(0x64500),a=io.read(0x45444);
   return b!=~0U && (b&64) && a!=~0U && (a&0xC00)==0xC00 && connected(io);
  }
+ // HPD falls before native PLL shutdown. This is a retained-power proof for
+ // that direct, disable-only access, not permission to train a disconnected
+ // sink or touch its banked PHY. AUX may already have been put by native code.
+ template<class IO> bool teardownWitness(IO &io,uintptr_t who,uintptr_t port){
+  if(!active || !phy || !who || !port || owner!=who || object!=port)return false;
+  auto core=io.read(0x45404);if(core==~0U || (core&12)!=12)return false;
+  auto buffer=io.read(0x64500);
+  return buffer!=~0U && (buffer&0x800000C0U)==0xC0;
+ }
  template<class IO> Status release(IO &io,uintptr_t who,uintptr_t port){
   if(!who||!port||owner!=who||object!=port)return Status::Foreign;
   auto core=io.read(0x45404);
@@ -26,6 +35,9 @@ struct Lease {
   auto buffer=io.read(0x64500);
   if(buffer==~0U || (buffer&(1U<<31)))return Status::Busy;
   if((buffer&64)&&!phy)return Status::Foreign;
+  // Keep the TC-cold-blocking AUX reference as well as PHY ownership until
+  // the native PLL disable/lock-clear sequence completes.
+  if(phy){auto pll=io.read(0x46048);if(pll==~0U || (pll&0xC0000000U))return Status::Busy;}
   if(aux){io.auxDisable();aux=false;}
   auto auxiliary=io.read(0x45444);
   auto bypassRefs=io.auxBypassRefs();
@@ -44,7 +56,9 @@ struct Lease {
    constexpr uint32_t w1c=(1U<<30)|(1U<<28)|(1U<<25);
    write(io,0x64510,(ctl&~(w1c|(1U<<11)))|savedRoute);route=false;
   }
-  if(phy){buffer=io.read(0x64500);if(buffer==~0U || (buffer&(1U<<31)))return Status::Busy;if(buffer&64)write(io,0x64500,buffer&~64U);if(io.read(0x64500)&64)return Status::Rollback;phy=false;}
+  if(phy){
+   buffer=io.read(0x64500);if(buffer==~0U || (buffer&(1U<<31)))return Status::Busy;if(buffer&64)write(io,0x64500,buffer&~64U);if(io.read(0x64500)&64)return Status::Rollback;phy=false;
+  }
   active=false;
   if(parent){
    core=io.read(0x45404);auto ddi=io.read(0x45454);auxiliary=io.read(0x45444);
