@@ -241,6 +241,8 @@ accept `--donor /path/to/AppleIntelTGLGraphicsFramebuffer` and
 by each test. CPU tests do not establish physical GPU compatibility.
 WhateverGreen source is not a build dependency.
 
+For hibernation diagnostics, `python3 tools/hibernation_evidence.py loader <OpenCore-log>` reports bootloader stages without treating a restored preview as a resumed kernel. Its `session` subcommand compares captured state JSON files; it does not trigger sleep or change boot settings.
+
 ## License and credits
 
 WhateverXe retains WhateverGreen's copyright notices and BSD-3-Clause license.

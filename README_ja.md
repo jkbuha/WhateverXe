@@ -178,6 +178,8 @@ python3 tools/test.py
 
 WhateverXeとAppleIntelTGLCompatのkext、およびソースのmanifestは`build/`に出力されます。TGLCompatのソースと共有ヘッダーはこのリポジトリで管理し、署名済みバイナリはWhateverXe Graphicsで配布します。WEXのRelease ZIPに含まれるkextはOpenCore用プラグインのみで、グラフィックスpkgは含みません。任意のdonor再生試験には`--donor /path/to/AppleIntelTGLGraphicsFramebuffer`と`--accelerator /path/to/AppleIntelTGLGraphics`を指定します。各試験が受け付ける正確なバイナリが必要です。CPUテストだけで実GPUの互換性が確認できるわけではありません。ビルドにWhateverGreenのソースは不要です。
 
+休止状態の診断には `python3 tools/hibernation_evidence.py loader <OpenCore-log>` を使用できます。復元されたプレビュー画像をカーネルの復帰と誤認せず、bootloader の到達段階を報告します。`session` サブコマンドは取得済みの状態 JSON を比較します。スリープの開始や起動設定の変更は行いません。
+
 ## ライセンスとクレジット
 
 WhateverXeはWhateverGreenの著作権表示とBSD-3-Clauseライセンスを継承しています。[LICENSE.txt](LICENSE.txt)を参照してください。LiluとMacKernelSDKは別の依存コンポーネントです。
