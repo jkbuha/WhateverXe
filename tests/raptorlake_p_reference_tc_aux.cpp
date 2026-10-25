@@ -12,6 +12,9 @@ struct IO {
  uint32_t readDPCD(uint8_t *data,unsigned n){++auxCalls;assert(n==16&&(read(0x45454)&0xC00)==0xC00&&(read(0x45444)&0xC00)==0xC00&&(read(0x64500)&0x40)&&!(read(0x64510)&0x800));data[0]=badCaps?0:0x12;data[1]=0x14;data[2]=0x84;if(foreignScanout)regs[0x64500]|=1U<<31;return result;}
 };
 int main(){
+ assert(connected(0x35,1U<<18)&&connected(0x3D,1U<<18));
+ for(auto tc:{0U,4U,6U,7U,UINT32_MAX})assert(!connected(tc,1U<<18));
+ for(auto hpd:{0U,1U<<2,(1U<<18)|(1U<<2),UINT32_MAX})assert(!connected(0x35,hpd));
  Result caps;caps.status=Complete;caps.nativeResult=0;caps.dpcd[0]=0x81C21412;
  uint32_t rate=0,lanes=0;assert(sinkLimits(caps,rate,lanes)&&rate==20&&lanes==2);
  for(auto fault:{0U,1U,2U,3U}){auto bad=caps;if(fault==0)bad.status=DPCD;if(fault==1)bad.nativeResult=1;if(fault==2)bad.dpcd[0]=0x81C20012;if(fault==3)bad.dpcd[0]=0x81C31412;

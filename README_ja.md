@@ -114,9 +114,10 @@ Alder Lake-N / Twin Lakeで世代選択や個別機能の有効化引数を追�
 | `-wex-rplp-native-barriers` | native accelerator の公開後に依存 barrier を有効にする実験的 RPL-P 診断。任意の panel backend と手動 arm が必要で、native context を検証してから従来の startup path を離れます。 |
 | `-wex-rplp-backlight` | 任意の RPL-P panel backend 向けに UID-19・16-bit PWM の輝度 profile を有効にします。Apple または custom profile を保持し、外部 display は対象外です。 |
 | `-wex-rplp-tcss` | 任意の RPL-P panel backend 向けの実験的な ADL-P/RPL-P Type-C 検出です。4 個の TC port slot を公開し、TCSS の ready/DP-alt 状態を使用します。Thunderbolt transport は対象外で、外部 link training は検証中です。 |
-| `-wex-rplp-tcss-aux-probe` | RPL-P TCSS observer と併用し、特権 snapshot から TC3 PHY/AUX 電源と受信機 capability の読み取りを 1 回だけ検証します。取得した電源・ownership request は終了後に戻し、video link training は行いません。 |
-| `-wex-rplp-tcss-live` | TCSS observer と AUX probe を併用する実験的な TC3 専用 native link training。特権 AUX snapshot の成功後にだけ経路を許可し、他の外部 port は未接続として保持します。Native AUX 参照数を維持し、ADL-P/RPL-P の ownership sequence を使用します。 |
-| `-wex-rplp-training-path` | 実験的な TC3 live 経路で、未使用の native pipe-B training path と表示電源を予約し、framebuffer の resource allocation に引き継ぎます。ADL-P の signal coefficient と SST framing を使用します。厳密に一致する任意の RPL-P reference backend と、特権 AUX preflight の成功が必要です。 |
+| `-wex-rplp-tcss-aux-probe` | RPL-P TCSS observer と併用し、特権 snapshot または自動検出から、TC3 PHY/AUX 電源と受信機 capability を一回だけ検証します。ケーブル未接続時には、この検証枠を消費しません。取得した電源・ownership request は終了後に戻し、video link training は行いません。 |
+| `-wex-rplp-tcss-live` | TCSS observer と AUX probe を併用する実験的な TC3 専用 native link training。AUX capability preflight の成功後にだけ経路を許可し、他の外部 port は未接続として保持します。Native AUX 参照数を維持し、ADL-P/RPL-P の ownership sequence を使用します。 |
+| `-wex-rplp-training-path` | 実験的な TC3 live 経路で、未使用の native pipe-B training path と表示電源を予約し、framebuffer の resource allocation に引き継ぎます。ADL-P の signal coefficient と SST framing を使用します。厳密に一致する任意の RPL-P reference backend と、AUX capability preflight の成功が必要です。 |
+| `-wex-rplp-tcss-auto` | TCSS observer、AUX probe、live 経路、training-path の各 option と併用する、実験的な TC3 初回自動検出。Native acceleration と AGDC、および DP-alt 受信機の接続を確認してから、同じ一回限りの capability preflight と native 検出を実行します。以後の hotplug は native handler が処理します。 |
 | `-wex-rplp-tcss-observe` | 実験的 RPL-P TCSS backend で外部 port の dispatch と mode 検出を記録し、外部 port は未接続として保持します。別の live 試験を明示的に選択しない限り、link training は無効です。 |
 | `-wex-rplp-early-display` | 実験的な RPL-P 起動制御です。検証済み owner の firmware framebuffer binding を遅延し、native framebuffer で最初の desktop を表示します。早期 activation coordinator と recovery 設定が必要です。 |
 | `-wex-rplp-gpu-recovery` | 対応する reference GPU image 向け RPL-P shared render-domain reset recovery。native accelerator の公開後、native reset で状態を失った sibling engine を検証して復元・再実行します。 |

@@ -6,6 +6,9 @@
 namespace RaptorLakeP {namespace ReferenceTCAux {
 enum Status:uint32_t {Complete,Denied,Preflight,DDIPower,Foreign,Ownership,AuxBusy,AuxPower,Disconnected,DPCD,Rollback};
 struct Result {uint32_t version{1},status{Denied},writes{},nativeResult{~0U},before[4]{},after[4]{},dpcd[4]{};};
+inline bool connected(uint32_t tc,uint32_t hpd){
+ return tc!=~0U && (tc&7)==5 && hpd!=~0U && (hpd&(1U<<18)) && !(hpd&(1U<<2));
+}
 inline bool sinkLimits(const Result &r,uint32_t &rate,uint32_t &lanes){
  if(r.status!=Complete || r.nativeResult)return false;
  auto candidateRate=(r.dpcd[0]>>8)&255U,candidateLanes=(r.dpcd[0]>>16)&31U;
@@ -17,7 +20,7 @@ template<class IO> Result probe(IO &io,bool allowed,bool ddiLanes=false){
  Result out;if(!allowed)return out;
  constexpr uint32_t request=1U<<11,state=1U<<10,owned=1U<<6,busy=1U<<31,tbt=1U<<11;
  bool ddiToken=false,auxToken=false,phyToken=false,controlToken=false;
- auto connected=[&](){auto v=io.read(0x161508),h=io.read(0x44470);return v!=~0U && (v&7)==5 && h!=~0U && (h&(1U<<18)) && !(h&(1U<<2));};
+ auto connected=[&](){return ReferenceTCAux::connected(io.read(0x161508),io.read(0x44470));};
  auto write=[&](uint32_t r,uint32_t v){io.write(r,v);++out.writes;};
  auto wait=[&](uint32_t r,uint32_t mask,unsigned ms){for(unsigned i=0;i<=ms;++i){auto v=io.read(r);if(v==~0U)return false;if((v&mask)==mask)return true;if(i<ms)io.pause();}return false;};
  auto core=io.read(0x45404);
@@ -86,7 +89,7 @@ template<class IO> ParentResult probeWithParent(IO &io,bool allowed){
  constexpr uint32_t parentPower=11,parentFuse=12;
  auto core=io.read(reg),tc=io.read(0x161508),hpd=io.read(0x44470);
  out.coreBefore=core;
- if(core==~0U || (core&0xC03)!=0xC03 || tc==~0U || (tc&7)!=5 || hpd==~0U || !(hpd&(1U<<18)) || (hpd&(1U<<2))){out.aux.status=Preflight;return out;}
+ if(core==~0U || (core&0xC03)!=0xC03 || !connected(tc,hpd)){out.aux.status=Preflight;return out;}
  const bool token=!(core&request);out.parentFlags=token?1:2;
  auto write=[&](uint32_t r,uint32_t v){io.write(r,v);++out.aux.writes;};
  auto wait=[&](uint32_t r,uint32_t bits,unsigned ms){for(unsigned i=0;i<=ms;i++){auto v=io.read(r);if(v==~0U)return false;if((v&bits)==bits)return true;if(i<ms)io.pause();}return false;};

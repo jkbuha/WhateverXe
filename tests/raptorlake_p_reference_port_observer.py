@@ -30,6 +30,7 @@ void *auxProbePort;uintptr_t auxProbeThread;unsigned auxProbePermit;uintptr_t cu
 unsigned hpdCalls,auxCalls;uint32_t hpdOriginal(void *){++hpdCalls;return 1;}
 uint32_t auxOriginal(void *,uint32_t command,uint32_t *data,uint32_t bytes,bool retry){++auxCalls;assert(command==9&&bytes==4&&retry);*data=0x1234;return 0;}
 mach_vm_address_t portHPDOriginal=reinterpret_cast<uintptr_t>(hpdOriginal),portAUXOriginal=reinterpret_cast<uintptr_t>(auxOriginal);
+unsigned initialRequests=0;void requestInitialDiscovery(){++initialRequests;}
 BODY
 void put(void *p,unsigned o,uintptr_t v){memcpy(static_cast<uint8_t *>(p)+o,&v,8);}
 void setup(unsigned ddi){put(controller,0xC40,0x123);put(controller,0xD40,reinterpret_cast<uintptr_t>(platform));put(&port,0x578,0x123);put(&port,0x548,reinterpret_cast<uintptr_t>(platform+0x20+24*ddi));memcpy(platform+0x20+24*ddi,&ddi,4);port.table=reinterpret_cast<uintptr_t>(vtable);}

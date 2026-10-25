@@ -115,15 +115,24 @@
   "-wex-nopanel": [
     "-tglnopanel"
   ],
+  "-wex-rplp-backlight": [],
   "-wex-rplp-bcs": [],
+  "-wex-rplp-blit-pitch": [],
   "-wex-rplp-cache-shadow": [],
   "-wex-rplp-cache-transaction": [],
   "-wex-rplp-caps-shadow": [],
+  "-wex-rplp-donor-fixes": [],
+  "-wex-rplp-early-display": [],
+  "-wex-rplp-fb": [],
+  "-wex-rplp-forcewake-balance": [],
+  "-wex-rplp-gpu-recovery": [],
+  "-wex-rplp-gpu-recovery-v2": [],
   "-wex-rplp-gtt-aperture": [],
   "-wex-rplp-gtt-shadow": [],
   "-wex-rplp-gtt-slot": [],
   "-wex-rplp-manager-pools": [],
   "-wex-rplp-manual-arm": [],
+  "-wex-rplp-native-barriers": [],
   "-wex-rplp-native-chain": [],
   "-wex-rplp-native-engines": [],
   "-wex-rplp-native-factory": [],
@@ -136,7 +145,14 @@
   "-wex-rplp-pin-pages": [],
   "-wex-rplp-probe": [],
   "-wex-rplp-rcs": [],
+  "-wex-rplp-reference-backend": [],
   "-wex-rplp-subranges": [],
+  "-wex-rplp-tcss": [],
+  "-wex-rplp-tcss-auto": [],
+  "-wex-rplp-tcss-aux-probe": [],
+  "-wex-rplp-tcss-live": [],
+  "-wex-rplp-tcss-observe": [],
+  "-wex-rplp-training-path": [],
   "-wex-tc-aux": [
     "-tgltc-aux"
   ],
@@ -160,20 +176,5 @@
   ],
   "-wexoff": [
     "-wxeoff"
-  ],
-  "-wex-rplp-donor-fixes": [],
-  "-wex-rplp-reference-backend": [],
-  "-wex-rplp-fb": [],
-  "-wex-rplp-native-barriers": [],
-  "-wex-rplp-backlight": [],
-  "-wex-rplp-gpu-recovery": [],
-  "-wex-rplp-forcewake-balance": [],
-  "-wex-rplp-tcss": [],
-  "-wex-rplp-early-display": [],
-  "-wex-rplp-tcss-observe": [],
-  "-wex-rplp-tcss-aux-probe": [],
-  "-wex-rplp-gpu-recovery-v2": [],
-  "-wex-rplp-blit-pitch": [],
-  "-wex-rplp-tcss-live": [],
-  "-wex-rplp-training-path": []
+  ]
 }

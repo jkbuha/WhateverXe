@@ -51,7 +51,9 @@ thread_call_t work;
 thread_call_t monitor;
 thread_call_t framebufferWork;
 thread_call_t moduleWork;
-thread_call_t captureWork,nativeRescanWork;
+thread_call_t captureWork,nativeRescanWork,initialDiscoveryWork;
+uint32_t initialDiscoveryBusy,initialDiscoveryAgain,initialDiscoveryState[8]{1};
+void requestInitialDiscovery();
 mach_vm_address_t nativeHotplugEntry;
 uint32_t nativeRescanBusy,nativeRescanUsed,nativeRescanState[8]{1};
 thread_call_t earlyPublishWork;
@@ -436,6 +438,7 @@ uint32_t observedPortState(void *port){
  portObserve[index+4]=compatPortMode(port);
  portObserve[index+5]=backend.readReg32(0x44470);
  portObserve[index+6]=backend.readReg32(0xC4000);
+ if(ddi==5 && portObserve[index+4]==3)requestInitialDiscovery();
  if(livePortSelected(port))return portStateOriginal?reinterpret_cast<uint32_t (*)(void *)>(portStateOriginal)(port):0;
  uint32_t disconnected=0;memcpy(bytes+0x554,&disconnected,4);
  __sync_fetch_and_add(&portBindings[7],1);
@@ -459,7 +462,7 @@ bool observerSelected(){return wexRplReferenceTCSSRequested() && checkKernelArgu
 uint32_t observedPortHPD(void *port){
  if(observerSelected()){
   uint32_t ddi;if(!observerPort(port,ddi))return 0;
-  if(ddi && !livePortSelected(port)){__sync_fetch_and_add(&portBindings[5],1);return 0;}
+  if(ddi && !livePortSelected(port)){if(ddi==5)requestInitialDiscovery();__sync_fetch_and_add(&portBindings[5],1);return 0;}
  }
  return portHPDOriginal?reinterpret_cast<uint32_t (*)(void *)>(portHPDOriginal)(port):0;
 }
@@ -493,6 +496,7 @@ void monitorWorker(thread_call_param_t,thread_call_param_t){
  uint32_t sample[256]{};wexRplReferenceRuntime(sample,256);
  sample[1]=++monitorSamples;
  target->setProperty("WhateverXeRPLPReferenceRuntime",sample,sizeof(sample));publish();
+ requestInitialDiscovery();
  uint64_t deadline;clock_interval_to_deadline(1000,kMillisecondScale,&deadline);
  if(monitorSamples<120)thread_call_enter_delayed(monitor,deadline);
 }
@@ -648,8 +652,14 @@ void probeTCAux(){
   }
  }
  if(target)target->setProperty("WhateverXeRPLPReferenceTCAUX",&result,sizeof(result));
- if(__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) && result.aux.status==RaptorLakeP::ReferenceTCAux::Complete && result.aux.nativeResult==0){IORecursiveLockLock(livePortLock);RaptorLakeP::ReferenceTCAux::sinkLimits(result.aux,liveSinkMaxRate,liveSinkMaxLanes);__atomic_store_n(&livePortPermission,1,__ATOMIC_RELEASE);publishLivePort();IORecursiveLockUnlock(livePortLock);}
+ uint32_t rate=0,lanes=0;
+ if(__atomic_load_n(&livePortReady,__ATOMIC_ACQUIRE) && RaptorLakeP::ReferenceTCAux::sinkLimits(result.aux,rate,lanes)){
+  IORecursiveLockLock(livePortLock);liveSinkMaxRate=rate;liveSinkMaxLanes=lanes;
+  __atomic_store_n(&livePortPermission,1,__ATOMIC_RELEASE);publishLivePort();IORecursiveLockUnlock(livePortLock);
+ }
 }
+
+#include "kern_raptorlake_p_initial_discovery_impl.hpp"
 
 void captureWorker(thread_call_param_t,thread_call_param_t){
  if(captureAllowed()){
@@ -661,7 +671,9 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
   auto color=RaptorLakeP::ReferenceSnapshot::captureColor(io,captureSequence);
   target->setProperty("WhateverXeRPLPReferenceColorSnapshot",&color,sizeof(color));
-  if(sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1) && checkKernelArgument("-wex-rplp-tcss-aux-probe") && observerSelected() && __sync_bool_compare_and_swap(&auxProbeAttempted,0,1))probeTCAux();
+  if(sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1) && checkKernelArgument("-wex-rplp-tcss-aux-probe") && observerSelected() &&
+     RaptorLakeP::ReferenceTCAux::connected(io.read(0x161508),io.read(0x44470)) && __sync_bool_compare_and_swap(&auxProbeAttempted,0,1))probeTCAux();
+  requestInitialDiscovery();
   // Controller lifetime, private image and physical owner are pinned by
   // captureAllowed(). D40 is the same immutable platform table used by the
   // qualified compatibility-port route; never export its kernel pointers.
@@ -1322,6 +1334,7 @@ void init(){
  monitor=thread_call_allocate(monitorWorker,nullptr);
  if(wexRplReferencePanel())captureWork=thread_call_allocate(captureWorker,nullptr);
  if(wexRplReferencePanel() && checkKernelArgument("-wex-rplp-tcss-live"))nativeRescanWork=thread_call_allocate(nativeRescanWorker,nullptr);
+ if(wexRplReferencePanel() && checkKernelArgument("-wex-rplp-tcss-auto"))initialDiscoveryWork=thread_call_allocate(initialDiscoveryWorker,nullptr);
  if(wexRplReferencePanel())moduleWork=thread_call_allocate(moduleWorker,nullptr);
  if(wexRplReferencePanel())framebufferWork=thread_call_allocate(framebufferWorker,nullptr);
  if(wexRplReferencePanel() && earlyRequested())earlyPublishWork=thread_call_allocate(earlyPublish,nullptr);
