@@ -25,12 +25,15 @@ struct Route {
  bool captured{},active{},adopted{};
  uint32_t clock{},function{},lastClock{},lastFunction{};
  template<class IO> Status prepare(IO &io,unsigned lanes,bool native=false){
-  if(adopted!=native || (native&&!captured) || !io.powerHeld() || (lanes!=1 && lanes!=2))return Status::Denied;
+  if(adopted!=native || !io.powerHeld() || (lanes!=1 && lanes!=2))return Status::Denied;
   const auto c=io.read(0x46144),f=io.read(0x61400),t=io.read(0x61540),b=io.read(0x64500),p=io.read(0x71008);
   if(c==~0U || f==~0U || t==~0U || b==~0U || p==~0U)return Status::Unavailable;
   if(((f|b)&0x80000000U) || (!native&&(t&0x80000000U)) || (p&0xC0000000U) || !(b&0x80))return Status::Busy;
   if(((c&0xF0000000U) && (c&0xF0000000U)!=0x80000000U) ||
      ((f&0x78000000U) && (f&0x78000000U)!=0x30000000U))return Status::Foreign;
+  // End-of-training cleanup can restore the temporary route before native
+  // adoption. Recapture only after ownership, power, idle and port-selection
+  // checks above; a cleared temporary snapshot does not revoke native ownership.
   if(!captured){clock=c;function=f;captured=true;}
   const auto wantedClock=(c&0x0FFFFFFFU)|0x80000000U;
   const auto wantedFunction=(f&~0x7F00000EU)|0x32000000U|((lanes-1)<<1);

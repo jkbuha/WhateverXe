@@ -121,6 +121,8 @@ int main(){
  put32(portObj.memory,0x128,20);put32(portObj.memory,0x124,2);backend.regs[0x64500]=0x80203642;
  recordSuccessfulTraining(port);assert(trainingNegotiatedValid&&trainingNegotiatedConfig[2]==20&&trainingNegotiatedConfig[11]==2);
  backend.regs[0x64500]=0xC0;recordSuccessfulTraining(port);assert(trainingNegotiated[7]==2&&trainingNegotiatedValid);
+ // AGDC ends its temporary training burst before native modeset adoption.
+ assert(trainingLease.route.restore(io)==RaptorLakeP::TrainingRoute::Status::Ready&&!trainingLease.route.captured);
  assert(trainingResources(&fbObj,5,0)&&trainingLease.adopted&&trainingLease.route.adopted&&!trainingLease.logicalPG&&trainingPGRefs()==1&&allocs==1);
  backend.regs[0x46144]=0;backend.regs[0x61540]=0x80040300;
  assert(!prepareNativeTrainingPath(port)&&backend.regs[0x46144]==0x80000000&&trainingNegotiated[26]==0&&trainingNegotiated[27]==0x80000000);

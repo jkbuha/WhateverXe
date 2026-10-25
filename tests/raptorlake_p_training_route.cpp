@@ -38,6 +38,20 @@ int main(){
   assert(r.prepare(io,2,true)==Status::Ready&&io.regs[0x46144]==0x80000000);
   nw=io.writes.size();io.regs[0x64500]|=0x80000000;assert(r.prepare(io,2,true)==Status::Busy&&io.writes.size()==nw);
  }
+ // Native adoption may follow a completed temporary-route restore.
+ {IO io;Route r;assert(r.prepare(io,2)==Status::Ready);
+  assert(r.restore(io)==Status::Ready&&!r.captured);r.adopted=true;
+  io.regs[0x46144]=0;io.regs[0x61540]=0x80040300;
+  assert(r.prepare(io,2,true)==Status::Ready&&r.captured&&io.regs[0x46144]==0x80000000);
+ }
+ // Missing capture must not weaken native power/idle/foreign-route guards.
+ for(unsigned fault=0;fault<6;fault++){
+  IO io;Route r;r.adopted=true;
+  if(fault==0)io.powered=false;if(fault==1)io.regs[0x64500]|=0x80000000;
+  if(fault==2)io.regs[0x71008]=0xC0000000;if(fault==3)io.regs[0x61400]|=0x80000000;
+  if(fault==4)io.regs[0x46144]=0x10000000;if(fault==5)io.regs[0x61400]=0x08000000;
+  assert(r.prepare(io,2,true)!=Status::Ready&&io.writes.empty()&&!r.captured);
+ }
  for(unsigned mode=0;mode<12;mode++){
   IO io;Route r;if(mode==0)io.powered=false;
   if(mode==1)io.regs[0x46144]=~0U;if(mode==2)io.regs[0x61400]=0x80000000;
