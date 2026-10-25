@@ -12,6 +12,7 @@ f=r'''
 #include "kern_raptorlake_p_training_route.hpp"
 #include "kern_raptorlake_p_reference_voltage.hpp"
 #include "kern_raptorlake_p_reference_ddi.hpp"
+#include "kern_raptorlake_p_reference_tc_live.hpp"
 using mach_vm_address_t=uintptr_t;using thread_t=void*;using thread_call_t=void*;using thread_call_param_t=void*;using IOReturn=uint32_t;
 constexpr IOReturn kIOReturnNotReady=0xE00002D8,kIOReturnSuccess=0;constexpr unsigned kMillisecondScale=1;
 void *pendingToken;void clock_interval_to_deadline(unsigned n,unsigned,uint64_t*d){assert(n==2000);*d=n;}
@@ -44,7 +45,17 @@ struct LivePhyIO{
  unsigned lock(){assert(!held);held=true;return 1;}void unlock(unsigned n){assert(held&&n==1);held=false;}void bankFault(){}
 };
 struct LivePortIO{void*port;uint32_t read(uint32_t r){return backend.readReg32(r);}};bool allowed=true,healthy=true;
-struct LiveLease{bool phy=true;uintptr_t object;bool witness(LivePortIO&,uintptr_t owner,uintptr_t p){return healthy&&owner==(uintptr_t)framebufferOwner&&p==(uintptr_t)port;}}livePortLease;
+unsigned deferredReleases=0;uint32_t livePortState[16]{};
+void publishLivePort(){assert(lock.depth);}
+struct LiveLease{
+ bool phy=true,active=true,parent=true;uintptr_t object,owner=0;
+ bool witness(LivePortIO&,uintptr_t who,uintptr_t p){return healthy&&who==(uintptr_t)framebufferOwner&&p==(uintptr_t)port;}
+ RaptorLakeP::ReferenceTCLive::Status release(LivePortIO&,uintptr_t who,uintptr_t p){
+  assert(owner==who&&object==p&&!active&&portObj.refs&&lock.depth);
+  assert(!(backend.regs[0x45404]&0x3000)); // PipeB must have drained first.
+  ++deferredReleases;owner=0;parent=false;return RaptorLakeP::ReferenceTCLive::Status::Ready;
+ }
+}livePortLease;
 bool livePortSelected(void*p){return allowed&&p==port;}
 uint32_t livePortReady=1,livePortPermission=1,liveSinkMaxRate=20,liveSinkMaxLanes=2;
 bool wexRplReferenceFBAllowed(void*p){return p==framebufferOwner;}
@@ -152,7 +163,9 @@ int main(){
  assert(!trainingExternalNeedsMode(&controller,&portObj,pathMem)&&!trainingExternalNeedsMode(&portObj,&fbObj,pathMem));
  backend.regs[0x71008]=0xC0000000;assert(!trainingExternalNeedsMode(&controller,&fbObj,pathMem));backend.regs[0x71008]=0;
  assert(!trainingRelease());trainingPutDDI(&powerObj,5);assert(backend.regs[0x45454]==3&&powerObj.refs==1);
- trainingFree(pathMem);assert(trainingLease.power&&powerObj.refs==1);trainingPutPG(&powerObj,3);
+ livePortLease.owner=(uintptr_t)framebufferOwner;livePortLease.active=false;
+ trainingFree(pathMem);assert(trainingLease.power&&powerObj.refs==1&&!deferredReleases);trainingPutPG(&powerObj,3);
+ assert(deferredReleases==1&&!livePortLease.owner&&trainingDeferredPort[1]==1&&!trainingDeferredPort[2]&&trainingDeferredPort[3]&&!trainingDeferredPort[4]);
  assert(!trainingLease.power&&!fbObj.refs&&!powerObj.refs&&!portObj.refs&&backend.regs[0x45404]==0xC0F);
  assert(!trainingNegotiatedValid);
  put32(fbObj.memory,0x49E8,0);trainingGetDDI(&powerObj,5);trainingLease.freed=true;assert(!prepareTrainingPath(port)&&trainingLeaseState[23]==1);assert(trainingLease.route.prepare(io,1)==RaptorLakeP::TrainingRoute::Status::Ready);

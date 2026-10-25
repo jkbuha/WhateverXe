@@ -14,6 +14,7 @@ mach_vm_address_t trainingSetupOriginal,trainingGetLinkOriginal,trainingSetConfi
 uint8_t trainingNegotiatedConfig[28]{};bool trainingNegotiatedValid;
 uint32_t trainingNegotiated[32]{1};
 uint32_t trainingColor[8]{1};
+uint32_t trainingDeferredPort[8]{1};
 
 struct TrainingPathLease {
  void *path{},*port{};IOService *fb{};OSObject *power{};
@@ -95,6 +96,17 @@ void trainingCleanupPower(){
  TrainingPowerIO io;auto result=Display13Power::release(io,trainingLease.powerState,trainingLease.powerLease);
  trainingLeaseState[17]=static_cast<uint32_t>(result.status);
  if(result.status!=Display13Power::Status::Complete)return;
+ // setPortMode(0) can release AUX/PHY before native PG3 drains. Its final
+ // parent release then returns Busy. Finish that exact inactive port lease
+ // after our PipeB lease is gone, before dropping the retained port object.
+ if(livePortLease.owner==reinterpret_cast<uintptr_t>(framebufferOwner) &&
+    livePortLease.object==reinterpret_cast<uintptr_t>(trainingLease.port) && !livePortLease.active){
+  LivePortIO portIO{trainingLease.port};++trainingDeferredPort[1];
+  trainingDeferredPort[3]=livePortLease.parent;trainingDeferredPort[5]=io.read(0x45404);
+  auto portResult=livePortLease.release(portIO,reinterpret_cast<uintptr_t>(framebufferOwner),reinterpret_cast<uintptr_t>(trainingLease.port));
+  trainingDeferredPort[2]=static_cast<uint32_t>(portResult);livePortState[8]=trainingDeferredPort[2];
+  trainingDeferredPort[4]=livePortLease.parent;trainingDeferredPort[6]=io.read(0x45404);publishLivePort();
+ }
  trainingLease.fb->release();trainingLease.power->release();static_cast<OSObject *>(trainingLease.port)->release();
  trainingNegotiatedValid=false;
  trainingLease.fb=nullptr;trainingLease.power=nullptr;trainingLease.port=nullptr;trainingLease.path=nullptr;
@@ -416,6 +428,7 @@ void publishTrainingLease(){
  target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));
  target->setProperty("WhateverXeRPLPReferenceLink",trainingLink,sizeof(trainingLink));
  target->setProperty("WhateverXeRPLPReferenceExternalColor",trainingColor,sizeof(trainingColor));
+ target->setProperty("WhateverXeRPLPReferenceDeferredPort",trainingDeferredPort,sizeof(trainingDeferredPort));
  trainingNegotiated[2]=trainingNegotiatedValid;target->setProperty("WhateverXeRPLPReferenceNegotiatedLink",trainingNegotiated,sizeof(trainingNegotiated));
  target->setProperty("WhateverXeRPLPReferenceDDI",trainingDDIState,sizeof(trainingDDIState));
  target->setProperty("WhateverXeRPLPReferenceTrainingCleanup",trainingCleanupState,sizeof(trainingCleanupState));IORecursiveLockUnlock(livePortLock);
