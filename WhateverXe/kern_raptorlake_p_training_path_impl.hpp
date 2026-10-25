@@ -13,6 +13,7 @@ thread_call_t trainingCleanupWork;uint64_t trainingGeneration;
 mach_vm_address_t trainingSetupOriginal,trainingGetLinkOriginal,trainingSetConfig;
 uint8_t trainingNegotiatedConfig[28]{};bool trainingNegotiatedValid;
 uint32_t trainingNegotiated[32]{1};
+uint32_t trainingColor[8]{1};
 
 struct TrainingPathLease {
  void *path{},*port{};IOService *fb{};OSObject *power{};
@@ -378,6 +379,20 @@ uint32_t trainingExternalClock(const void *owner,const void *head,const void *pa
  }
  IORecursiveLockUnlock(livePortLock);return value;
 }
+uint32_t trainingExternalGamma(unsigned long reg,uint32_t value){
+ if((reg&0xFFFFFU)!=0x4AC80 || !livePortLock || !trainingLeaseState[1])return value;
+ IORecursiveLockLock(livePortLock);
+ if(trainingLease.path && trainingLease.adopted && trainingLease.route.adopted &&
+    trainingNegotiatedValid && livePortSelected(trainingLease.port)){
+  TrainingPowerIO io;
+  if(io.powerHeld()){
+   ++trainingColor[1];trainingColor[2]=value;trainingColor[3]=0;
+   trainingColor[4]=io.read(0x4AC80);trainingColor[5]=io.read(0x71008);
+   trainingColor[6]=io.read(0x64500);value=0;
+  }else ++trainingColor[7];
+ }
+ IORecursiveLockUnlock(livePortLock);return value;
+}
 bool trainingExternalNeedsMode(const void *owner,const void *head,const void *path){
  if(owner!=framebufferOwner || !head || !path || !livePortLock)return false;
  IORecursiveLockLock(livePortLock);bool needs=false;
@@ -400,6 +415,7 @@ void publishTrainingLease(){
  target->setProperty("WhateverXeRPLPReferenceTrainingLease",trainingLeaseState,sizeof(trainingLeaseState));
  target->setProperty("WhateverXeRPLPReferenceSignal",trainingSignal,sizeof(trainingSignal));
  target->setProperty("WhateverXeRPLPReferenceLink",trainingLink,sizeof(trainingLink));
+ target->setProperty("WhateverXeRPLPReferenceExternalColor",trainingColor,sizeof(trainingColor));
  trainingNegotiated[2]=trainingNegotiatedValid;target->setProperty("WhateverXeRPLPReferenceNegotiatedLink",trainingNegotiated,sizeof(trainingNegotiated));
  target->setProperty("WhateverXeRPLPReferenceDDI",trainingDDIState,sizeof(trainingDDIState));
  target->setProperty("WhateverXeRPLPReferenceTrainingCleanup",trainingCleanupState,sizeof(trainingCleanupState));IORecursiveLockUnlock(livePortLock);

@@ -25,6 +25,19 @@ static IO active(unsigned mask=1){
 }
 int main(){
  static_assert(sizeof(Snapshot)==1568,"snapshot wire layout");
+ for(unsigned mask=0;mask<16;++mask){
+  auto io=active(mask);auto s=captureColor(io,17);
+  assert(s.status==Complete&&s.poweredPipes==mask&&s.activePipes==mask&&s.count<=192&&s.sequence==17);
+  for(unsigned p=0;p<4;++p){
+   bool gamma=false,misc=false,csc=false;
+   for(auto reg:io.reads){gamma|=reg==0x4A480+0x800*p;misc|=reg==0x70030+0x1000*p;csc|=reg==0x49028+0x100*p;}
+   assert(gamma==bool(mask&(1U<<p))&&misc==gamma&&csc==gamma);
+  }
+ }
+ {auto io=active();io.unavailable=0x70030;assert(captureColor(io,1).status==Unavailable);}
+ {auto io=active();io.powerChangeAt=2;auto s=captureColor(io,1);assert(s.status==PowerChanged&&io.reads.size()==2);}
+ {auto io=active();io.values[0x60400]=0;auto s=captureColor(io,1);assert(s.status==Complete&&!s.activePipes&&s.count==4);}
+
  {IO io;auto s=capture(io,19);assert(s.version==1&&s.sequence==19&&s.status==Complete&&s.count==2&&!s.activePipes);assert(io.reads==std::vector<uint32_t>({0x45404,0x45404}));}
  for(unsigned mask=1;mask<16;++mask){auto io=active(mask);auto s=capture(io,7);assert(s.status==Complete&&s.poweredPipes==mask&&s.activePipes==mask&&s.count<=192);for(auto r:io.reads)assert(!(r&3)&&r<0x1000000);}
  {auto io=active();io.values[0x60400]=0;auto s=capture(io,1);assert(s.status==Complete&&!s.activePipes&&s.count==4);}

@@ -6,6 +6,8 @@ from prepare_rplp_reference import prepare
 with tempfile.TemporaryDirectory() as d:
  p=Path(d);out=p/'generated';prepare(Path(sys.argv[1]),out,Path(sys.argv[2]))
  s=(out/'kern_gen11.cpp').read_text()
+ assert 'case 0x4AC80: return wexRplReferenceExternalGamma(reg,val);' in s
+ assert 'extern unsigned wexRplReferenceExternalGamma(unsigned long,unsigned);' in (out/'wex_reference_gate.hpp').read_text()
  assert '{activeKext, f10, checkKernelArgument("-wex-rplp-training-path")?f10:r10, arrsize(f10),' in s
  donor=Path(sys.argv[2])/'Contents/MacOS/AppleIntelTGLGraphicsFramebuffer'
  raw=donor.read_bytes();pattern=bytes.fromhex('e8afe2ffff84c0745b');assert raw.count(pattern)==1 and raw[0x75028:0x75031]==pattern

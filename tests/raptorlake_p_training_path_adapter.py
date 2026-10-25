@@ -31,7 +31,7 @@ struct OSObject {
 };using IOService=OSObject;
 OSObject controller,portObj,fbObj,powerObj;IOService*framebufferOwner=&controller;void*port=&portObj;
 struct Backend {
- std::map<uint32_t,uint32_t> regs{{0x45404,0xC0F},{0x45454,3},{0x45444,0xC03},{0x42000,0x8E380000},{0x46114,0x80000000},{0x46144,0},{0x61400,0},{0x61540,0},{0x64500,0xC0},{0x71008,0},{0x16E8C0,3},{0x16E8A0,0x1C},{0x1010A0,0xAABBCCDD},{0x16AD00,0x1234}};unsigned writes=0;
+ std::map<uint32_t,uint32_t> regs{{0x4AC80,0x40000001},{0x45404,0xC0F},{0x45454,3},{0x45444,0xC03},{0x42000,0x8E380000},{0x46114,0x80000000},{0x46144,0},{0x61400,0},{0x61540,0},{0x64500,0xC0},{0x71008,0},{0x16E8C0,3},{0x16E8A0,0x1C},{0x1010A0,0xAABBCCDD},{0x16AD00,0x1234}};unsigned writes=0;
  uint32_t readReg32(uint32_t r){assert(regs.count(r));return regs[r];}
  void writeReg32(uint32_t r,uint32_t v){assert(regs.count(r));++writes;if(r==0x45454){regs[r]=(v&~0x400U)|((v&0x800)?0x400:0);}else if(r==0x45404){auto mask=0xA80AU;regs[r]=(v&~(mask>>1))|((v&mask)>>1);}else regs[r]=v;}
 }backend;
@@ -126,6 +126,13 @@ int main(){
  assert(trainingResources(&fbObj,5,0)&&trainingLease.adopted&&trainingLease.route.adopted&&!trainingLease.logicalPG&&trainingPGRefs()==1&&allocs==1);
  backend.regs[0x46144]=0;backend.regs[0x61540]=0x80040300;
  assert(!prepareNativeTrainingPath(port)&&backend.regs[0x46144]==0x80000000&&trainingNegotiated[26]==0&&trainingNegotiated[27]==0x80000000);
+ auto colorWrites=backend.writes;
+ assert(trainingExternalGamma(0x4AC80,0x40000001)==0&&trainingColor[2]==0x40000001&&trainingColor[4]==0x40000001);
+ assert(trainingExternalGamma(0x4A480,0x1234)==0x1234&&trainingExternalGamma(0x4B480,0x1234)==0x1234);
+ healthy=false;assert(trainingExternalGamma(0x4AC80,0x40000001)==0x40000001);healthy=true;
+ trainingLease.route.adopted=false;assert(trainingExternalGamma(0x4AC80,0x40000001)==0x40000001);trainingLease.route.adopted=true;
+ trainingLeaseState[1]=0;assert(trainingExternalGamma(0x4AC80,0x40000001)==0x40000001);trainingLeaseState[1]=1;
+ assert(backend.writes==colorWrites);
  auto nativeWrites=backend.writes;backend.regs[0x71008]=0xC0000000;
  assert(!prepareNativeTrainingPath(port)&&backend.writes==nativeWrites);backend.regs[0x71008]=0;
  backend.regs[0x61540]=0;

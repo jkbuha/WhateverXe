@@ -26,6 +26,7 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  gate+='extern mach_vm_address_t wexRplReferenceContextFreeOriginal;\nextern void wexRplReferenceContextFree(void *);\nextern void wexRplReferenceCacheRCSContext(void *);\nextern void *wexRplReferenceAcquireRCSContext();\nextern void wexRplReferenceReleaseRCSContext(void *);\n'
  gate+='extern bool wexRplReferenceBarrierOwner(const void *);\nextern void wexRplReferenceBarrierResult(unsigned,unsigned);\n'
  gate+='extern bool wexRplReferenceAdoptFramebuffer(void *);\nextern void wexRplReferenceFramebufferStarted(void *,bool);\nextern mach_vm_address_t wexRplDisplayPipeInitOriginal;\nextern bool wexRplReferenceDisplayPipeInit(void *,void *,void *,void *,unsigned);\n'
+ gate+='extern unsigned wexRplReferenceExternalGamma(unsigned long,unsigned);\n'
  (out/'wex_reference_gate.hpp').write_text(gate)
  def edit(name,before,after):
   p=out/name;s=p.read_text();assert s.count(before)==1,(name,before,s.count(before));p.write_text(s.replace(before,after))
@@ -72,6 +73,12 @@ def prepare(source:Path,out:Path,reference_framebuffer:Path=None):
  mode_before='\tif (!NGreen::callback->isRealTGL) {\n\t\tNGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A'
  mode_after='\tif (!NGreen::callback->isRealTGL && (!checkKernelArgument("-wex-rplp-training-path") || wexRplReferencePanelMode(that,param_1,param_2))) {\n\t\tNGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A'
  edit('kern_gen11.cpp',mode_before,mode_after)
+
+ # Apply the existing panel gamma bypass to the externally adopted pipe
+ # only through the exact-owner/power-qualified backend. Other pipes retain
+ # their native colour writes; this opt-in does not rewrite LUT contents.
+ edit('kern_gen11.cpp','case 0x4A480: return 0;',
+      'case 0x4A480: return 0;\n\t\tcase 0x4AC80: return wexRplReferenceExternalGamma(reg,val);')
 
  # These native Port methods return a bool and IOReturn respectively. The
  # pinned imported declarations discard both results. Preserve the private

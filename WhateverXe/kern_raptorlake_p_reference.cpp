@@ -655,6 +655,8 @@ void captureWorker(thread_call_param_t,thread_call_param_t){
   } io;
   auto sample=RaptorLakeP::ReferenceSnapshot::capture(io,++captureSequence);
   target->setProperty("WhateverXeRPLPReferenceSnapshot",&sample,sizeof(sample));
+  auto color=RaptorLakeP::ReferenceSnapshot::captureColor(io,captureSequence);
+  target->setProperty("WhateverXeRPLPReferenceColorSnapshot",&color,sizeof(color));
   if(sample.status==RaptorLakeP::ReferenceSnapshot::Complete && (sample.activePipes&1) && checkKernelArgument("-wex-rplp-tcss-aux-probe") && observerSelected() && __sync_bool_compare_and_swap(&auxProbeAttempted,0,1))probeTCAux();
   // Controller lifetime, private image and physical owner are pinned by
   // captureAllowed(). D40 is the same immutable platform table used by the
@@ -1172,6 +1174,9 @@ bool wexRplReferenceExternalNeedsMode(const void *owner,const void *head,const v
 
 uint32_t wexRplReferenceExternalClock(const void *owner,const void *head,const void *path,uint32_t value){
  return checkKernelArgument("-wex-rplp-training-path")?trainingExternalClock(owner,head,path,value):value;
+}
+uint32_t wexRplReferenceExternalGamma(unsigned long reg,uint32_t value){
+ return trainingExternalGamma(reg,value);
 }
 
 bool wexRplReferencePanelMode(const void *owner,const void *head,const void *path){
