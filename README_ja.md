@@ -23,7 +23,7 @@ SequoiaとTahoeは同じOS系列内の互換性のある更新に対応します
 - Tiger Lake-U：48 EU・80 EU構成。
 - Alder Lake-N：16 EU・24 EU構成。
 - Twin Lake：32 EU構成。
-- Alder Lake-H：シングルチャネルを含む96 EU構成。
+- Alder Lake-H：シングルチャネルを含む48・96 EU構成。
 - Alder Lake-S：UHD Graphics 770。
 - Raptor Lake-U：48 EU構成。
 
@@ -35,7 +35,7 @@ OS別の範囲と表示構成は[動作確認済みの機能と既知の問題](
 - 対応IDの他のAlder Lake-N / Twin Lake構成。
 - 対応IDの他のAlder Lake-H/P/U・Raptor Lake-H/P/U構成。
 - 対応IDの他のAlder Lake-S/HX・Raptor Lake-S/HX構成。
-- Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/P/Uの内蔵eDPは実装済み・実機未検証です。
+- Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/P/Uの内蔵eDPは実装済みです。実機ではファームウェアのパネルリンクを維持する設定（`-wex-edp-keep`、[その他の設定](#その他の設定)を参照）でのみ確認しています。
 
 ### 対応に追加改修が必要
 
@@ -83,6 +83,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - 内蔵画面の輝度調整には`SSDT-PNLF`を追加します。
 - GPUは自動選択するため、通常は`device-id`上書きは不要です。
 - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/P/Uではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
+- Alder Lake-H/P/U / Raptor Lake-H/P/Uの内蔵画面がmacOSへの切り替わりで消える場合は、`-wex-edp-keep`を追加し、OpenCoreの`UEFI > Output > Resolution`を`Max`にします。WEXはファームウェアが確立したパネルリンクを再トレーニングせずに維持します。スケーリングした解像度でもリンクを維持し、パイプのスケーラーだけを変更します。この設定では消灯復帰に対応しないため、ディスプレイのスリープを無効にしてください。
 
 ## 動作確認済みの機能と既知の問題
 
@@ -96,6 +97,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 | Alder Lake-N / Twin Lakeラップトップ | Big Sur・Tahoe：MicroPC 2・MiniBook X N100のMIPI DSI・輝度・回転・消灯復帰・HDMI/USB-C共存。MicroPC 2はHiDPI・最大3画面、MiniBook X N100は任意設定の60 Hzも確認 |
 | Raptor Lake-Uラップトップ | Big Sur・Tahoe：MiniBook X U300の内蔵MIPI DSI・輝度・回転・HiDPI・USB-C外部2画面。内蔵は50 Hz、Big Surでは任意設定の60 Hzも確認 |
 | Alder Lake-H | Big Sur〜Tahoe：96 EU、HDMIとDP→HDMI変換器による3画面。シングルチャネル構成の`4626`でもBig Surの加速を確認 |
+| Alder Lake-Hラップトップ | Tahoe：48 EU、`-wex-edp-keep`による1920x1200有機ELの内蔵eDP（スケーリングした解像度を含む）。消灯復帰と有機ELの輝度調整は未対応 |
 | Alder Lake-S | Big Sur〜Tahoe：UHD 770、HDMI/DP/USB-C、最大3画面、Safari動画。WidevineはBig Sur/Tahoeで確認 |
 
 MIPI DSI対応は**試験的**で、検証したGPD MicroPC 2・CHUWI MiniBook X N100/U300の内蔵パネルに限ります。他の機器での動作を期待しないでください。
@@ -108,6 +110,7 @@ MIPI DSI対応は**試験的**で、検証したGPD MicroPC 2・CHUWI MiniBook X
 - 一部の画像変換でアプリがクラッシュすることがあります。
 - Safari動画で時折コマ落ちします。FairPlay保護コンテンツは未対応です。
 - 同時表示は最大3画面です。検証構成を超える解像度は未検証です。
+- `-wex-edp-keep`では、ディスプレイのスリープや、リフレッシュレート・色深度の異なるモードではパネルリンクを再トレーニングするため、内蔵画面が消えることがあります。システムのスリープは未検証です。
 - 一部の端子配線・輝度制御方式、MST、Thunderbolt管理の出力は未対応です。
 
 ### ロードマップ
@@ -132,6 +135,6 @@ WhateverXeはWhateverGreenの著作権表示とBSD-3-Clauseライセンスを継
 
 Xeグラフィックスの取り組みを公開している[JulioNectar/XPS13Plus](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe)に感謝します。同リポジトリのcompiler adapterとLLVM bridgeを、WhateverXe GraphicsのOS標準AIR変換の参考にしました。
 
-内蔵パネルの対応では、[WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP)、[X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe)、XPS13Plus、[Linux i915の表示ソース](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display)も、ハードウェアの挙動と実装の比較に参照しています。
+内蔵パネルの対応では、[WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP)、[X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe)、XPS13Plus、[Linux i915の表示ソース](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display)も、ハードウェアの挙動と実装の比較に参照しています。ファームウェアのパネルリンクの維持は、[NootedGreen](https://github.com/sgiammori/NootedGreen)のファームウェアリンクモードとLinux i915のfastbootに倣っています。
 
 MiniBook Xの任意設定60 Hzのパネルタイミングには、[minibookx-ctlの表示ガイド](https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/display.md)も参照しています。

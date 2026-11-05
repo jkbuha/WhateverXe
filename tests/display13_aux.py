@@ -10,14 +10,19 @@ functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig 
  'bool XE::display13AUXReady(', 'uint32_t XE::wrapDisplay13ReadAUX(', 'uint32_t XE::wrapDisplay13WriteAUX(',
  'uint32_t XE::wrapDisplay13I2CAUX(', 'uint32_t XE::wrapDisplay13RunAUX('])
 binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
+# -wex-edp-keep switch and record (kern_xe.cpp) with their kernel imports stubbed.
+keep=s[s.index('// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,'):s.index('uint32_t XE::wrapDisplay13ReadAUX(')]
+keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep
 objects=(r/'tests/tgl_fb_binding.cpp').read_text().split('int main()')[0].replace('port[0x580]','port[0x700]')
 base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
-base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',functions)
+base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',keep+'\n'+functions)
 base=base.replace('struct OSObject {','void *nativePortObject=nullptr;\nstruct OSObject {').replace('return size;','return this==nativePortObject?0x700:size;')
 base=base.replace('bool adlnWriterMappingBound()', 'void adlnFault(bool &fault,unsigned){fault=true;}\nbool adlnWriterMappingBound()')
 header=(r/'WhateverXe/kern_xe.hpp').read_text()
 extra=header[header.index(' bool display13FBAUXHooksReady'):header.index(' mach_vm_address_t orgDisplay13TrainingPattern')]
 extra=extra.replace(' bool processDisplay13FramebufferAUX(KernelPatcher &,size_t,mach_vm_address_t,size_t);','').replace('mach_vm_address_t','uintptr_t')
+# The keep decision hook counts as installed: these wrappers see what a matched donor build sees.
+extra+=' uintptr_t orgDisplay13RegsNeedUpdate {1};\n static bool display13EDPKeepActive();\n'
 base=base.replace('struct XE {','struct XE {\n'+extra)
 code=base+(r/'tests/display13_aux_fixture.cpp').read_text()
 assert 'c.bridge.suspend(io)' in s

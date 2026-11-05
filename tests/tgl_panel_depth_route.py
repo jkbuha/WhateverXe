@@ -53,10 +53,12 @@ struct XE {
  Ports firmwarePorts;mach_vm_address_t orgTGLModeTiming;
  static uint32_t tglPanelDepthPort(void *);
  static void wrapTGLModeTiming(void *,void *,void *);
+ static bool display13EDPKeepActive();
 } state,*callbackXE=&state;
 struct TGLPanelDepthCache {void *port;uint32_t maximum;};
 TGLPanelDepthCache tglPanelDepthCache[2];
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
+bool keepArg=false,keepHook=true;bool XE::display13EDPKeepActive(){return keepArg && keepHook;}
 PRODUCTION
 void native(void *,void *,void *){++calls;}
 template<class T> void put(uint8_t *p,unsigned off,T v){memcpy(p+off,&v,sizeof(v));}
@@ -90,6 +92,18 @@ int main(){
  XE::wrapTGLModeTiming(nullptr,fb,timing);assert(published==before+1 && *reinterpret_cast<uint16_t*>(timing+0x8A)==1);
  state.adlsWiring.panel=0;put(timing,0x8A,uint16_t(2));before=published;
  XE::wrapTGLModeTiming(nullptr,fb,timing);assert(published==before && *reinterpret_cast<uint16_t*>(timing+0x8A)==2);
+ // -wex-edp-keep: the panel's mode set requests the firmware's 8 bpc, only on the
+ // panel DDI; without the switch the EDID maximum stands.
+ state.adlsDisplaySelected=false;state.xeProfile.family=XELP::Family::TigerLake;put(port,0x548,static_cast<void *>(cfg));
+ cfg[0]=cfg[2]=0;tglPanelDepthCache[0]={port,10};
+ // A donor build the keep decision hook does not match (test 3) keeps nothing,
+ // so the EDID maximum stands there too.
+ for(unsigned test=0;test<4;++test){
+  keepArg=test!=0;keepHook=test!=3;state.adlnOutputWiring.panel=test==2?2:1;put(timing,0x8A,uint16_t(4));
+  XE::wrapTGLModeTiming(nullptr,fb,timing);
+  assert(*reinterpret_cast<uint16_t *>(timing+0x8A)==(test==1?2:4) && record[1]==(test==1?8U:10U));
+ }
+ keepArg=false;keepHook=true;
  puts("PASS: production owner/port guards and unused-controller argument");
 }
 '''.replace('PRODUCTION',s[start:end])

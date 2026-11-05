@@ -212,6 +212,7 @@ private:
  static uint32_t wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag);
  static uint32_t wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag);
  mach_vm_address_t orgDisplay13TrainingPattern {},orgDisplay13SignalLevels {};
+ mach_vm_address_t orgDisplay13RegsNeedUpdate {};
  mach_vm_address_t orgDisplay13EnablePort {},orgDisplay13DisablePort {};
  static bool display13MainLinkAUX(void *port,bool acquire,bool stopping=false);
  static uint32_t wrapDisplay13EnablePort(void *port);
@@ -233,6 +234,7 @@ private:
  static bool display13PanelOnlyClock();
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
+ static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);
  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
 	mach_vm_address_t xelpProviderProbe {},xelpProviderConfigureProbe {};
  bool display13DPAltProbeReady {},display13DPProbeReady {},display13TCProbeReady {},display13TCDPProbeReady {},display13FBDPHooksReady {};
@@ -534,6 +536,7 @@ private:
  static uint32_t display13PanelBrightness(void *controller,uint32_t brightness);
  static void display13PanelPWMEnable(void *access);
  static uint32_t wrapDisplay13PanelPower(void *controller,uint32_t state);
+ static bool display13EDPKeepActive();
  static void resetPanelDepth();
  static void cachePanelDepth(void *port,uint32_t block,const uint8_t *data,uint32_t result);
  void processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
