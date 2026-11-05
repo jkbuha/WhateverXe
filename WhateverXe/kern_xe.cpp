@@ -61,6 +61,7 @@
 #include "kern_adls_clock.hpp"
 #include "kern_adls_boot.hpp"
 #include "kern_tgl_combo_signal.hpp"
+#include "kern_display13_edp_keep.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
@@ -7596,12 +7597,44 @@ bool XE::display13AUXReady(void *port,bool command,bool retained) {
  Display13FBPowerIO io {c.map};return c.bridge.beginAUXCommand(io,config[0]);
 }
 
+// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,
+// wrapDisplay13RegsNeedUpdate). The panel's receiver caps and EDID are seen
+// in the firmware's usual eDP format so the donor's mode set requests it.
+static bool display13EDPKeep() {
+ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-keep") ? 1 : 0;
+ return v==1;
+}
+// -wex-edp-keep with its decision hook installed. The panel's capped link caps,
+// 8 bpc EDID and 8 bpc mode only make the donor's request match the kept
+// firmware link: without the hook (another donor build) nothing is kept, so
+// the donor's whole path stays native.
+bool XE::display13EDPKeepActive() {
+ return display13EDPKeep() && callbackXE && callbackXE->orgDisplay13RegsNeedUpdate;
+}
+// WEXEDPKeepFirst / WEXEDPKeep, one record per complete mode set the donor
+// asked for on a display path while -wex-edp-keep is set (the first one, which
+// still sees the firmware's link, and the last one are published):
+//   version, call, kept (count of kept links), reasons (Display13EDPKeep::Reason),
+//   ddi, pipe, path state (+3644), port lanes (+124), port rate (+128, recorded
+//   only), live TRANS_DDI_FUNC_CTL/TRANSCONF/H,V timings/PIPESRC, requested
+//   TRANS_DDI_FUNC_CTL/timings/PIPESRC, DPCD 0x202..0x207.
+struct Display13EDPKeepRecord {
+ uint32_t version,call,kept,reasons,ddi,pipe,state,portLanes,portRate;
+ uint32_t live[9],wanted[8];uint8_t status[8];
+};
+static volatile uint32_t display13EDPKeepCalls=0,display13EDPKeepKept=0;
+// The panel path whose latest mode-set decision kept the firmware's link; 0 once
+// a complete mode set was requested.
+static volatile uintptr_t display13EDPKeepPath=0;
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
  if(!ready)return kIOReturnNotReady;
  const auto r=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,address,data,length);
- IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);
+ const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
+ const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
+ if(!r && complete && panel && display13EDPKeepActive())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length);
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
@@ -7851,6 +7884,21 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
   {disable,wrapDisplay13DisablePort,orgDisplay13DisablePort}
  };
  display13FBSSTHooksReady=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
+ // -wex-edp-keep only: the mode-set decision (wrapDisplay13RegsNeedUpdate) at
+ // its Tahoe TGL framebuffer address. Its 17-byte prologue has no
+ // RIP-relative operand; a missing hook leaves the donor's own decision and
+ // the rest of the SST frontend unchanged.
+ if(display13FBSSTHooksReady && display13EDPKeep()) {
+  const char *regs="__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE";
+  const uint8_t regsEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+  const auto u=patcher.solveSymbol<mach_vm_address_t>(index,regs,address,size);patcher.clearError();
+  bool ready=u==address+0x4F044 && !memcmp(reinterpret_cast<void *>(u),regsEntry,sizeof(regsEntry));
+  if(ready) {
+   KernelPatcher::RouteRequest route[] {{regs,wrapDisplay13RegsNeedUpdate,orgDisplay13RegsNeedUpdate}};
+   ready=patcher.routeMultiple(index,route,arrsize(route),address,size);patcher.clearError();
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPKeepReady",ready);
+ }
  return display13FBSSTHooksReady;
 }
 
@@ -8036,6 +8084,80 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
  const auto result=FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);
  if(result || pattern>5)return result;
  return program(false)?0:kIOReturnNotReady;
+}
+
+// -wex-edp-keep (Display13EDPKeep): the donor asks for a complete mode set of
+// the boot panel path because its cached CRTCParams and current mode are the
+// boot placeholders, and that mode set stops the firmware's link and
+// retrains it. When the path is the one WhateverXe adopted at handoff, the
+// firmware's eDP SST source still runs (AlderLakeN::dpSource on a fresh
+// readout) and its pipe already has exactly the requested active image, lanes
+// and depth, report no register update: the donor's own same-mode branch then
+// updates only the plane and scaler (hwSetMode "Partial modeset"), leaves the
+// path attached (+3644 stays 2) and returns success. Anything else keeps the
+// donor's answer. The owner lock is held only for the register readout; the
+// DPCD status read runs after it.
+bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler) {
+ auto s=callbackXE;auto &c=display13FBPower;
+ const bool update=FunctionCast(wrapDisplay13RegsNeedUpdate,s->orgDisplay13RegsNeedUpdate)(controller,fb,path,params,timing,scaler);
+ if(!update || !display13EDPKeep() || !c.lock || !path || !params)return update;
+ namespace K=Display13EDPKeep;
+ Display13EDPKeepRecord record {};record.version=1;record.call=__sync_add_and_fetch(&display13EDPKeepCalls,1);
+ record.ddi=record.pipe=record.state=UINT32_MAX;
+ uint32_t reasons=0,lanes=0;void *port=nullptr;
+ IOLockLock(c.lock);
+ auto object=static_cast<OSObject *>(path);
+ if(object->getMetaClass()->getClassSize()>=0x3730) {
+  port=Display13FBMemory::field<void *>(path,0x3648);
+  record.pipe=Display13FBMemory::field<uint32_t>(path,0x3640);record.state=Display13FBMemory::field<uint32_t>(path,0x3644);
+ }
+ // The panel's Combo port can still have the native mode 0 of the handoff:
+ // setPortMode runs in the donor's complete mode set, which a kept link skips.
+ auto p=port ? display13SSTPort(port) : nullptr;
+ if(!p && port)p=display13PanelBootPort(port);
+ if(p)record.ddi=Display13FBMemory::field<uint32_t>(p,0x120);
+ if(!p || controller!=c.controller || record.ddi>=2 || !(s->adlnOutputWiring.panel&(1U<<record.ddi)) || record.pipe!=0)reasons|=K::NotPanel;
+ else {
+  record.portLanes=Display13FBMemory::field<uint32_t>(p,0x124);record.portRate=Display13FBMemory::field<uint32_t>(p,0x128);
+  if(!c.bootPanel || c.bridge.bootPort!=record.ddi || !c.bridge.bootAdopted ||
+     c.bridge.bootPath!=reinterpret_cast<uintptr_t>(path))reasons|=K::NotBoot;
+  Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
+  uint32_t values[arrsize(K::LiveRegisters)] {};bool read=live.status==AlderLakeN::ReadoutStatus::Complete;
+  for(unsigned i=0;read && i<arrsize(K::LiveRegisters);++i)read=AlderLakeN::value(live,K::LiveRegisters[i],values[i]);
+  for(unsigned i=0;i<arrsize(K::LiveRegisters);++i)record.live[i]=values[i];
+  if(!read)reasons|=K::Readout;
+  else {
+   if(!AlderLakeN::dpSource(live,0,record.ddi,nullptr,true))reasons|=K::NoSource;
+   K::Live l {};l.func=values[0];l.transconf=values[1];
+   for(unsigned i=0;i<6;++i)l.timing[i]=values[2+i];
+   l.source=values[8];lanes=((l.func>>1)&7)+1;
+   // The latest decision on this path kept the link: its scaler and source are the donor's own.
+   reasons|=K::compare(l,K::wanted(params),record.portLanes,display13EDPKeepPath==reinterpret_cast<uintptr_t>(path));
+  }
+  const auto w=K::wanted(params);record.wanted[0]=w.func;
+  for(unsigned i=0;i<6;++i)record.wanted[1+i]=w.timing[i];
+  record.wanted[7]=w.source;
+ }
+ IOLockUnlock(c.lock);
+ if(!(reasons&K::NotPanel)) {
+  uint8_t status[6] {};
+  const auto r=wrapDisplay13ReadAUX(port,0x202,status,sizeof(status));
+  if(r || !K::sinkTrained(status,lanes))reasons|=K::Sink;
+  memcpy(record.status,status,sizeof(status));
+ }
+ record.reasons=reasons;
+ const bool keep=!(reasons&K::Blocking);
+ if(keep)record.kept=__sync_add_and_fetch(&display13EDPKeepKept,1);
+ else record.kept=display13EDPKeepKept;
+ if(!(reasons&K::NotPanel))display13EDPKeepPath=keep ? reinterpret_cast<uintptr_t>(path) : 0;
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(record.call==1)root->setProperty("WEXEDPKeepFirst",&record,sizeof(record));
+ root->setProperty("WEXEDPKeep",&record,sizeof(record));
+ if(keep && record.kept==1)
+  SYSLOG("igfx","eDP keep: firmware link kept on DDI %u, pipe A (sink status %02x %02x %02x)",record.ddi,record.status[0],record.status[1],record.status[2]);
+ else if(!keep && record.call==1)
+  SYSLOG("igfx","eDP keep: firmware link not kept (reasons 0x%x, state %u, sink status %02x %02x %02x)",reasons,record.state,record.status[0],record.status[1],record.status[2]);
+ return keep ? false : update;
 }
 uint32_t XE::wrapDisplay13GMBus(IOService *controller,uint32_t bus,uint32_t speed,void *request) {
     // Extending the donor's pin bound is not permission to use an arbitrary
@@ -8588,6 +8710,9 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
     uint64_t r[8] {1,block,force,0,0,config ? config[0] : 9};
     auto root=IORegistryEntry::getRegistryRoot();if(selected)root->setProperty("N97FBPortDDCEntry",r,sizeof(r));
     const auto result=FunctionCast(wrapAlderLakeNPortDDC,callbackXE->orgAlderLakeNPortDDC)(port,block,data,force);r[3]=result;
+    // -wex-edp-keep: the panel EDID's depth as the firmware runs it (8 bpc).
+    if(!result && block==1 && selected && config && config[0]<2 &&
+       (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeepActive())Display13EDPKeep::edid8bpc(data);
     cachePanelDepth(port,block,data,result);
     if(selected) {
         if(!result && data && (block==1 || block==2)) {
@@ -17985,8 +18110,10 @@ void XE::wrapTGLModeTiming(void *controller,void *fb,void *timing) {
  auto port=*reinterpret_cast<void **>(path+0x3648);
  const auto ddi=tglPanelDepthPort(port);if(ddi>1)return;
  IOSimpleLockLock(tglAUXLock);
- const auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
+ auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
  IOSimpleLockUnlock(tglAUXLock);
+ // -wex-edp-keep: the mode set requests the firmware's 8 bpc on the panel.
+ if(display13EDPKeepActive() && (callbackXE->adlnOutputWiring.panel&(1U<<ddi)) && (!maximum || maximum>8))maximum=8;
  const auto encoding=*reinterpret_cast<uint16_t *>(t+0x88);
  auto &depth=*reinterpret_cast<uint16_t *>(t+0x8A);
  const auto before=depth;
