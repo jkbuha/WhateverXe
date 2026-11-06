@@ -3,9 +3,9 @@
 #include "kern_tgl_media_root.hpp"
 namespace XeMediaReferenceCandidate {
 constexpr unsigned MaxPages=16;
-enum Kind:uint64_t {Descriptor=1,Instruction=2,Surface=4};
+enum Kind:uint64_t {Descriptor=1,Instruction=2,Surface=4,Root=8};
 struct Page{uint64_t gpu,kind,copied,qualified;uint8_t bytes[4096];};
-struct Capture{uint64_t schema,guard,pages,drops,refusedRoots,acceptedRoots,failedPages;Page page[MaxPages];};
+struct Capture{uint64_t schema,guard,pages,drops,refusedRoots,acceptedRoots,failedPages,sourceMask;Page page[MaxPages];};
 static_assert(sizeof(Capture)<131072,"bounded immutable media reference property");
 template<class Reader>struct Collector{
  Capture &capture;Reader &read;
@@ -30,7 +30,7 @@ template<class Reader>struct Collector{
   return true;
  }
  bool root(const uint8_t*bytes,unsigned size){
-  capture.schema=1;XeMediaRootCandidate::State s{};
+  capture.schema=2;XeMediaRootCandidate::State s{};
   if(!XeMediaRootCandidate::parse(bytes,size,s)){++capture.refusedRoots;return false;}
   ++capture.acceptedRoots;
   // Candidate surface-state page only; no surface-format/pixel dereference.

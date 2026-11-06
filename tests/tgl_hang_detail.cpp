@@ -154,5 +154,42 @@ int main(int argc,char **argv) {
   if(mode==5){assert(!media->guard && !media->acceptedRoots && !media->pages);}
   if(mode==6 || mode==7){assert(media->guard==2);}
  }
+
+ for(unsigned mode=0;mode<12;++mode) {
+  Fixture f;auto &e=f.pending.entries[0];std::vector<uint32_t> root(42);
+  root[0]=0x11000001;root[3]=0x7a000004;root[9]=0x69041301;
+  root[10]=0x6101000e;root[14]=(Main+0x30000)|1;root[16]=(Main+0x40000)|1;root[20]=(Main+0x20000)|1;
+  root[26]=0x70000007;root[35]=0x70020002;root[37]=64;root[38]=0xc0;root[39]=0x18c00001;
+  e.dwords=root.size();e.copied=root.size()*4;memcpy(e.bytes,root.data(),e.copied);
+  memcpy(f.blocks[K+0x30000].data(),e.bytes,e.copied);
+  // CPU tail is deliberately not the first GPU root; keep strict alias failure.
+  e.bytes[0]^=0xff;memcpy(f.blocks[Cache].data(),e.bytes,e.copied);
+  f.put(Ring+0xb8,uint32_t(e.dwords));f.put(K+0x60000+0xc0,uint64_t(0x240));f.put(K+0x60000+0xe0,uint64_t(0x140));
+  auto c=f.run();assert(!c->q[1] && c->candidates[0][7]==8 && c->candidates[0][6] && c->graph.q[1]==1);
+  auto media=std::make_unique<XeMediaReferenceCandidate::Capture>();auto scratch=std::make_unique<TGLHangGraph::Page>();
+  if(mode==1)c->graph.pages[0].q[3]=0;
+  if(mode==2)f.blocks[K+0x30000][0x74]^=1;
+  if(mode==3)f.blocks[K+0x30000][400]^=1; // bytes beyond the terminal do not define this root's state
+  if(mode==4){auto bytes=f.blocks[K+0x30000];f.leaf(Main,0x31000);f.blocks[K+0x31000]=bytes;}
+  if(mode==5)f.put(K+0x12000,uint64_t(0));
+  if(mode==8)c->graph.pages[0].bytes[0]^=0xff;
+  if(mode==9)c->pending.q[11]=2;
+  if(mode==10)c->candidates[0][7]|=4;
+  if(mode==11)c->graph.pages[0].q[5]=0;
+  auto read=[&](uint64_t p,void*out,unsigned n)->uint64_t {
+   auto got=f.read(p,out,n);
+   if(p==K+0x30000 && n==4096) {
+    if(mode==6)f.put(Ring+0x9000+64,uint32_t(12));
+    if(mode==7)f.put(Ring+0xa0,uint32_t(12));
+   }
+   return got;
+  };
+  auto phys=[&](uint64_t cpu,uint64_t &p){p=cpu-K;return cpu>=K && cpu<K+0x1000000;};
+  collectMedia(*c,*media,*scratch,K,K+0x1000000,read,phys);
+  assert(media->schema==2);
+  if(mode==0 || mode==3){assert(!media->guard && media->sourceMask==2 && media->acceptedRoots==1 && media->pages==4);assert(media->page[0].kind==XeMediaReferenceCandidate::Root);}
+  else if(mode==2 || mode==4 || mode==5 || mode==6 || mode==7){assert(media->guard==2);}
+  else {assert(!media->guard && !media->sourceMask && !media->acceptedRoots && !media->pages);}
+ }
  printf("detail bytes=%zu graph offset=%zu pending offset=%zu tests passed\n",sizeof(Capture),offsetof(Capture,graph),offsetof(Capture,pending));
 }

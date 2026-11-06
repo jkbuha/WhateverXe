@@ -193,7 +193,7 @@ void collect(Capture &c,const TGLHangPending::Capture &pending,const uint8_t *re
 template<class Read,class Physical>
 void collectMedia(const Capture &detail,XeMediaReferenceCandidate::Capture &media,
  TGLHangGraph::Page &scratch,uint64_t directBase,uint64_t directEnd,Read read,Physical physical) {
- media.schema=1;media.guard=1;
+ media.schema=2;media.guard=1;
  if(detail.q[0]!=Schema || detail.q[1] || detail.q[15]>4 ||
     memcmp(detail.before,detail.after,sizeof(detail.before)))return;
  uint64_t owner[Fields]{};
@@ -209,11 +209,40 @@ void collectMedia(const Capture &detail,XeMediaReferenceCandidate::Capture &medi
  XeMediaReferenceCandidate::Collector<decltype(pageRead)> collector{media,pageRead};
  for(unsigned n=0;n<detail.q[15];++n) {
   const auto q=detail.candidates[n];
-  if(q[7] || !q[6] || q[0]>=detail.pending.q[11] || q[0]>=4)continue;
+  if(!q[6] || q[0]>=detail.pending.q[11] || q[0]>=4)continue;
   const auto &e=detail.pending.entries[q[0]];
   if(!e.stable || !e.dwords || e.dwords>4096 || e.copied!=e.dwords*4 ||
      !cacheMatches(detail.q[4],e,read)){media.guard=2;return;}
-  collector.root(e.bytes,static_cast<unsigned>(e.copied));
+  if(!q[7]) {
+   if(collector.root(e.bytes,static_cast<unsigned>(e.copied)))media.sourceMask|=1;
+  } else if(q[7]==8 && q[5]==e.copied && detail.q[15]==1 &&
+            detail.pending.q[11]==1 && !media.pages) {
+   // A coalesced cache row can retain first GPU address and last CPU tail.
+   // Do not claim the tail is an alias. Admit only its separately captured,
+   // qualified first GPU page, then verify fresh ownership/mapping/content.
+   const TGLHangGraph::Page *earlier=nullptr;
+   for(unsigned i=0;i<detail.graph.q[1] && i<TGLHangGraph::MaxPages;++i) {
+    const auto &p=detail.graph.pages[i];
+    if(p.q[0]==(e.gpu&~4095ULL) && p.q[2]==4096 && p.q[3]==1 &&
+       !p.q[4] && p.q[5]==1 && !p.q[6])earlier=&p;
+   }
+   const unsigned off=e.gpu&4095,cap=4096-off<512?4096-off:512;
+   XeMediaRootCandidate::State state{};
+   if(!earlier || !XeMediaRootCandidate::parse(earlier->bytes+off,cap,state)) {
+    ++media.refusedRoots;
+   } else {
+    auto fresh=collector.page(e.gpu,XeMediaReferenceCandidate::Root);
+    if(!fresh || !fresh->qualified ||
+       memcmp(&scratch.before,&earlier->before,sizeof(scratch.before)) ||
+       memcmp(&scratch.after,&earlier->after,sizeof(scratch.after)) ||
+       memcmp(&scratch.chainBefore,&earlier->chainBefore,sizeof(scratch.chainBefore)) ||
+       memcmp(&scratch.chainAfter,&earlier->chainAfter,sizeof(scratch.chainAfter)) ||
+       memcmp(fresh->bytes+off,earlier->bytes+off,state.terminalOffset+12)) {
+     media.guard=2;return;
+    }
+    if(collector.root(fresh->bytes+off,cap))media.sourceMask|=2;
+   }
+  }
   if(!cacheMatches(detail.q[4],e,read)){media.guard=2;return;}
  }
  uint64_t finalOwner[Fields]{};
