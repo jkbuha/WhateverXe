@@ -3,6 +3,7 @@
 #ifndef kern_tgl_hang_detail_hpp
 #define kern_tgl_hang_detail_hpp
 #include "kern_tgl_hang_graph.hpp"
+#include "kern_tgl_media_refs.hpp"
 namespace TGLHangDetail {
 constexpr uint64_t Schema=2;
 using TGLHangPending::kernelRange;
@@ -186,5 +187,39 @@ void collect(Capture &c,const TGLHangPending::Capture &pending,const uint8_t *re
  if(!ownership(c.after,c.q[4],expectedClass,read))return;
  c.q[1]=memcmp(c.before,c.after,sizeof(c.before))?4:0;
 }
+// An additional failure-only candidate view. Reuse the existing no-fault page
+// reader and all owner/cache witnesses; do not traverse batch calls or change
+// the legacy graph's interpretation. No kernel pointers enter this property.
+template<class Read,class Physical>
+void collectMedia(const Capture &detail,XeMediaReferenceCandidate::Capture &media,
+ TGLHangGraph::Page &scratch,uint64_t directBase,uint64_t directEnd,Read read,Physical physical) {
+ media.schema=1;media.guard=1;
+ if(detail.q[0]!=Schema || detail.q[1] || detail.q[15]>4 ||
+    memcmp(detail.before,detail.after,sizeof(detail.before)))return;
+ uint64_t owner[Fields]{};
+ if(!ownership(owner,detail.q[4],detail.q[5],read) || memcmp(owner,detail.before,sizeof(owner)))return;
+ auto pageRead=[&](uint64_t gpu,uint8_t *out)->bool {
+  memset(&scratch,0,sizeof(scratch));scratch.q[0]=gpu;
+  mappedPage(scratch,owner,directBase,directEnd,read,physical);
+  const bool valid=scratch.q[2]==4096 && scratch.q[3]==1 && !scratch.q[4] &&
+   scratch.q[5]==1 && !scratch.q[6];
+  if(valid)memcpy(out,scratch.bytes,4096);
+  return valid;
+ };
+ XeMediaReferenceCandidate::Collector<decltype(pageRead)> collector{media,pageRead};
+ for(unsigned n=0;n<detail.q[15];++n) {
+  const auto q=detail.candidates[n];
+  if(q[7] || !q[6] || q[0]>=detail.pending.q[11] || q[0]>=4)continue;
+  const auto &e=detail.pending.entries[q[0]];
+  if(!e.stable || !e.dwords || e.dwords>4096 || e.copied!=e.dwords*4 ||
+     !cacheMatches(detail.q[4],e,read)){media.guard=2;return;}
+  collector.root(e.bytes,static_cast<unsigned>(e.copied));
+  if(!cacheMatches(detail.q[4],e,read)){media.guard=2;return;}
+ }
+ uint64_t finalOwner[Fields]{};
+ media.guard=ownership(finalOwner,detail.q[4],detail.q[5],read) &&
+  !memcmp(finalOwner,owner,sizeof(owner)) ? 0:2;
+}
+
 }
 #endif

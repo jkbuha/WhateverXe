@@ -15526,6 +15526,26 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
    memcpy(c->q+16,selection.q,sizeof(selection.q));
    c->q[30]=cpuRoot;
    if(!tglVMRead(tglVM.kernelPmap+0x50,c->q[31]) || c->q[31]!=cpuRoot)c->q[1]=5;
+   // Extra immutable CPU candidate bytes at the existing first-failure route.
+   // The media payload contains GPU addresses only. Stack-heavy page evidence
+   // remains in an owned temporary allocation and is never published here.
+   if(!c->q[1]) {
+    struct MediaWork {
+     XeMediaReferenceCandidate::Capture capture;
+     TGLHangGraph::Page scratch;
+    };
+    auto media=static_cast<MediaWork *>(IOMalloc(sizeof(MediaWork)));
+    if(media) {
+     bzero(media,sizeof(*media));
+     TGLHangDetail::collectMedia(*c,media->capture,media->scratch,
+      tglVM.directBase,tglVM.directEnd,read,physical);
+     uint64_t finalCpuRoot=0;
+     if(!tglVMRead(tglVM.kernelPmap+0x50,finalCpuRoot) || finalCpuRoot!=cpuRoot)
+      media->capture.guard=3;
+     root->setProperty("TGLHangMedia0",&media->capture,sizeof(media->capture));
+     IOFree(media,sizeof(*media));
+    }
+   }
    // Diagnose the context-fetch address space at the first native hang only.
    // GGTT reads use the already qualified BAR; no writes, cache operations,
    // forcewake, virtual calls or normal-submission instrumentation are added.

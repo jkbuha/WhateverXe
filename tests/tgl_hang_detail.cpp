@@ -116,5 +116,43 @@ int main(int argc,char **argv) {
  {Fixture f;f.root();f.put(LRC+0x1024,uint32_t(0));auto c=f.run();assert(c->q[29]==5 && !c->graph.q[2]);}
  {Fixture f;f.root();f.mutateCache=true;auto c=f.run();assert(c->q[1]==8 && c->q[29]==4);}
  {Fixture f;f.root();f.partial=true;auto c=f.run();assert(c->graph.q[5]&TGLHangGraph::ReadHole);assert(!c->graph.q[2]);}
+
+ // Exercise the actual additional collector through the same native-owner,
+ // software-table, hardware-PTE and cache fixtures as the main capture.
+ for(unsigned mode=0;mode<10;++mode) {
+  Fixture f;auto &e=f.pending.entries[0];std::vector<uint32_t> root(42);
+  root[0]=0x11000001;root[3]=0x7a000004;root[9]=0x69041301;
+  root[10]=0x6101000e;root[14]=(Main+0x30000)|1;root[16]=(Main+0x40000)|1;root[20]=(Main+0x20000)|1;
+  root[26]=0x70000007;root[35]=0x70020002;root[37]=64;root[38]=0xc0;root[39]=0x18c00001;
+  e.dwords=root.size();e.copied=root.size()*4;memcpy(e.bytes,root.data(),e.copied);
+  memcpy(f.blocks[Cache].data(),e.bytes,e.copied);memcpy(f.blocks[K+0x30000].data(),e.bytes,e.copied);
+  f.put(Ring+0xb8,uint32_t(e.dwords));f.put(K+0x60000+0xc0,uint64_t(0x240));f.put(K+0x60000+0xe0,uint64_t(0x140));
+  auto c=f.run();assert(!c->q[1] && !c->candidates[0][7] && c->candidates[0][6]);
+  auto media=std::make_unique<XeMediaReferenceCandidate::Capture>();auto scratch=std::make_unique<TGLHangGraph::Page>();
+  if(mode==1)c->q[1]=1;
+  if(mode==2)f.put(Ring+0x9000+64,uint32_t(12));
+  if(mode==3)f.put(Ring+0xa0,uint32_t(12));
+  if(mode==5)c->candidates[0][7]=4;
+  if(mode==9)c->q[15]=5;
+  const auto unchanged=f.blocks;unsigned calls=0;
+  auto read=[&](uint64_t p,void*out,unsigned n)->uint64_t {
+   ++calls;auto count=f.read(p,out,n);
+   if(p==K+0x60000 && n==4096) {
+    if(mode==6)f.put(Ring+0xa0,uint32_t(12));
+    if(mode==7)f.put(Ring+0x9000+64,uint32_t(12));
+    if(mode==8)return count?count-1:0;
+   }
+   return count;
+  };
+  auto physical=[&](uint64_t cpu,uint64_t &phys){phys=cpu-K;if(mode==4 && cpu==K+0x2000)phys+=4096;return cpu>=K && cpu<K+0x1000000;};
+  collectMedia(*c,*media,*scratch,K,K+0x1000000,read,physical);
+  if(mode==0){assert(!media->guard && media->acceptedRoots==1 && media->pages==3 && !media->failedPages);assert(f.blocks==unchanged);}
+  if(mode==1 || mode==9){assert(media->guard==1 && !calls && !media->pages);}
+  if(mode==2){assert(media->guard==1 && !media->pages);}
+  if(mode==3){assert(media->guard==2 && !media->pages);}
+  if(mode==4 || mode==8){assert(!media->guard && media->failedPages && media->acceptedRoots==1);}
+  if(mode==5){assert(!media->guard && !media->acceptedRoots && !media->pages);}
+  if(mode==6 || mode==7){assert(media->guard==2);}
+ }
  printf("detail bytes=%zu graph offset=%zu pending offset=%zu tests passed\n",sizeof(Capture),offsetof(Capture,graph),offsetof(Capture,pending));
 }
