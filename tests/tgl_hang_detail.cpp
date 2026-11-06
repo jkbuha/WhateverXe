@@ -186,7 +186,7 @@ int main(int argc,char **argv) {
   };
   auto phys=[&](uint64_t cpu,uint64_t &p){p=cpu-K;return cpu>=K && cpu<K+0x1000000;};
   collectMedia(*c,*media,*scratch,K,K+0x1000000,read,phys);
-  assert(media->schema==2);
+  assert(media->schema==3);
   if(mode==0 || mode==3){assert(!media->guard && media->sourceMask==2 && media->acceptedRoots==1 && media->pages==4);assert(media->page[0].kind==XeMediaReferenceCandidate::Root);}
   else if(mode==2 || mode==4 || mode==5 || mode==6 || mode==7){assert(media->guard==2);}
   else {assert(!media->guard && !media->sourceMask && !media->acceptedRoots && !media->pages);}

@@ -3,7 +3,7 @@
 #include "kern_tgl_media_root.hpp"
 namespace XeMediaReferenceCandidate {
 constexpr unsigned MaxPages=16;
-enum Kind:uint64_t {Descriptor=1,Instruction=2,Surface=4,Root=8};
+enum Kind:uint64_t {Descriptor=1,Instruction=2,Surface=4,Root=8,SecondaryHead=16};
 struct Page{uint64_t gpu,kind,copied,qualified;uint8_t bytes[4096];};
 struct Capture{uint64_t schema,guard,pages,drops,refusedRoots,acceptedRoots,failedPages,sourceMask;Page page[MaxPages];};
 static_assert(sizeof(Capture)<131072,"bounded immutable media reference property");
@@ -29,8 +29,22 @@ template<class Reader>struct Collector{
   }
   return true;
  }
+ // The target is a candidate in the already owned software PPGTT. This does
+ // not infer effective GPU state, recurse into commands, or establish execution.
+ bool secondaryHead(const uint8_t *bytes,unsigned size,unsigned terminal){
+  if(!bytes || terminal>size || size-terminal<12 || (terminal&3) ||
+     XeMediaRootCandidate::word(bytes+terminal)!=0x18c00001)return false;
+  const uint64_t target=XeMediaRootCandidate::pair(bytes+terminal+4);
+  uint64_t checked;
+  if((target&3) || !XeMediaRootCandidate::add(target,0,8192,checked))return false;
+  const uint64_t first=target&~4095ULL;
+  // Exactly two page reads at most. Per-page qualification and holes remain
+  // explicit; never recursively follow a target found in these bytes.
+  page(first,SecondaryHead);page(first+4096,SecondaryHead);
+  capture.sourceMask|=4;return true;
+ }
  bool root(const uint8_t*bytes,unsigned size){
-  capture.schema=2;XeMediaRootCandidate::State s{};
+  capture.schema=3;XeMediaRootCandidate::State s{};
   if(!XeMediaRootCandidate::parse(bytes,size,s)){++capture.refusedRoots;return false;}
   ++capture.acceptedRoots;
   // Candidate surface-state page only; no surface-format/pixel dereference.
@@ -43,6 +57,7 @@ template<class Reader>struct Collector{
    uint64_t gpu;if(!XeMediaRootCandidate::add(s.instruction,offset,512,gpu)){++capture.drops;continue;}
    copy(gpu,512,nullptr,Instruction);
   }
+  secondaryHead(bytes,size,s.terminalOffset);
   return true;
  }
 };

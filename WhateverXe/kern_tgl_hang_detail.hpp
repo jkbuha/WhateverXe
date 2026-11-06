@@ -193,7 +193,7 @@ void collect(Capture &c,const TGLHangPending::Capture &pending,const uint8_t *re
 template<class Read,class Physical>
 void collectMedia(const Capture &detail,XeMediaReferenceCandidate::Capture &media,
  TGLHangGraph::Page &scratch,uint64_t directBase,uint64_t directEnd,Read read,Physical physical) {
- media.schema=2;media.guard=1;
+ media.schema=3;media.guard=1;
  if(detail.q[0]!=Schema || detail.q[1] || detail.q[15]>4 ||
     memcmp(detail.before,detail.after,sizeof(detail.before)))return;
  uint64_t owner[Fields]{};
