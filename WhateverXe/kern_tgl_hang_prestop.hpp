@@ -16,8 +16,17 @@ struct Capture {
  uint32_t registers[2][32];
  uint64_t slots[2][4][12]; // item, context, ID, descriptor, ring, stamps, index, retired, write index, engine, context owner, ring owner
 };
+// Separate pointer-free witness preserves the schema2 1152-byte main ABI.
+// CMD_BUF_CCTL is already read by native failure/submission diagnostics.
+// Linux v6.12 intel_lrc.c gen12_emit_cmd_buf_wa motivates observation only.
+struct CCTLCapture {
+ uint64_t q[8]; // schema, guard, before/after2084, caller begin/end ns,
+ // main guard and row errors. Sequential CPU reads, not GPU acceptance.
+};
+static_assert(sizeof(CCTLCapture)==64,"CCTL witness wire extent");
 template<class Read,class MMIO>
-void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bool gtLease=false) {
+void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bool gtLease=false,CCTLCapture *cctl=nullptr) {
+ if(cctl) {memset(cctl,0,sizeof(*cctl));cctl->q[0]=1;cctl->q[1]=1;cctl->q[4]=c.q[2];}
  c.q[0]=2;c.q[1]=1;c.q[4]=owner;c.q[5]=scheduler;
  auto field=[&](uint64_t p,unsigned offset,uint64_t &v,unsigned n=8) {
   v=0;return (p>>47)==0x1ffff && p+offset+n>=p && read(p+offset,&v,n)==n;
@@ -27,6 +36,7 @@ void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bo
     !field(scheduler,0xca0,streamer) || !field(streamer,0x10,so) || so!=owner)return;
  c.q[6]=streamer;c.q[1]=2;c.q[9]=mmio(0xd84);
  if(c.q[9]==UINT32_MAX || !(c.q[9]&2))return;
+ if(cctl) {cctl->q[1]=2;cctl->q[2]=mmio(0x2084);}
  // Only a caller already owning native GT forcewake may read these registers.
  // Render ACK or another client's GT ACK is not ownership of a GT lease.
  bool gt=false;
@@ -64,6 +74,16 @@ void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bo
  c.q[1]=!field(scheduler,0x10,so) || so!=owner ||
   !field(scheduler,0xca0,again) || again!=streamer ||
   !field(streamer,0x10,so) || so!=owner ? 3 : (c.q[10] ? 4 : 0);
+ if(cctl) {
+  cctl->q[6]=c.q[1];cctl->q[7]=c.q[10];
+  const auto ack=c.registers[1][26]; // existing second RENDER_ACK sample
+  if(c.q[1])cctl->q[1]=3;
+  else if(ack==UINT32_MAX || !(ack&2))cctl->q[1]=2;
+  else {
+   cctl->q[3]=mmio(0x2084);
+   cctl->q[1]=cctl->q[2]==UINT32_MAX || cctl->q[3]==UINT32_MAX ? 4 : 0;
+  }
+ }
 }
 }
 #endif

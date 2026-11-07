@@ -110,6 +110,7 @@ extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
 static bool tglHangPreStopReady=false;
 static uint32_t tglHangPreStopState;
 static TGLHangPreStop::Capture tglHangPreStopCapture{};
+static TGLHangPreStop::CCTLCapture tglHangPreStopCCTL{};
 static bool tglSameTailEnabled;
 static TGLSameTail::State tglSameTailState{},tglSameTailFailure{};
 static TGLSubmitHistory::History<> tglSubmitHistory;
@@ -15679,7 +15680,7 @@ extern "C" void tglHangPreStopWake(void *owner,bool enable,unsigned domains,unsi
   XELPForceWakeIRQ::required(wakeFlags,domains) &&
   read(p+0x1298,&gtReferences,sizeof(gtReferences))==sizeof(gtReferences) && int32_t(gtReferences)>0;
  // Read Gen12 fault/flush state before STOP/reset without an additional wake.
- TGLHangPreStop::collect(c,p,reinterpret_cast<uint64_t>(scheduler),read,mmio,countedGT);
+ TGLHangPreStop::collect(c,p,reinterpret_cast<uint64_t>(scheduler),read,mmio,countedGT,&tglHangPreStopCCTL);
  if(tglRPCSPowerReady) {
   uint64_t context=0;
   if(!c.q[1] && !c.q[10] && !c.q[11])for(unsigned i=0;i<4;++i)
@@ -15688,7 +15689,7 @@ extern "C" void tglHangPreStopWake(void *owner,bool enable,unsigned domains,unsi
  }
  if(!c.q[1])tglSubmitHistoryRecord(owner,reinterpret_cast<void *>(c.q[6]),UINT32_MAX,2);
  uint64_t freezeTime;tglHostClock(&freezeTime);tglSubmitHistory.freeze(freezeTime);
- tglHostClock(c.q+3);__atomic_store_n(&tglHangPreStopState,2U,__ATOMIC_RELEASE);
+ tglHostClock(c.q+3);tglHangPreStopCCTL.q[5]=c.q[3];__atomic_store_n(&tglHangPreStopState,2U,__ATOMIC_RELEASE);
 }
 
 void XE::wrapTGLHangRingDump(void *ring,void *registers) {
@@ -15704,6 +15705,8 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
   if (slot==0) {
    if(__atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
     IORegistryEntry::getRegistryRoot()->setProperty("TGLHangPreStop0",&tglHangPreStopCapture,sizeof(tglHangPreStopCapture));
+   if(__atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
+    IORegistryEntry::getRegistryRoot()->setProperty("TGLHangPreStopCCTL0",&tglHangPreStopCCTL,sizeof(tglHangPreStopCCTL));
    if(tglSameTailEnabled && __atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
     IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTail0",&tglSameTailFailure,sizeof(tglSameTailFailure));
    if(tglSameTailEnabled)tglSubmitHistoryPublish();
