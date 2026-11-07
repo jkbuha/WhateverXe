@@ -36,7 +36,6 @@ void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bo
     !field(scheduler,0xca0,streamer) || !field(streamer,0x10,so) || so!=owner)return;
  c.q[6]=streamer;c.q[1]=2;c.q[9]=mmio(0xd84);
  if(c.q[9]==UINT32_MAX || !(c.q[9]&2))return;
- if(cctl) {cctl->q[1]=2;cctl->q[2]=mmio(0x2084);}
  // Only a caller already owning native GT forcewake may read these registers.
  // Render ACK or another client's GT ACK is not ownership of a GT lease.
  bool gt=false;
@@ -50,6 +49,10 @@ void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bo
    c.q[15]=mmio(0xB464); // CS/LTISEQ flush message, read does not clear.
   }
  }
+ // An ACK alone can belong to another client. New reads also require the
+ // counted native GT lease and its qualified ACK, without another wake.
+ const bool cctlStarted=cctl && gt;
+ if(cctlStarted) {cctl->q[1]=2;cctl->q[2]=mmio(0x2084);}
  for(unsigned pass=0;pass<2;++pass) {
   for(unsigned i=0;i<32;++i)c.registers[pass][i]=mmio(Registers[i]);
   for(unsigned i=0;i<4;++i) {
@@ -77,8 +80,10 @@ void collect(Capture &c,uint64_t owner,uint64_t scheduler,Read read,MMIO mmio,bo
  if(cctl) {
   cctl->q[6]=c.q[1];cctl->q[7]=c.q[10];
   const auto ack=c.registers[1][26]; // existing second RENDER_ACK sample
-  if(c.q[1])cctl->q[1]=3;
-  else if(ack==UINT32_MAX || !(ack&2))cctl->q[1]=2;
+  const auto gtAfter=uint32_t(c.q[12]>>32);
+  if(!cctlStarted)cctl->q[1]=1;
+  else if(c.q[1])cctl->q[1]=3;
+  else if(ack==UINT32_MAX || !(ack&2) || gtAfter==UINT32_MAX || !(gtAfter&2))cctl->q[1]=2;
   else {
    cctl->q[3]=mmio(0x2084);
    cctl->q[1]=cctl->q[2]==UINT32_MAX || cctl->q[3]==UINT32_MAX ? 4 : 0;
