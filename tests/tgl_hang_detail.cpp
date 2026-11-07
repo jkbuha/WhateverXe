@@ -67,6 +67,24 @@ struct Fixture {
 };
 }
 int main(int argc,char **argv) {
+ // The nearest preceding RCS root may disable POSH traversal. Its stamp can
+ // already be retired while another engine still needs the root's evidence.
+ for(const uint32_t header:{0x18800101U,0x18900101U}) {
+  Fixture f;f.root();f.put(RingStorage,header);
+  f.put(Ring+0x9040,uint32_t(12));f.pending.q[8]=f.pending.q[9]=12;
+  auto c=f.run();assert(!c->q[1] && !c->q[29] && c->q[25]==Main);
+  assert(c->q[28]==11 && c->graph.q[2]==1);
+  assert(c->graph.draws[0].q[0]==TGLHangPending::Count);
+  for(unsigned bit=0;bit<32;++bit) {
+   const auto changed=header^(1U<<bit);
+   const bool allowed=changed==0x18800101U || changed==0x18900101U;
+   assert(ringBatchStart(changed)==allowed);
+   if(allowed)continue;
+   Fixture bad;bad.root();bad.put(RingStorage,changed);
+   auto refused=bad.run();assert(refused->q[29]==1 && !refused->graph.q[2]);
+  }
+ }
+
  {Fixture f;const uint64_t origin=Ring+0xb000,other=Ring+0xc000,stream=Ring+0xd000,item=Ring+0xe000;
   for(auto p:{origin,other,stream,item})f.alloc(p,4096);
   f.put(origin+0x10,K+0x999000);f.put(origin+0x20,other);f.put(origin+0x40,uint8_t(1));

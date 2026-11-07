@@ -81,6 +81,11 @@ bool cacheMatches(uint64_t ring,const TGLHangPending::Entry &e,Read &read) {
 // write and the matching cache record. This is provenance, not proof that the
 // GPU is still executing it. In particular a completed RCS stamp says nothing
 // here about outstanding POCS work. Preserve strict tail-copy checks below.
+// Both forms are first-level PPGTT RCS starts; bit20 only enables POSH
+// traversal. Do not admit POSH Start, predication, GGTT or other flags here.
+constexpr bool ringBatchStart(uint32_t word) {
+ return word==0x18800101U || word==0x18900101U;
+}
 template<class Read,class Walker>
 void ringRoot(Capture &c,Read &read,Walker &walker) {
  auto q=c.q+24;q[0]=1;q[5]=5;
@@ -92,7 +97,7 @@ void ringRoot(Capture &c,Read &read,Walker &walker) {
  q[5]=1;
  for(unsigned distance=12;distance<=length;distance+=4) {
   const unsigned at=(head+length-distance)&(length-1);
-  if(word(at)!=0x18900101)continue;
+  if(!ringBatchStart(word(at)))continue;
   const uint64_t gpu=uint64_t(word(at+4))|(uint64_t(word(at+8))<<32);
   if(!gpu || gpu>>47 || (gpu&3))continue;
   q[1]=gpu;q[2]=at;q[5]=2;
@@ -157,7 +162,7 @@ void collect(Capture &c,const TGLHangPending::Capture &pending,const uint8_t *re
   const auto &e=pending.entries[i];order[i]=i;score[i]=(1ULL<<32)+uint32_t(e.stamp-b[Retired]);
   for(unsigned o=0;head<b[RingLength] && o<b[RingLength];o+=4) {
    if(!(c.q[12]&(1ULL<<(o/4096))))continue;
-   const auto w=TGLHangPending::u32(c.ring+o);if(w!=0x18900101)continue;
+   const auto w=TGLHangPending::u32(c.ring+o);if(!ringBatchStart(w))continue;
    uint32_t lo=0,hi=0;unsigned p1=(o+4)&(b[RingLength]-1),p2=(o+8)&(b[RingLength]-1);
    if(!(c.q[12]&(1ULL<<(p1/4096))) || !(c.q[12]&(1ULL<<(p2/4096))))continue;
    lo=TGLHangPending::u32(c.ring+p1);hi=TGLHangPending::u32(c.ring+p2);
