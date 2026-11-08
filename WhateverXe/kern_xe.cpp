@@ -1,5 +1,7 @@
 #include "kern_display13_color.hpp"
 #include <mach/clock.h>
+#include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 //
@@ -6114,6 +6116,16 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 			patcher.clearError();
 		}
 		IORegistryEntry::getRegistryRoot()->setProperty("WEXIdleTimerGuard",idleOk);
+		// Wake re-arm from the idle timer (display13FBRearmParked). Short route: the prologue
+		// 55 48 89 E5 41 57 41 56 53 50 is followed by a RIP-relative incq a long route would copy.
+		const uint8_t idleEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50};
+		bool idleRouted=idleOk && !memcmp(reinterpret_cast<void *>(idle),idleEntry,sizeof(idleEntry));
+		if(idleRouted) {
+			KernelPatcher::RouteRequest idleRoute {idleSymbol,wrapDisplay13FBIdleTimer,orgDisplay13FBIdleTimer};
+			idleRouted=patcher.routeMultipleShort(index,&idleRoute,1,address,size);
+			patcher.clearError();
+		}
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXIdleTimerRearm",idleRouted);
 	}
 	return swRouted;
 }
@@ -6173,7 +6185,9 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	check[37]=c.state.failureRegister;check[38]=c.state.failureBits;
 	check[39]=excluded;check[40]=io.read(0xC400C);check[41]=io.read(0xC4004);
 	const bool enabled=c.status==Display13FBIRQ::Status::Complete;
+	const bool retry=!enabled && c.state.begun && !c.state.faulted;
 	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	if(retry)display13FBRearmSchedule();
 	controller->setProperty("N97FBIRQ",record,sizeof(record));
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBIRQEnableCheck",check,sizeof(check));
 	if(!check[3])IORegistryEntry::getRegistryRoot()->setProperty("N97FBIRQFirstEnableCheck",check,sizeof(check));
@@ -6188,6 +6202,86 @@ IOReturn XE::wrapDisplay13FBDisableIRQ(IOService *controller) {
 	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
 	controller->setProperty("N97FBIRQ",record,sizeof(record));
 	return disabled ? kIOReturnSuccess : kIOReturnNotReady;
+}
+// Display wake on a single-output (panel-only) wiring: the donor's hwEnableInterrupts runs
+// before enablePipe sets PIPECONF, so wrapDisplay13FBEnableIRQ parks the DE master, or its
+// power-loss restore fails Topology (pipe A not running yet). On this path the donor does not
+// follow with hwConfigureVBLInterrupt, and its IdleTimerFired fallback (a bare DISPLAY_INT_CTL
+// enable that leaves c+0xFD4 = 0) is cut by the WEX idle guard because it livelocked CPU 0.
+// Without a re-arm no VBL arrives, flips never complete and WindowServer hangs (Precision 5570,
+// 2026-11-08). Re-arm the whole bank once pipe A runs, under the native IRQ lock, with the same
+// helpers as EnableIRQ/ConfigureVBL. Published as N97FBIRQ event 4.
+bool XE::display13FBRearmParked(IOService *controller) {
+	auto &c=display13FBIRQ;
+	if(!callbackXE->display13FBIRQReady || !adlnIRQOwner(controller) || !c.lock)return true;
+	static uint64_t ticks,attempts,completes;
+	Display13FBIRQIO io {c.base};uint64_t record[32] {},probe[20] {};bool attempted=false,done=false;
+	// An eDP panel next to other VBT outputs (Type-C DP on the 5570) is multi-output wiring:
+	// there the parked master comes from DisableIRQ or a power-loss restore that failed Topology.
+	const bool multi=Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring);
+	const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
+	const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
+	const auto wells=io.read(Display13FBIRQ::Driver);
+	const bool powered=Display13FBIRQ::powered(wells,0);
+	Display13FBIRQ::ActivePipes actual {};
+	bool running=false;
+	if(multi) {
+		actual=Display13FBIRQ::readActivePipes(io,admitted,c.state.transcoders);
+		running=actual.status==Display13FBIRQ::Status::Complete;
+	} else running=powered && Display13Transcoder::running(io,0,c.state.transcoders);
+	const bool parked=c.state.begun && !c.state.faulted && !(c.state.enabled && c.state.active);
+	if(parked && !c.quiescing && !c.blockedPipes && running) {
+		if(c.powerLost) {
+			c.status=Display13FBIRQ::restoreAfterPowerLoss(io,c.state,admitted);
+			if(c.status==Display13FBIRQ::Status::Complete)c.powerLost=false;
+		} else {
+			const auto excluded=controller==callbackXE->adlnTopologyController ?
+				Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
+			c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),multi ? actual.active : 1U,
+				callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+		}
+		attempted=true;done=c.status==Display13FBIRQ::Status::Complete;
+		++attempts;if(done)++completes;
+		adlnIRQCache(controller,io);adlnIRQRecord(record,4);
+	}
+	// Probe: why a re-arm did or did not happen (read with ioreg on the registry root).
+	probe[0]=++ticks;probe[1]=attempts;probe[2]=completes;probe[3]=c.state.begun;probe[4]=c.state.enabled;
+	probe[5]=c.state.active;probe[6]=c.state.faulted;probe[7]=c.quiescing;probe[8]=c.blockedPipes;probe[9]=c.powerLost;
+	probe[10]=wells;probe[11]=powered;probe[12]=running;
+	probe[13]=powered ? Display13Transcoder::control(io,0,c.state.transcoders) : 0xDEADu;
+	probe[14]=io.read(Display13FBIRQ::Master);probe[15]=static_cast<uint32_t>(c.status);
+	probe[16]=multi;probe[17]=admitted;probe[18]=actual.active;probe[19]=static_cast<uint32_t>(actual.status);
+	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	if(attempted)controller->setProperty("N97FBIRQ",record,sizeof(record));
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXRearmProbe",probe,sizeof(probe));
+	return done || !parked; // re-armed, or nothing parked any more (re-armed elsewhere or faulted)
+}
+// EnableIRQ declined (display sleep, or wake before enablePipe sets PIPECONF): retry
+// the re-arm from a WEX thread call every 50 ms for up to 10 s, independent of donor callbacks.
+// The donor arms its idle timer from completed flips, so IdleTimerFired alone may never come.
+static thread_call_t adlnRearmCall {};
+static int32_t adlnRearmLeft {};
+void XE::display13FBRearmSchedule() {
+	if(!adlnRearmCall)adlnRearmCall=thread_call_allocate(reinterpret_cast<thread_call_func_t>(display13FBRearmTick),nullptr);
+	if(!adlnRearmCall)return;
+	__atomic_store_n(&adlnRearmLeft,200,__ATOMIC_RELEASE);
+	uint64_t deadline {};clock_interval_to_deadline(50,kMillisecondScale,&deadline);
+	thread_call_enter_delayed(adlnRearmCall,deadline);
+}
+void XE::display13FBRearmTick(void *,void *) {
+	auto controller=__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE);
+	if(!controller || display13FBRearmParked(controller))return;
+	if(__atomic_sub_fetch(&adlnRearmLeft,1,__ATOMIC_ACQ_REL)>0) {
+		uint64_t deadline {};clock_interval_to_deadline(50,kMillisecondScale,&deadline);
+		thread_call_enter_delayed(adlnRearmCall,deadline);
+	}
+}
+// IdleTimerFired runs on the controller work loop a few seconds after display wake; it is the
+// first native callback after enablePipe on this path. Re-arm first, then the original (whose
+// bare re-enable branch the idle guard skips).
+void XE::wrapDisplay13FBIdleTimer(IOService *controller) {
+	display13FBRearmParked(controller);
+	FunctionCast(wrapDisplay13FBIdleTimer,callbackXE->orgDisplay13FBIdleTimer)(controller);
 }
 void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObject *path,bool enabled,bool getLock) {
 	if(!adlnIRQOwner(controller) || !fb || !path)return;
@@ -19599,12 +19693,14 @@ IOMemoryDescriptor *XE::wrapTGLAperture(void *fb, int aperture) {
 	return r;
 }
 
+// Wake re-arm at the activation boundary (when this observation route is active).
 void XE::wrapTGLEnablePipe(void *controller, void *fb, void *path, const void *timing) {
 	auto caller = __builtin_return_address(0);
 	tglObserveTiming(fb, path, timing, 1, 0);
 	tglObservePath(nullptr, path, 5, false, 0, 0, caller);
 	tglObserveScanout(fb, nullptr, 3, false, 0);
 	FunctionCast(wrapTGLEnablePipe, callbackXE->orgTGLEnablePipe)(controller, fb, path, timing);
+	display13FBRearmParked(static_cast<IOService *>(controller));
 	tglObservePath(nullptr, path, 5, true, 0, 0, caller);
 	tglObserveScanout(fb, nullptr, 3, true, 0);
 }

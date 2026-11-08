@@ -496,6 +496,7 @@ private:
 	static void wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop);
 	mach_vm_address_t orgDisplay13FBIRQ[5] {};
 	mach_vm_address_t orgDisplay13FBSWIRQ {};
+	mach_vm_address_t orgDisplay13FBIdleTimer {};
 	mach_vm_address_t adlnWorkLoopInGate {},adlnWorkLoopOnThread {};
 	mach_vm_address_t adlnWorkLoopTryClose {},adlnWorkLoopOpen {};
 	__attribute__((noinline)) bool processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
@@ -505,6 +506,10 @@ private:
 	static void wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t *aux,uint32_t *hotplug);
 	static bool wrapDisplay13FBProcessIRQ(IOService *controller);
 	static void wrapDisplay13FBSWIRQ(IOService *controller,IOInterruptEventSource *source,int count);
+	static void wrapDisplay13FBIdleTimer(IOService *controller);
+	static bool display13FBRearmParked(IOService *controller);
+	static void display13FBRearmSchedule();
+	static void display13FBRearmTick(void *,void *);
     void auditDSIBoot(IOPCIDevice *,volatile const uint8_t *,uint64_t,const AlderLakeN::DisplayReadout &,bool);
 	void adlnBootstrap(IOPCIDevice *pci);
 	uint16_t tglDeviceId {0}; // Physical PCI ID, not a DeviceProperties override.
