@@ -150,5 +150,6 @@
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
   "-wex-adln-cctl-reload": [],
-  "-wex-adln-ctx-invalidate": []
+  "-wex-adln-ctx-invalidate": [],
+  "-wex-resume-park": []
 }
