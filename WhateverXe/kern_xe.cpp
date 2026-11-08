@@ -10421,6 +10421,7 @@ static thread_call_t wexBootSnapshotCall;
 static volatile bool wexBootSnapshotFrozen; // set at the first lost-power resume
 static uint32_t wexBootSnapshotData[ResumeSnapshot::Words],wexBootSnapshotPTE[ResumeSnapshot::PTEWords];
 static void wexSamplePage(uint64_t pte,uint32_t *out);
+static void wexFlushSurface(uintptr_t bar,uint32_t surface,uint32_t *out);
 static thread_call_t wexResumeSnapshotCall;
 static uint32_t wexResumeSnapshotIndex,wexResumeSnapshotEpoch;
 static uint32_t wexResumeSnapshotData[2][ResumeSnapshot::Words];
@@ -10467,6 +10468,11 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
             wexSamplePage((uint64_t(b[2])<<32)|b[1],o+1+36+6*i);
         }
         IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeContent",content,sizeof(content));
+        if(index==1) {
+            uint32_t flush[6] {};
+            wexFlushSurface(c.map->getVirtualAddress(),wexResumeSnapshotPTE[index][1]&~4095U,flush);
+            IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeFlush",flush,sizeof(flush));
+        }
     }
     stage[2]=2;IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshotStage",stage,sizeof(stage));
     IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshot",wexResumeSnapshotData,sizeof(wexResumeSnapshotData));
@@ -10523,6 +10529,33 @@ static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
 }
 // Read-only content sample of one physical RAM page behind a GGTT entry:
 // nonzero dword count and XOR over the first 1 KiB, plus the first dwords.
+// H13: write back any cached lines of the scanout surface to RAM. The display
+// engine reads RAM without snooping CPU/LLC caches; after a hibernation
+// restore the restored pixels may still be dirty in cache. clflush only; no
+// register writes. Walks the surface's GGTT entries, stops at 16 MiB.
+static void wexFlushSurface(uintptr_t bar,uint32_t surface,uint32_t *out) {
+    out[0]=1;out[1]=surface;out[2]=out[3]=out[4]=0;
+    if(!bar || !surface || (surface&4095))return;
+    uint64_t t0=0,t1=0;absolutetime_to_nanoseconds(mach_absolute_time(),&t0);
+    for(uint32_t page=0;page<4096;++page) {
+        const uint64_t gpu=uint64_t(surface)+uint64_t(page)*4096;
+        const uint64_t entry=0x800000+(gpu>>9);
+        if(gpu>=0x100000000ULL || entry+8>0x1000000)break;
+        const uint64_t pte=*reinterpret_cast<volatile uint64_t *>(bar+entry);
+        const uint64_t physical=pte&0x7FFFFFF000ULL;
+        if(!(pte&1) || !physical){++out[3];continue;}
+        auto md=IOMemoryDescriptor::withPhysicalAddress(physical,4096,kIODirectionInOut);
+        if(!md){++out[4];continue;}
+        if(auto map=md->createMappingInTask(kernel_task,0,kIOMapAnywhere)) {
+            auto va=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+            for(unsigned line=0;line<4096;line+=64)asm volatile("clflush (%0)"::"r"(va+line):"memory");
+            ++out[2];map->release();
+        } else ++out[4];
+        md->release();
+    }
+    asm volatile("mfence":::"memory");
+    absolutetime_to_nanoseconds(mach_absolute_time(),&t1);out[5]=static_cast<uint32_t>((t1-t0)/1000);
+}
 static void wexSamplePage(uint64_t pte,uint32_t *out) {
     out[0]=static_cast<uint32_t>(pte);out[1]=static_cast<uint32_t>(pte>>32);out[2]=out[3]=out[4]=out[5]=UINT32_MAX;
     const uint64_t physical=pte&0x7FFFFFF000ULL;
