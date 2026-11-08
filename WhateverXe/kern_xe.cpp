@@ -7730,6 +7730,25 @@ uint8_t *XE::display13SSTPort(void *port) {
  return p;
 }
 
+// At the firmware handoff a Combo eDP port still has native mode 0: Apple's setPortMode has not run yet, and
+// display13SSTPort requires exactly 1 (the AUX gate already accepts 0 or 1 on Combo ports). Admit that one case for the
+// handoff only: the same terms, on the DDI the VBT names as the panel. Every other caller keeps the exact check, and
+// Raptor Lake-U stays on the boot framebuffer until its display clock is implemented.
+uint8_t *XE::display13PanelBootPort(void *port) {
+ auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
+ if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || XELP::raptorLakeUDevice(s->xeProfile.identity) ||
+    !s->display13FBSSTHooksReady ||
+    !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
+    c.controller!=s->adlnTopologyController || !adlnWriterMappingBound() ||
+    c.clockFaulted || c.memoryFaulted || c.panelFaulted || c.clockStopped || !s->adlnOutputWiring.described())return nullptr;
+ auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+ if(!config || !Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
+    config[0]>=2 || !(s->adlnOutputWiring.panel&(1U<<config[0])) || p[0x117] ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=0 ||
+    Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
+ return p;
+}
+
 bool XE::display13HDMIPort(void *port) {
  auto s=callbackXE;auto object=static_cast<OSObject *>(port);
  if(!object || object->getMetaClass()->getClassSize()<0x580)return false;
@@ -8670,7 +8689,13 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                 }
                 check[49]=c.bridge.bootAdopted;
                 check[50]=adlnWriterMappingBound();
-                if(sst) {
+                // renedis/Thatisjigen hand-off admission (a57698f): only with
+                // -wex-panel-handoff, and only when the SST/AUX-lease path did not admit.
+                static int panelHandoff=-1;
+                if(panelHandoff<0)panelHandoff=checkKernelArgument("-wex-panel-handoff") ? 1 : 0;
+                const bool panelBoot=panelHandoff && dp && !sst && display13PanelBootPort(port);
+                if(panelBoot)SYSLOG("igfx","Display13 eDP boot port on DDI %u admitted with native mode 0",ddi);
+                if(sst || panelBoot) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     check[51]=static_cast<uint32_t>(boot.status);
                     uint32_t cmtg=0,ctl2=0;check[52]=AlderLakeN::value(boot,0x6FA88,cmtg);check[53]=cmtg;
