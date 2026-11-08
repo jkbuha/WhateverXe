@@ -82,6 +82,8 @@ struct XE {
  static bool prepareDisplay13Wake(IOService*){return true;}
  // Native common completion is covered by display13_power_dispatch.py.
  bool ownedDisplay13Framebuffer(IOService*)const{return false;}
+ // -wex-edp-blank (kern_xe.cpp): a native eDP feature, never taken on the DSI path.
+ static bool display13EDPBlankPower(IOService*,uint32_t,uint32_t&){return false;}
  struct {unsigned dsi=1;}adlnOutputWiring;bool dsiStopAttempted=false,dsiResourcesReady=true;
  uintptr_t display13FramebufferEvent=0;bool dsiSystemWakeNotify=false,dsiPowerOffNotified=false;
  uint32_t dsiWakeIncomplete=0;

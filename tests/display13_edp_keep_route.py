@@ -11,10 +11,12 @@ functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig 
  'uint32_t XE::wrapDisplay13EnablePort(', 'uint32_t XE::wrapDisplay13DisablePort(',
  'uint32_t XE::wrapDisplay13SignalLevels(', 'uint32_t XE::wrapDisplay13TrainingPattern(',
  'bool XE::display13AUXReady(', 'uint32_t XE::wrapDisplay13ReadAUX(', 'uint32_t XE::wrapDisplay13WriteAUX(',
- 'bool XE::wrapDisplay13RegsNeedUpdate('])
+ 'bool XE::wrapDisplay13RegsNeedUpdate(',
+ 'bool XE::display13EDPBlankReady(', 'void XE::display13EDPBlankPublishReady(', 'bool XE::display13EDPBlankPower('])
 binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
 keep=s[s.index('// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,'):s.index('uint32_t XE::wrapDisplay13ReadAUX(')]
-keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep
+blank=s[s.index('// -wex-edp-blank (Display13EDPBlank), on top of'):s.index('bool XE::display13EDPBlankReady(')]
+keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep+'\n'+blank
 objects=(r/'tests/tgl_fb_binding.cpp').read_text().split('int main()')[0].replace('port[0x580]','port[0x700]')
 base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
 # The real context's boot readout and panel flag, read through the same
@@ -25,16 +27,20 @@ bootio='''struct Display13FBBootIO {
  uint32_t read(uint32_t r){auto i=map->regs.find(r);return i==map->regs.end()?0:i->second;}
 };
 '''
+base=base.replace(' uint32_t base=0,drop=0,delay=0,idleAfter=0,idleReg=0;',' uint32_t base=0,drop=0,delay=0,idleAfter=0,idleReg=0;\n uintptr_t getVirtualAddress();size_t length=0x1000000;size_t getLength() {return length;}',1)
 base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',bootio+keep+'\n'+functions)
 base=base.replace('bool adlnWriterMappingBound()','void adlnFault(bool &fault,unsigned){fault=true;}\nbool adlnWriterMappingBound()')
-base='#include "kern_alderlake_n.hpp"\n#include <cstdio>\n'+base
+assert base.count('constexpr unsigned kIOReturnNotReady=0xE00002D8;')==1
+base=base.replace('constexpr unsigned kIOReturnNotReady=0xE00002D8;','constexpr unsigned kIOReturnNotReady=0xE00002D8,kIOReturnSuccess=0;')
+base='#include "kern_alderlake_n.hpp"\n#include "kern_display13_edp_blank.hpp"\n#include <cstdio>\n'+base
 assert base.count(' Map *map=nullptr;')==1
 base=base.replace(' Map *map=nullptr;',' Map *map=nullptr;bool bootPanel=false;AlderLakeN::DisplayReadout displayScratch;')
 header=(r/'WhateverXe/kern_xe.hpp').read_text()
 extra=header[header.index(' bool display13FBAUXHooksReady'):header.index(' mach_vm_address_t orgDisplay13TrainingPattern')]
 extra=extra.replace(' bool processDisplay13FramebufferAUX(KernelPatcher &,size_t,mach_vm_address_t,size_t);','').replace('mach_vm_address_t','uintptr_t')
 assert ' mach_vm_address_t orgDisplay13RegsNeedUpdate {};' in header and ' static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);' in header
-extra+=' static bool display13EDPKeepActive();\n'
+extra+=' static bool display13EDPBlankPower(IOService *,uint32_t,uint32_t &);static bool display13EDPBlankReady();static void display13EDPBlankPublishReady();static bool display13EDPKeepActive();\n'
+extra+=' bool fbOwned {true};bool ownedDisplay13Framebuffer(IOService *) const {return fbOwned;}\n'
 extra+=' uintptr_t orgDisplay13RegsNeedUpdate {};\n static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);\n'
 base=base.replace('struct XE {','struct XE {\n'+extra)
 code=base+(r/'tests/display13_edp_keep_route_fixture.cpp').read_text()
@@ -57,5 +63,5 @@ if len(sys.argv)>1:
 with tempfile.TemporaryDirectory(prefix='display13-edp-keep-') as d:
  p=Path(d);(p/'test.cpp').write_text(code)
  subprocess.run(['clang++','-std=c++17','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
- for args in [[],['-wex-edp-keep']]:
+ for args in [[],['-wex-edp-keep'],['-wex-edp-keep','-wex-edp-blank'],['-wex-edp-blank']]:
   subprocess.run([str(p/'test')]+args,check=True)

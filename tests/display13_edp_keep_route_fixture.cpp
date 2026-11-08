@@ -165,6 +165,138 @@ void keepScenarios() {
  {const auto f=firstRecord();assert(f.call==1 && !f.reasons);assert(testSyslog().size()==1);}
  printf("PASS Display13 eDP keep: %u mode-set decisions over a firmware-lit panel through the production wrappers\n",scenarios);
 }
+// -wex-edp-blank through the production power hook (display13EDPBlankPower):
+// the kept boot panel path blanks and unblanks the primary plane and cursor of
+// pipe A in place of the donor's Doze/Wake transition, everything else takes
+// the donor's own. The mock MMIO window is real memory (the hook writes it
+// through the mapping's virtual address, as the kernel does).
+alignas(4096) uint8_t blankMMIO[0x1000000];
+uintptr_t Map::getVirtualAddress(){return reinterpret_cast<uintptr_t>(blankMMIO);}
+volatile uint32_t &mmio(uint32_t offset){return *reinterpret_cast<volatile uint32_t *>(blankMMIO+offset);}
+namespace B=Display13EDPBlank;
+const uint32_t livePlane=0x84001008U,liveCursor=0x04000027U;
+void blankLive(){mmio(B::PlaneCtl)=livePlane;mmio(B::PlaneSurf)=0x00200000U;mmio(B::CurCtl)=liveCursor;mmio(B::CurBase)=0x01230000U;}
+std::vector<uint32_t> blankRecord() {
+ auto &data=IORegistryEntry::getRegistryRoot()->data;assert(data.count("WEXEDPBlank"));
+ const auto &v=data["WEXEDPBlank"];assert(v.size()==11*sizeof(uint32_t));
+ std::vector<uint32_t> r(11);memcpy(r.data(),v.data(),v.size());assert(r[0]==2);return r;
+}
+uint32_t powerOf(Fixture &f){uint32_t v;memcpy(&v,f.fb+0x4284,sizeof(v));return v;}
+// The adopted boot panel path, awake, attached on pipe A, whose latest decision kept the link.
+void blankPrepare(Fixture &f,Map &map) {
+ edpSetup(f,map);auto &c=display13FBPower;
+ c.bootPanel=true;c.bridge.bootPort=0;c.bridge.bootPath=reinterpret_cast<uintptr_t>(f.path);c.bridge.bootAdopted=true;
+ f.attach();put(f.fb,0x4284,2U);state.fbOwned=true;state.adlnOutputWiring.dsi=0;
+ state.orgDisplay13RegsNeedUpdate=reinterpret_cast<uintptr_t>(nativeRegs);map.length=0x1000000;
+ c.bridge.state.faulted=c.bridge.state.suspended=false;
+ display13EDPKeepPath=reinterpret_cast<uintptr_t>(f.path);
+ display13EDPBlankState=Display13EDPBlank::State{};IORegistryEntry::getRegistryRoot()->data.erase("WEXEDPBlank");blankLive();
+}
+void blankScenarios() {
+ const bool requested=testKernelArguments().count("-wex-edp-blank")!=0;
+ unsigned scenarios=0;uint32_t result=0xFFFFFFFFU;
+ const auto power=[&](Fixture &f,uint32_t st){result=0xFFFFFFFFU;return XE::display13EDPBlankPower(reinterpret_cast<IOService *>(f.fb),st,result);};
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  if(!requested) {
+   // Without the switch the donor's transition is untouched.
+   assert(!power(f,1) && result==0xFFFFFFFFU && powerOf(f)==2 && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor);
+   assert(!IORegistryEntry::getRegistryRoot()->data.count("WEXEDPBlank"));++scenarios;
+   printf("PASS Display13 eDP blank off: the donor's power transition unchanged (%u scenarios)\n",scenarios);return;
+  }
+  // Display sleep: Wake -> Doze only clears the enables and records the state.
+  assert(power(f,1) && result==kIOReturnSuccess && powerOf(f)==1);
+  assert(!(mmio(B::PlaneCtl)&B::PlaneEnable) && mmio(B::PlaneCtl)==(livePlane&~B::PlaneEnable));
+  assert(!(mmio(B::CurCtl)&B::CursorMode) && mmio(B::PlaneSurf)==0x00200000U && mmio(B::CurBase)==0x01230000U);
+  {const auto r=blankRecord();assert(r[1]==1 && r[2]==2 && r[3]==1 && r[4]==unsigned(B::Action::Blank) && r[5]==1 && r[6]==0 && r[7]==livePlane && r[8]==liveCursor && r[9]==0 && r[10]==2);}
+  assert(display13EDPBlankState.fb==reinterpret_cast<uintptr_t>(f.fb));
+  // Doze -> Off while dark changes nothing but the recorded state.
+  assert(power(f,0) && powerOf(f)==0 && display13EDPBlankState.blanks==1 && !(mmio(B::PlaneCtl)&B::PlaneEnable));
+  // Wake: the enables come back, no donor transition.
+  assert(power(f,2) && result==kIOReturnSuccess && powerOf(f)==2);
+  assert(mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
+  {const auto r=blankRecord();assert(r[1]==2 && r[2]==0 && r[4]==unsigned(B::Action::Unblank) && r[6]==1 && r[10]==3 && !display13EDPBlankState.fb);}
+  // Awake again: nothing to do, still not the donor's.
+  assert(power(f,2) && powerOf(f)==2 && display13EDPBlankState.blanks==1 && display13EDPBlankState.unblanks==1);
+  assert(blankRecord()[4]==unsigned(B::Action::Keep));
+  assert(!locked && objectRefs.empty());++scenarios;}
+ // A donor reprogramming of the plane while dark survives the wake.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(power(f,1));mmio(B::PlaneCtl)=0x04003008U;mmio(B::PlaneSurf)=0x00400000U;
+  assert(power(f,2) && mmio(B::PlaneCtl)==0x84003008U && mmio(B::PlaneSurf)==0x00400000U);++scenarios;}
+ // Each missing condition keeps the donor's own transition and the hardware untouched.
+ const std::pair<const char *,void (*)(Fixture &)> refusals[]={
+  {"link not kept",[](Fixture &){display13EDPKeepPath=0;}},
+  {"another path",[](Fixture &f){display13EDPKeepPath=reinterpret_cast<uintptr_t>(f.path)+8;}},
+  {"path not adopted at the handoff",[](Fixture &){display13FBPower.bridge.bootAdopted=false;}},
+  {"not the boot path",[](Fixture &){display13FBPower.bridge.bootPath=1;}},
+  {"not the boot panel",[](Fixture &){display13FBPower.bootPanel=false;}},
+  {"pipe B",[](Fixture &f){put(f.path,0x3640,1U);}},
+  {"path detached",[](Fixture &f){put(f.path,0x3644,1U);}},
+  {"not an owned framebuffer",[](Fixture &){state.fbOwned=false;}},
+  {"bridge suspended",[](Fixture &){display13FBPower.bridge.state.suspended=true;}},
+  {"bridge faulted",[](Fixture &){display13FBPower.bridge.state.faulted=true;}},
+  {"DSI panel",[](Fixture &){state.adlnOutputWiring.dsi=1;}},
+  {"unknown power state",[](Fixture &f){put(f.fb,0x4284,7U);}},
+ };
+ for(const auto &refusal:refusals) {
+  Fixture f(0,0,0);Map map;blankPrepare(f,map);refusal.second(f);
+  const auto before=powerOf(f);
+  if(power(f,1)){printf("blanked despite: %s\n",refusal.first);assert(false);}
+  assert(powerOf(f)==before && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
+  assert(!locked && objectRefs.empty());++scenarios;
+ }
+ // A native doze stays native, also when it wakes.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);put(f.fb,0x4284,1U);
+  assert(!power(f,2) && powerOf(f)==1 && blankRecord()[4]==unsigned(B::Action::Native));++scenarios;}
+ // A blanked panel is never left dark: when its link is no longer the kept one
+ // the wake unblanks it and hands over to the donor.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(power(f,1));display13EDPKeepPath=0;
+  assert(!power(f,2) && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
+  assert(powerOf(f)==1 && blankRecord()[4]==unsigned(B::Action::Unblank));++scenarios;}
+ // Another framebuffer (an external display on pipe B, an offline connector
+ // without a path) never touches the blanked panel and never overwrites its
+ // record: in clamshell mode the external display wakes while the panel stays
+ // off. Only the panel's own wake brings it back.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  Fixture ext(1,1,1);ext.attach();put(ext.fb,0x4284,1U);
+  Fixture offline(2,2,2);put(offline.fb,0x4284,1U);
+  assert(power(f,1) && !(mmio(B::PlaneCtl)&B::PlaneEnable));
+  const auto record=blankRecord();
+  for(uint32_t st:{2U,1U,0U,2U}) {
+   assert(!power(ext,st) && result==0xFFFFFFFFU && !power(offline,st) && result==0xFFFFFFFFU);
+   assert(!(mmio(B::PlaneCtl)&B::PlaneEnable) && !(mmio(B::CurCtl)&B::CursorMode) && display13EDPBlankState.blanked);
+   assert(blankRecord()==record);
+  }
+  assert(power(f,2) && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
+  // Awake, the others' callbacks still take the donor's path and leave pipe A alone.
+  assert(!power(ext,2) && !power(offline,2) && mmio(B::PlaneCtl)==livePlane);
+  assert(!locked && objectRefs.empty());++scenarios;}
+ // The panel's wake with the display hardware down (a real system sleep left
+ // the bridge suspended) or pipe A no longer on the boot panel releases the
+ // blank without writing a register, and hands over to the donor.
+ for(int variant=0;variant<3;++variant) {
+  Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(power(f,1));const auto dark=mmio(B::PlaneCtl);
+  if(variant==0)display13FBPower.bridge.state.suspended=true;
+  else if(variant==1)display13FBPower.bridge.state.faulted=true;
+  else put(f.path,0x3640,1U);
+  assert(!power(f,2) && mmio(B::PlaneCtl)==dark && !(dark&B::PlaneEnable) && !display13EDPBlankState.blanked);
+  assert(display13EDPBlankState.forgets==1 && display13EDPBlankState.unblanks==0 && powerOf(f)==1);
+  {const auto r=blankRecord();assert(r[4]==unsigned(B::Action::Unblank) && r[9]==1 && r[10]==1);}
+  assert(!locked && objectRefs.empty());++scenarios;
+ }
+ // The hardware window must be the whole 16 MB BAR0.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);map.length=0x800000;
+  assert(!power(f,1) && powerOf(f)==2 && mmio(B::PlaneCtl)==livePlane && !display13EDPBlankState.blanked);++scenarios;}
+ // Ready needs the keep decision hook: without it no link is ever kept.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(XE::display13EDPBlankReady());
+  state.orgDisplay13RegsNeedUpdate=0;assert(!XE::display13EDPBlankReady());
+  state.orgDisplay13RegsNeedUpdate=reinterpret_cast<uintptr_t>(nativeRegs);state.adlnOutputWiring.panel=0;assert(!XE::display13EDPBlankReady());
+  ++scenarios;}
+ printf("PASS Display13 eDP blank: plane/cursor blank and unblank in place of the donor's Doze/Wake, eligibility, never left dark, other framebuffers and powered-down hardware leave pipe A alone (%u scenarios)\n",scenarios);
+}
 // Without -wex-edp-keep the decision is the donor's, unrecorded.
 void offScenario() {
  Fixture f(0,0,0);Map map;edpSetup(f,map);
@@ -173,6 +305,8 @@ void offScenario() {
  uint8_t params[0x100];keepParams(params,keepPanel);const unsigned reads=sink.statusReads;
  assert(XE::wrapDisplay13RegsNeedUpdate(f.ctl,f.fb,f.path,params,nullptr,nullptr) && sink.statusReads==reads);
  assert(!IORegistryEntry::getRegistryRoot()->data.count("WEXEDPKeep") && testSyslog().empty());
+ {Fixture g(0,0,0);Map m;blankPrepare(g,m);uint32_t r=0xFFFFFFFFU;assert(!XE::display13EDPBlankPower(reinterpret_cast<IOService *>(g.fb),1,r) && mmio(B::PlaneCtl)==livePlane);
+  assert(!XE::display13EDPBlankReady());}
  printf("PASS Display13 eDP keep off: the donor's caps and mode-set decision unchanged\n");
 }
 int main(int argc,char **argv){
@@ -181,6 +315,6 @@ int main(int argc,char **argv){
  capsScenarios(keep);
  // A donor build the decision hook does not match keeps nothing: its caps stay native.
  capsScenarios(keep,false);
- if(keep)keepScenarios();else offScenario();
+ if(keep){keepScenarios();blankScenarios();}else offScenario();
  return 0;
 }

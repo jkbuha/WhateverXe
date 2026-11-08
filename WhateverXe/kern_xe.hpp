@@ -539,7 +539,12 @@ private:
  static uint32_t display13PanelBrightness(void *controller,uint32_t brightness);
  static void display13PanelPWMEnable(void *access);
  static uint32_t wrapDisplay13PanelPower(void *controller,uint32_t state);
+ // -wex-edp-blank: display sleep of the kept panel link without the donor's power
+ // transition (kern_display13_edp_blank), run instead of the power callback.
+ static bool display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result);
  static bool display13EDPKeepActive();
+ static bool display13EDPBlankReady();
+ static void display13EDPBlankPublishReady();
  static void resetPanelDepth();
  static void cachePanelDepth(void *port,uint32_t block,const uint8_t *data,uint32_t result);
  void processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);

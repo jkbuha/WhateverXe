@@ -7,6 +7,15 @@ uint32_t XE::wrapDisplay13SetPowerState(IOService *fb,uint32_t state) {
     bool notifyWake=false;
     bool nativePowerOn=false;
     recordDSIClient(fb,9,state,UINT32_MAX);
+    // -wex-edp-blank: display sleep of the kept eDP panel path scans nothing
+    // out instead of running the donor's power transition (link stop, retraining).
+    if(!callbackXE->adlnOutputWiring.dsi) {
+        uint32_t blankResult=kIOReturnSuccess;
+        if(display13EDPBlankPower(fb,state,blankResult)) {
+            recordDSIClient(fb,9,state,blankResult);
+            return blankResult;
+        }
+    }
     // Subscribers can re-enter clients. Serialize this transport's callback,
     // without holding its FB mutex across notifications.
     auto busy=callbackXE->adlnOutputWiring.dsi && fb &&

@@ -151,6 +151,7 @@
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-edp-keep": [],
+  "-wex-edp-blank": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
   "-wex-resume-park": []
