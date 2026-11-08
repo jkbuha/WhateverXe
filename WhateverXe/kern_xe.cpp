@@ -10497,8 +10497,15 @@ static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
     if(lease)wake(owner,true,1);
     uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
     WEXResumeSnapshotIO io {c.map->getVirtualAddress(),lease?gtBase:c.map->getVirtualAddress()};
-    ResumeSnapshot::capture(io,wexBootSnapshotData,0xB007,ns,lease);
+    // H11: keep only live-desktop samples. Sleep entry turns pipe A off first,
+    // so the retained copy is the last state with the panel actually showing.
+    static uint32_t candidate[ResumeSnapshot::Words];
+    ResumeSnapshot::capture(io,candidate,0xB007,ns,lease);
     if(lease)wake(owner,false,1);
+    bool live=false;
+    for(unsigned i=0;i<ResumeSnapshot::DisplayCount;++i)
+        if(ResumeSnapshot::display[i]==0x70008)live=(candidate[ResumeSnapshot::Header+i]&0xC0000000U)==0xC0000000U;
+    if(live)memcpy(wexBootSnapshotData,candidate,sizeof(candidate));
     const auto &d=wexBootSnapshotData;
     auto at=[&](uint32_t reg)->uint32_t {
         for(unsigned i=0;i<ResumeSnapshot::DisplayCount;++i)if(ResumeSnapshot::display[i]==reg)return d[ResumeSnapshot::Header+i];
@@ -10506,7 +10513,7 @@ static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
         return 0;
     };
     const auto ring=at(0x2038);
-    ResumeSnapshot::capturePTEs(io,wexBootSnapshotPTE,at(0x701AC),at(0x70084),ring==UINT32_MAX?0:ring);
+    if(live)ResumeSnapshot::capturePTEs(io,wexBootSnapshotPTE,at(0x701AC),at(0x70084),ring==UINT32_MAX?0:ring);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXBootSnapshot",wexBootSnapshotData,sizeof(wexBootSnapshotData));
     IORegistryEntry::getRegistryRoot()->setProperty("WEXBootGGTT",wexBootSnapshotPTE,sizeof(wexBootSnapshotPTE));
     if(!wexBootSnapshotFrozen && !c.restoreEpoch) {

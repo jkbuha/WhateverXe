@@ -28,6 +28,15 @@ constexpr uint32_t display[] {
     // perf counter, selective-update/manual-tracking state and ALPM.
     0x60800,0x60810,0x60814,0x60818,0x60840,0x60844,0x60848,0x60860,
     0x60900,0x60910,0x60914,0x60918,0x6091C,0x60940,0x60950
+    // H11: display-core state that native startup programs once and Linux
+    // re-initialises on every resume: MBUS ABOX credits, BW buddy control and
+    // page masks, all four DBUF slices, pipe A DBOX credits and arbitration,
+    // DC state, DMC program/HTP/SSP, chicken and clock-gating, and the
+    // remaining primary-plane watermark levels.
+    ,0x45038,0x45048,0x4504C,0x45130,0x45134,0x45150,0x45154,
+    0x44FE8,0x44300,0x44304,0x7003C,0x70028,0x45504,0x80000,0x8F004,0x8F074,
+    0x46430,0x42080,0x46530,
+    0x70244,0x70248,0x7024C,0x70250,0x70254,0x70258,0x7025C,0x70268
 };
 // RCS: tail, head, start, ctl, IPEIR, IPEHR, INSTDONE, ACTHD, ACTHD_UDW,
 // MI_MODE, CCID, execlist status lo/hi, CSB pointers, execlist control;
