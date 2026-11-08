@@ -6177,12 +6177,19 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	} else if(c.quiescing)c.status=Display13FBIRQ::Status::Power;
 	else if(c.state.begun && !c.state.faulted && !(c.state.enabled && c.state.active) &&
 		!Display13Transcoder::running(io,0,c.state.transcoders)) {
-		// Single-output display wake: the native driver enables interrupts before
-		// enablePipe sets PIPECONF. A full enable() then sees no active pipe, fails
-		// Topology and latches the master off, so flips never complete. Keep the
-		// master enabled (or hotplug-only) until the pipe runs again (WEX #22-6).
-		c.status=c.state.enabled && !c.state.active && (io.read(Display13FBIRQ::Master)&Display13FBIRQ::Enable) ?
-			Display13FBIRQ::Status::Complete : Display13FBIRQ::hotplugOnly(io,c.state,false);
+		// Single-output, pipe A not running: display sleep, or wake before enablePipe
+		// sets PIPECONF. A full enable() here sees no active pipe, fails Topology and
+		// faults the bank, so the wake re-arm below never runs and flips never
+		// complete. Arming hotplug-only instead (WEX #22-6) hangs a panel-only laptop
+		// on display sleep: the eDP power-down HPD arrives while the transition
+		// quiesces, is deferred unacknowledged and re-fires forever (CPU 0 stuck in
+		// _interrupt, lock-timeout panics, Precision 5570). An internal panel needs
+		// no hotplug IRQ: park the display master off, not faulted, with no armed
+		// bank. wrapDisplay13FBConfigureVBL re-arms the whole bank once the
+		// transcoder runs.
+		const auto parked=c.state.enabled ? Display13FBIRQ::disable(io,c.state) : Display13FBIRQ::Status::Complete;
+		if(parked==Display13FBIRQ::Status::Complete)c.state.active=0;
+		c.status=parked==Display13FBIRQ::Status::Complete ? Display13FBIRQ::Status::Power : parked;
 	} else c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
 	adlnIRQCache(controller,io);adlnIRQRecord(record,1);
 	check[23]=static_cast<uint32_t>(c.status);check[24]=c.state.begun;
@@ -6251,7 +6258,9 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		}
 		// Native enablePipe enables PIPECONF before this VBL callback. Re-arm
 		// the full pipe bank only at that real activation boundary after idle HPD.
-		if(!Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && c.state.begun && c.state.enabled && !c.state.active && !c.state.faulted &&
+		// Also re-arm a bank parked off (not enabled) by the single-output branch of
+		// wrapDisplay13FBEnableIRQ while the pipe was down.
+		if(!Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && c.state.begun && (!c.state.enabled || !c.state.active) && !c.state.faulted &&
 			Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),pipe) && Display13Transcoder::running(io,pipe,c.state.transcoders)) {
 			const auto excluded=controller==callbackXE->adlnTopologyController ?
 				Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
