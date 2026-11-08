@@ -425,6 +425,7 @@ static bool tglContextCacheEnabled;
 static uintptr_t tglContextCacheInitOriginal;
 static bool tglAlderLakeNGoldenRestore(void *context);
 static void adlnCaptureOwnedGolden(void *context);
+static void tglContextCacheAfterReset(void *context);
 uint32_t tglCPSCounts[17] {}; // attempts, failures, GGTT, pointer, RCS, samples,
                            // bit set/unset, last7304, last21C0, ptr match/mismatch
 static bool tglCPSPrepare(void *owner) {
@@ -501,6 +502,7 @@ bool tglCPSRestore(void *context) {
  const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
  const bool result=FunctionCast(tglCPSRestore,tglCPSRestoreOriginal)(context);
  if(result && caller==tglCPSRestoreCaller)adlnCaptureOwnedGolden(context);
+ if(result && caller!=tglCPSRestoreCaller)tglContextCacheAfterReset(context);
  return result && tglCPSRestorePointer(context,caller) &&
   (caller!=tglCPSRestoreCaller || tglAlderLakeNGoldenRestore(context));
 }
@@ -510,12 +512,31 @@ bool tglCPSSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
-// Schema 1: soft mode, installed, soft declines, closed refusals.
+// Schema 2: soft mode, installed, soft declines, closed refusals, then CCTL
+// reload enabled, self installs, reset reinstalls, reset fallbacks.
 static bool tglContextCacheSerialize(void *,void *,OSSerialize *serializer) {
- uint32_t out[5] {1,TGLContextCache::soft()};
+ uint32_t out[9] {2,TGLContextCache::soft()};
  for(unsigned i=0;i<3;++i)out[i+2]=__atomic_load_n(&TGLContextCache::counts()[i],__ATOMIC_RELAXED);
+ out[5]=TGLContextCache::cctl();
+ for(unsigned i=3;i<6;++i)out[i+3]=__atomic_load_n(&TGLContextCache::counts()[i],__ATOMIC_RELAXED);
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static void tglContextCacheFlush(void *image) {
+ auto p=static_cast<uint8_t *>(image);
+ asm volatile("clflush (%0)"::"r"(p+TGLContextCache::SelfOffset):"memory");
+ asm volatile("clflush (%0)"::"r"(p+0x1054):"memory");
+ asm volatile("mfence":::"memory");
+}
+// The image GGTT address must equal the native ELSP descriptor's LRCA
+// (initWithOptions: getGPUVirtualAddress(context+0x98) into context+0x89).
+static bool tglContextCacheSelf(void *context,void *buffer,void *cpu,uint64_t size,uint64_t gpu) {
+ if(!cpu || !tglCPSGPUAddress)return false;
+ const auto image=reinterpret_cast<uint64_t (*)(void *)>(tglCPSGPUAddress)(buffer);
+ uint32_t descriptor;memcpy(&descriptor,static_cast<uint8_t *>(context)+0x89,4);
+ if(!image || (image&4095) || (descriptor&0xFFFFF000U)!=image)return false;
+ if(!TGLContextCache::installSelf(cpu,size,image,gpu))return false;
+ tglContextCacheFlush(cpu);return true;
 }
 // Constructor return is before scheduler submission. This covers fresh RCS
 // images and safe-image clones; beginReset later restores the qualified image.
@@ -530,10 +551,36 @@ static bool tglContextCacheInit(void *context,void *task,const void *params,uint
  auto cpu=reinterpret_cast<void *(*)(void *)>(tglCPSCPUAddress)(buffer);
  const auto size=*reinterpret_cast<uint64_t *>(buffer+0x20);
  const auto gpu=__atomic_load_n(&tglCPSCounts[2],__ATOMIC_RELAXED);
- if(!TGLContextCache::install(cpu,size,gpu))return TGLContextCache::decline(ok);
+ if(TGLContextCache::cctl() && tglContextCacheSelf(context,buffer,cpu,size,gpu)) {
+  __atomic_fetch_add(&TGLContextCache::counts()[0],1U,__ATOMIC_RELAXED);
+  __atomic_fetch_add(&TGLContextCache::counts()[3],1U,__ATOMIC_RELAXED);return true;
+ }
+ if(!TGLContextCache::install(cpu,size,gpu)) {
+  if(TGLContextCache::dropSelf(cpu,size,gpu))tglContextCacheFlush(cpu);
+  return TGLContextCache::decline(ok);
+ }
  __atomic_fetch_add(&TGLContextCache::counts()[0],1U,__ATOMIC_RELAXED);
- asm volatile("clflush (%0)"::"r"(static_cast<uint8_t *>(cpu)+0x1054):"memory");
- asm volatile("mfence":::"memory");return true;
+ tglContextCacheFlush(cpu);return true;
+}
+// restoreFromSafeImage (beginReset) copies the engine safe image over the whole
+// context, including PPHWSP and INDIRECT_CTX. Re-establish this context's own
+// batch, or never leave a pointer into another context's image.
+static void tglContextCacheAfterReset(void *context) {
+ if(!tglContextCacheEnabled || !TGLContextCache::cctl())return;
+ auto c=static_cast<uint8_t *>(context);if(!c || c[0x6C]!=0)return;
+ auto owner=*reinterpret_cast<uint8_t **>(c+0x50);
+ auto buffer=*reinterpret_cast<uint8_t **>(c+0x98);
+ if(!owner || !buffer || !*reinterpret_cast<void **>(owner+0x13F8))return;
+ auto cpu=reinterpret_cast<void *(*)(void *)>(tglCPSCPUAddress)(buffer);
+ const auto size=*reinterpret_cast<uint64_t *>(buffer+0x20);
+ const auto gpu=__atomic_load_n(&tglCPSCounts[2],__ATOMIC_RELAXED);
+ if(!cpu)return;
+ if(tglContextCacheSelf(context,buffer,cpu,size,gpu)) {
+  __atomic_fetch_add(&TGLContextCache::counts()[4],1U,__ATOMIC_RELAXED);return;
+ }
+ if(TGLContextCache::dropSelf(cpu,size,gpu)) {
+  __atomic_fetch_add(&TGLContextCache::counts()[5],1U,__ATOMIC_RELAXED);tglContextCacheFlush(cpu);
+ }
 }
 // r150: qualify the conditional state-cache/command-cache invalidate contract.
 // Read-only sparse samples during the existing RCS forcewake. These are resident
@@ -11988,6 +12035,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				(XELP::kernelOS(version)==XELP::OS::Tahoe) && checkKernelArgument("-wex-adln-ctx-invalidate");
 			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlnContextCacheRequested;
 			TGLContextCache::soft()=adlnContextCacheRequested;
+			// Linux gen12_emit_cmd_buf_wa: also reload CMD_BUF_CCTL per context.
+			TGLContextCache::cctl()=adlnContextCacheRequested && checkKernelArgument("-wex-adln-cctl-reload");
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);
 			// Preserve native submission; use its one-shot force-restore flag only
 			// for a witnessed equal-tail resubmission of the active first item.

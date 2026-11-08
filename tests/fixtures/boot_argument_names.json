@@ -149,5 +149,6 @@
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
+  "-wex-adln-cctl-reload": [],
   "-wex-adln-ctx-invalidate": []
 }

@@ -20,4 +20,8 @@ assert s.index('const bool adlnContextCacheRequested') < s.index('bool contextCa
 init=s[s.index('static bool tglContextCacheInit(void'):s.index('// r150:')]
 assert init.count('return TGLContextCache::decline(ok);')==2 and 'return false;' not in init
 assert 'tglContextCacheSerialize' not in init
+assert 'TGLContextCache::cctl()=adlnContextCacheRequested && checkKernelArgument("-wex-adln-cctl-reload");' in s
+# Reset path: every non-constructor restoreFromSafeImage re-establishes the self batch.
+assert 'if(result && caller!=tglCPSRestoreCaller)tglContextCacheAfterReset(context);' in s
+assert '(descriptor&0xFFFFF000U)!=image' in s
 print('PASS: ADL-N Wa_18022495364 opt-in requires host scheduler, Tahoe and boot argument; TGL trials unchanged; soft declines')
