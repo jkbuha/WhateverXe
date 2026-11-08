@@ -4790,7 +4790,7 @@ struct Display13FBIRQContext {
 	IOSimpleLock *lock {};
 	IOService *controller {};
 	Display13FBIRQ::State state;
-	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {};uint32_t blockedPipes {};
+	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {},faultPublished {};uint32_t blockedPipes {};
 	uintptr_t softwareThread {};
 	Display13FBIRQ::HandlerScopes scopes;
 	volatile uint32_t admittedPipes {}; // Release-published after actual path/backing proof.
@@ -4956,7 +4956,8 @@ static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 	r[10]=s.interrupts;
 	for(unsigned p=0;p<3;++p) {r[11+p]=s.vblanks[p];r[14+p]=s.flips[p];r[17+p]=s.underruns[p];r[20+p]=s.dsbErrors[p];r[23+p]=s.raw[p];}
 	r[26]=s.lastPCH;r[27]=s.lastDDI;r[28]=reinterpret_cast<uintptr_t>(c.controller);
-	r[29]=reinterpret_cast<uintptr_t>(c.lock);r[30]=c.handlers;r[31]=c.quiescing|(c.blockedPipes<<8)|(uint64_t(c.softwareHandlers)<<32);
+	r[29]=reinterpret_cast<uintptr_t>(c.lock);r[30]=c.handlers;
+	r[31]=c.quiescing|(c.blockedPipes<<8)|(uint64_t(c.softwareHandlers&0xFFFF)<<32)|(uint64_t(s.storms&0xFFFF)<<48);
 }
 
 
@@ -5200,6 +5201,9 @@ static bool adlnBeginClockGuard(Display13FBClockGuard &g) {
 	if(irq.quiescing || g.master==UINT32_MAX) {IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);failure(2);return false;}
 	g.held=true;g.enabled=irq.state.enabled;irq.quiescing=true;irq.blockedPipes=7;
 	io.write(Display13FBIRQ::Master,0);irq.state.enabled=false;
+	// Refresh the native cached DE master (c+D84) too: ProcessInterrupt restores the master
+	// from it, which would re-arm DE inside this scope and spin on a deferred display bit.
+	{Display13FBIRQIO irqIO {irq.base};adlnIRQCache(irq.controller,irqIO);}
 	IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
 	bool quiet=false;
 	for(unsigned ms=0;ms<=20;++ms) {
@@ -6169,6 +6173,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	const bool valid=display13FBAssociations(controller,0x1C20,fb,fb->getMetaClass()->getClassSize(),display13FBExpectedOwner(controller)) &&
 		path->getMetaClass()->getClassSize()>=0x3730;
 	const auto pipe=valid ? Display13FBMemory::field<uint32_t>(path,0x3640) : 3;
+	c.state.sinceVBlank=0; // native VBL control activity: not an interrupt storm
 	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && (c.quiescing || (pipe<3 && (c.blockedPipes&(1U<<pipe))))) {
 		c.status=Display13FBIRQ::Status::Power;adlnIRQCache(controller,io);
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
@@ -6193,7 +6198,15 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	}
 	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
 	adlnIRQCache(controller,io);
+	// Publish the first fault seen here (e.g. the interrupt storm breaker) once, so it can be
+	// read without waiting for the next native Enable/DisableIRQ. Registry writes need the
+	// simple lock released, so only when this call took it.
+	uint64_t record[32] {};
+	const bool publish=getLock && c.state.faulted && !c.faultPublished;
+	if(publish) {c.faultPublished=true;adlnIRQRecord(record,3);}
+	else if(!c.state.faulted)c.faultPublished=false;
 	if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	if(publish)controller->setProperty("N97FBIRQFault",record,sizeof(record));
 }
 bool XE::wrapDisplay13FBProcessIRQ(IOService *controller) {
 	if(!adlnIRQOwner(controller))return false;
@@ -6243,13 +6256,22 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	// Native ProcessInterrupt already holds c+90. Permission belongs to its
 	// entry scope, even if a power/clock caller restored state.enabled since.
 	// Keep all hardware pending untouched for a subsequent permitted handler.
-	if(!c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread())))return;
-	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
-	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
-	if(c.state.faulted) {
+	const auto dropCache=[controller] {
 		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xD84)=0;
 		*(reinterpret_cast<uint8_t *>(controller)+0xFD4)=0;
+	};
+	if(!c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread()))) {
+		// The native ProcessInterrupt re-arms the DE master from c+D84 after this call and
+		// loops while the GT master still shows a display bit: with nothing serviced it never
+		// returns (CPU 0 livelock in interrupt context, spinlock-timeout panics after display
+		// wake, Precision 5570). A disabled bank stays off in hardware and in the cache; its
+		// pending statuses remain for the permitted handler once the scope ends.
+		if(!c.state.enabled) {dropCache();if(io.readable(Display13FBIRQ::Master))io.write(Display13FBIRQ::Master,0);}
+		return;
 	}
+	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
+	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
+	if(c.state.faulted || !c.state.enabled)dropCache();
 }
 
 bool XE::processDisplay13FramebufferGTT(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -8944,6 +8966,7 @@ bool XE::adlnFreeStoppedPipe(IOService *fb) {
                 // stays disabled through native free; native SW queue/FD4 and
                 // GT callbacks remain intact for another pipe's old events.
                 io.write(Display13FBIRQ::Master,0);irq.state.enabled=false;irq.quiescing=true;irq.blockedPipes|=1U<<pipe;held=true;
+                adlnIRQCache(controller,io); // native cached master must not re-arm DE in the scope
                 const auto parked=Display13FBIRQ::parkStoppedPipe(io,irq.state,pipe,irq.handlers,irq.softwareHandlers,queued);
                 record[9]=static_cast<uint32_t>(parked);ready=parked==Display13FBIRQ::Status::Complete;
             }
@@ -10976,7 +10999,8 @@ bool XE::adlnPowerReference(void *power,uint32_t operation,uint32_t domain) {
 					Display13FBIRQ::beginPowerRelease(irqIO,irq.state,releaseScope,released,affected,
 						irq.scopes.display,competingSoftware,queued,aux,hpd) : Display13FBIRQ::Status::Unavailable;
 				irqRelease[9]=static_cast<uint32_t>(status);releaseAllowed=status==Display13FBIRQ::Status::Complete;
-				if(releaseScope.held) {irq.quiescing=true;irq.blockedPipes=affected;}
+				if(releaseScope.held) {irq.quiescing=true;irq.blockedPipes=affected;
+					adlnIRQCache(static_cast<IOService *>(c.controller),irqIO);} // master parked: drop native cache
 			} else {
 				releaseAllowed=!irq.quiescing && Display13FBIRQ::quiescentPipes(irqIO,irq.state,released,irq.handlers,affected);
 				if(releaseAllowed) {irq.quiescing=true;irq.blockedPipes=affected;}
