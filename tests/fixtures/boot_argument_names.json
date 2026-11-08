@@ -151,6 +151,7 @@
   "-wex-dsi-power-test": [],
   "-wex-adln-cctl-reload": [],
   "-wex-adln-ctx-invalidate": [],
+  "-wex-resume-flush": [],
   "-wex-resume-park": [],
   "-wex-resume-snapshot": []
 }

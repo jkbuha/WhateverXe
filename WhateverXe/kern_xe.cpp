@@ -10447,7 +10447,41 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
     uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
     WEXResumeSnapshotIO io {c.map->getVirtualAddress(),lease?gtBase:c.map->getVirtualAddress()};
     ResumeSnapshot::capture(io,wexResumeSnapshotData[index],index,ns,lease);
+    // H13 (opt-in -wex-resume-flush): at the first snapshot invalidate the GGTT
+    // TLBs (GFX_FLSH_CNTL, as after any GGTT update); at the second, write back
+    // CPU cache lines for every page behind the live scanout surface. The panel
+    // response time identifies which step a stale resume path was missing.
+    static uint64_t flushRecord[6] {1};
+    const bool flushTrial=checkKernelArgument("-wex-resume-flush");
+    if(flushTrial && !index && lease) {
+        *reinterpret_cast<volatile uint32_t *>(gtBase+0x101008)=1;
+        (void)*reinterpret_cast<volatile uint32_t *>(gtBase+0x101008);
+        flushRecord[1]=1;absolutetime_to_nanoseconds(mach_absolute_time(),&flushRecord[2]);
+    }
     if(lease)wake(owner,false,1);
+    if(flushTrial && index==1) {
+        const auto display=c.map->getVirtualAddress();
+        const uint32_t surface=*reinterpret_cast<volatile uint32_t *>(display+0x701AC)&~4095U;
+        uint64_t flushed=0;
+        for(uint32_t page=0;surface && page<2560;++page) {
+            const uint64_t gpu=uint64_t(surface)+uint64_t(page)*4096;
+            if(gpu+4096>0x100000000ULL)break;
+            const uint64_t pte=*reinterpret_cast<volatile uint64_t *>(display+0x800000+(gpu>>9));
+            const uint64_t physical=pte&0x7FFFFFF000ULL;
+            if(!(pte&1) || !physical)continue;
+            auto md=IOMemoryDescriptor::withPhysicalAddress(physical,4096,kIODirectionInOut);
+            if(!md)continue;
+            if(auto m=md->createMappingInTask(kernel_task,0,kIOMapAnywhere)) {
+                const auto va=m->getVirtualAddress();
+                for(unsigned line=0;line<4096;line+=64)asm volatile("clflush (%0)"::"r"(va+line):"memory");
+                ++flushed;m->release();
+            }
+            md->release();
+        }
+        asm volatile("mfence":::"memory");
+        flushRecord[3]=flushed;flushRecord[4]=surface;absolutetime_to_nanoseconds(mach_absolute_time(),&flushRecord[5]);
+    }
+    if(flushTrial)IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeFlush",flushRecord,sizeof(flushRecord));
     {
         // Follow the live scanout, cursor and RCS ring addresses into the GGTT.
         const auto &d=wexResumeSnapshotData[index];
