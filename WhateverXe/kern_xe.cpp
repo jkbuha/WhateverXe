@@ -24,6 +24,8 @@
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
 #include "kern_display13_resume_park.hpp"
+#include "kern_resume_snapshot.hpp"
+#include <kern/thread_call.h>
 #include "kern_display13_boot.hpp"
 #include "kern_display13_dsi_trial.hpp"
 #include "kern_dsi_readout.hpp"
@@ -10396,6 +10398,49 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	adlnPublishPowerRecord("N97FBPowerOverride",record);
 }
 
+// H5 diagnostic (opt-in -wex-resume-snapshot): two read-only register
+// snapshots, 10 s and 30 s after a lost-power shared display resume. Display
+// registers through the display owner's BAR mapping; RCS/BCS registers only
+// under a finite native render force-wake lease. No writes.
+static thread_call_t wexResumeSnapshotCall;
+static uint32_t wexResumeSnapshotIndex,wexResumeSnapshotEpoch;
+static uint32_t wexResumeSnapshotData[2][ResumeSnapshot::Words];
+struct WEXResumeSnapshotIO {
+    uintptr_t display,gt;
+    uint32_t read(uint32_t r) const {
+        const bool gtReg=r<0x40000 || (r>=0xA000 && r<0xE000);
+        return *reinterpret_cast<volatile uint32_t *>((gtReg?gt:display)+r);
+    }
+};
+static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
+    auto &c=display13FBPower;const auto index=wexResumeSnapshotIndex;
+    if(index>=2 || !c.map || !c.map->getVirtualAddress() || c.map->getLength()!=0x1000000)return;
+    void *owner=tglHost.owner;
+    auto wake=reinterpret_cast<void (*)(void *,bool,unsigned)>(adlnKernelContextWake);
+    const auto gtBase=owner?reinterpret_cast<uintptr_t>(Display13FBMemory::field<volatile uint8_t *>(owner,0x1240)):0;
+    const bool lease=wake && owner && gtBase;
+    // Stage marker first: a blocked lease remains visible from user space.
+    uint32_t stage[3] {1,index,1};
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshotStage",stage,sizeof(stage));
+    if(lease)wake(owner,true,1);
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    WEXResumeSnapshotIO io {c.map->getVirtualAddress(),lease?gtBase:c.map->getVirtualAddress()};
+    ResumeSnapshot::capture(io,wexResumeSnapshotData[index],index,ns,lease);
+    if(lease)wake(owner,false,1);
+    stage[2]=2;IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshotStage",stage,sizeof(stage));
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshot",wexResumeSnapshotData,sizeof(wexResumeSnapshotData));
+    wexResumeSnapshotIndex=index+1;
+    if(!index) {uint64_t deadline;clock_interval_to_deadline(20,kSecondScale,&deadline);thread_call_enter_delayed(wexResumeSnapshotCall,deadline);}
+}
+static void wexResumeSnapshotArm(uint32_t epoch) {
+    if(epoch==wexResumeSnapshotEpoch || !checkKernelArgument("-wex-resume-snapshot"))return;
+    if(!wexResumeSnapshotCall)wexResumeSnapshotCall=thread_call_allocate(wexResumeSnapshotFire,nullptr);
+    if(!wexResumeSnapshotCall)return;
+    wexResumeSnapshotEpoch=epoch;wexResumeSnapshotIndex=0;bzero(wexResumeSnapshotData,sizeof(wexResumeSnapshotData));
+    uint64_t deadline;clock_interval_to_deadline(10,kSecondScale,&deadline);
+    thread_call_enter_delayed(wexResumeSnapshotCall,deadline);
+}
+
 // Called with the display owner lock. No framebuffer or connector owns this
 // transition. Native global wake and a transport that bypasses native wake
 // both enter here; a second caller must not reset an already running peer.
@@ -10489,6 +10534,7 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
     // hardware failures are already latched by the resource that owns them.
     cold[8]=c.engineEnabled;cold[9]=c.clockStopped;cold[10]=c.dbuf.restorePending;cold[11]=c.bridge.state.faulted;
     display13FBPowerRecord(record,9,waking,result);
+    if(cold[0])wexResumeSnapshotArm(static_cast<uint32_t>(c.restoreEpoch));
     adlnPublishPowerRecord("N97FBPowerRestore",record);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SharedResume",cold,sizeof(cold));
     return ready;
