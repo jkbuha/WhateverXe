@@ -83,7 +83,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Add `SSDT-PNLF` for internal-display brightness control.
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P/U select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
-- If an Alder Lake-H/P/U / Raptor Lake-H/P/U internal panel goes dark when macOS takes over the boot screen, add `-wex-edp-keep` and set OpenCore `UEFI > Output > Resolution` to `Max`. WEX then keeps the panel link the firmware trained instead of training it again; a scaled resolution keeps that link and changes only the pipe scaler. Display off/on is not supported in this mode, so disable display sleep.
+- If an Alder Lake-H/P/U / Raptor Lake-H/P/U internal panel goes dark when macOS takes over the boot screen, add `-wex-edp-keep` and set OpenCore `UEFI > Output > Resolution` to `Max`. WEX then keeps the panel link the firmware trained instead of training it again; a scaled resolution keeps that link and changes only the pipe scaler. For display sleep also add `-wex-edp-blank`: the panel stays powered and its link keeps running, and only scanning out stops, so the screen shows black (an OLED emits no light). Without it, disable display sleep. With it, system sleep blanks the panel the same way.
 
 ## Tested features and known issues
 
@@ -97,7 +97,7 @@ The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 encode/
 | Alder Lake-N / Twin Lake laptops | MicroPC 2 and MiniBook X N100 on Big Sur/Tahoe: MIPI DSI, brightness, rotation, display off/on and HDMI/USB-C coexistence. MicroPC 2: HiDPI and up to three displays; MiniBook X N100: optional 60 Hz |
 | Raptor Lake-U laptop | MiniBook X U300 on Big Sur/Tahoe: internal MIPI DSI, brightness, rotation, HiDPI and up to two USB-C displays. Internal panel: 50 Hz; optional 60 Hz also tested on Big Sur |
 | Alder Lake-H | Big Sur–Tahoe: 96 EU, three displays using HDMI and a DP-to-HDMI adapter. Single-channel `4626` graphics acceleration checked on Big Sur |
-| Alder Lake-H laptops | Tahoe: 48 EU, internal 1920x1200 OLED eDP with `-wex-edp-keep`, including scaled resolutions. Display off/on and OLED brightness are unsupported |
+| Alder Lake-H laptops | Tahoe: 48 EU, internal 1920x1200 OLED eDP with `-wex-edp-keep`, including scaled resolutions. Display sleep as a black screen with `-wex-edp-blank`; OLED brightness is unsupported |
 | Alder Lake-S | Big Sur–Tahoe: UHD 770, HDMI/DP/USB-C and up to three displays; Safari video, with Widevine checked on Big Sur/Tahoe |
 
 MIPI DSI support is **experimental**, limited to the tested GPD MicroPC 2 and CHUWI MiniBook X N100/U300 panels. Do not expect it to work on other devices.
@@ -110,7 +110,7 @@ System sleep/wake support is **experimental**. Tested configurations are MiniBoo
 - Some image-conversion operations can crash applications.
 - Safari video may occasionally drop frames. FairPlay-protected playback is unsupported.
 - Up to three displays are supported. Resolutions beyond the tested configurations remain unverified.
-- With `-wex-edp-keep`, display sleep or a mode with a different refresh rate or color depth trains the panel link again and can leave the internal panel dark. System sleep is untested.
+- With `-wex-edp-keep`, display sleep without `-wex-edp-blank`, or a mode with a different refresh rate or color depth, trains the panel link again and can leave the internal panel dark. System sleep that powers the display hardware off is untested with `-wex-edp-blank`.
 - Some connector layouts and backlight methods, MST and Thunderbolt-managed outputs are unsupported.
 
 ### Roadmap
@@ -136,6 +136,6 @@ See [LICENSE.txt](LICENSE.txt). Lilu and MacKernelSDK are separate dependencies.
 
 Thanks to [JulioNectar/XPS13Plus](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe) for sharing its Xe graphics work. Its compiler adapter and LLVM bridge informed the OS-native AIR conversion used in WhateverXe Graphics.
 
-Internal-panel work also draws on [WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP), [X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe), XPS13Plus and the [Linux i915 display sources](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display) for hardware behavior and implementation comparisons. Keeping the firmware's panel link follows [NootedGreen](https://github.com/sgiammori/NootedGreen)'s firmware-link mode and Linux i915 fastboot.
+Internal-panel work also draws on [WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP), [X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe), XPS13Plus and the [Linux i915 display sources](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display) for hardware behavior and implementation comparisons. Keeping the firmware's panel link follows [NootedGreen](https://github.com/sgiammori/NootedGreen)'s firmware-link mode and Linux i915 fastboot; `-wex-edp-blank` follows the display-sleep fix of [vikenzo196](https://github.com/vikenzo196/WhateverXe) (issue #53).
 
 The optional MiniBook X 60 Hz panel timing also draws on the [minibookx-ctl display guide](https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/display.md).

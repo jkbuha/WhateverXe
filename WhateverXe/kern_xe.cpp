@@ -58,6 +58,7 @@
 #include "kern_adls_boot.hpp"
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_display13_edp_keep.hpp"
+#include "kern_display13_edp_blank.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
@@ -7552,7 +7553,7 @@ struct Display13EDPKeepRecord {
 };
 static volatile uint32_t display13EDPKeepCalls=0,display13EDPKeepKept=0;
 // The panel path whose latest mode-set decision kept the firmware's link; 0 once
-// a complete mode set was requested.
+// a complete mode set was requested. Read by -wex-edp-blank.
 static volatile uintptr_t display13EDPKeepPath=0;
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
@@ -13910,6 +13911,93 @@ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
  if(!ok)c.panelFaulted=true;
  IOLockUnlock(c.lock);IOLockUnlock(c.panelLock);
  return ok?result:uint32_t(kIOReturnNotReady);
+}
+
+// -wex-edp-blank (Display13EDPBlank), on top of -wex-edp-keep: the power callback
+// of the boot panel path whose latest mode-set decision kept the link does not
+// run the donor's Doze/Wake transition (it stops the link, runs a complete mode
+// set and leaves an OLED eDP 1.4 panel dark). It only clears/restores the
+// primary plane and cursor enables of pipe A and records the new power state
+// (+0x4284), as the DSI power path does. Any other framebuffer, or a path
+// whose link was not kept, takes the donor's own transition and never touches
+// pipe A; the blanked panel's own next Wake always brings it back (without a
+// register write when pipe A no longer scans it out or the display hardware is
+// down). Off (0), which the donor enters through prepareToEnterSleep and leaves
+// through prepareToExitSleep, is blanked the same way, so both are skipped too;
+// untested across a sleep that powers the display hardware off.
+// WEXEDPBlank (uint32_t[11], the panel's framebuffer only): version 2,
+// requested state, previous state, eligible, action (0 donor, 1 blank,
+// 2 unblank, 3 nothing to do), blanks, unblanks, plane and cursor control seen
+// when blanking, forgets (blank released without a register write), flags
+// (bit0 the framebuffer owns the blank, bit1 pipe A scans out the boot panel).
+// WEXEDPBlankReady: the flag, the keep decision hook and a native eDP panel.
+static bool display13EDPBlankRequested() {
+ static int v=-1;if(v<0)v=display13EDPKeep() && checkKernelArgument("-wex-edp-blank") ? 1 : 0;
+ return v==1;
+}
+static Display13EDPBlank::State display13EDPBlankState;
+bool XE::display13EDPBlankReady() {
+ auto s=callbackXE;auto &c=display13FBPower;
+ return display13EDPBlankRequested() && s && c.lock && c.map && s->orgDisplay13RegsNeedUpdate &&
+  s->adlnOutputWiring.panel && !s->adlnOutputWiring.dsi;
+}
+void XE::display13EDPBlankPublishReady() {
+ static bool published=false;
+ if(published || !display13EDPBlankRequested())return;
+ published=true;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankReady",display13EDPBlankReady());
+}
+bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
+ namespace B=Display13EDPBlank;
+ display13EDPBlankPublishReady();
+ auto s=callbackXE;auto &c=display13FBPower;auto &b=display13EDPBlankState;
+ if(!display13EDPBlankRequested() || !s || !c.lock || !c.map || !fb || s->adlnOutputWiring.dsi)return false;
+ B::Action action=B::Action::Native;bool eligible=false,owner=false,panel=false,scanout=false,forgot=false;
+ uint32_t current=UINT32_MAX;
+ if(s->ownedDisplay13Framebuffer(fb)) {
+  IOLockLock(c.lock);
+  owner=b.blanked && b.fb==reinterpret_cast<uintptr_t>(fb);
+  const auto base=c.map->getVirtualAddress();
+  auto path=Display13FBMemory::singlePath<OSObject *>(fb);
+  if(base && c.map->getLength()==0x1000000 && path && path->getMetaClass()->getClassSize()>=0x3730) {
+   current=Display13FBMemory::field<uint32_t>(fb,0x4284);
+   // Pipe A still scans out the adopted boot panel and the display hardware
+   // is up; eligible: attached, and its latest mode-set decision kept the
+   // firmware's link.
+   panel=c.bridge.bootPath==reinterpret_cast<uintptr_t>(path);
+   scanout=panel && c.bootPanel && c.bridge.bootAdopted && !c.bridge.state.faulted && !c.bridge.state.suspended &&
+    Display13FBMemory::field<void *>(path,0x3648) && !Display13FBMemory::field<uint32_t>(path,0x3640);
+   eligible=scanout && Display13FBMemory::field<uint32_t>(path,0x3644)==2 &&
+    display13EDPKeepPath==reinterpret_cast<uintptr_t>(path);
+  }
+  action=B::decide(eligible,owner,current,state,b.blanked);
+  struct IO {
+   uintptr_t base;
+   uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
+   void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
+  } io {base};
+  if(action==B::Action::Blank) {B::blank(io,b);b.fb=reinterpret_cast<uintptr_t>(fb);}
+  else if(action==B::Action::Unblank) {
+   if(scanout)B::unblank(io,b);
+   else {B::forget(b);forgot=true;}
+  }
+  if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
+  IOLockUnlock(c.lock);
+ }
+ // Only the panel's own framebuffer is recorded: the others' callbacks would
+ // overwrite it at every wake.
+ if(panel || owner) {
+  const uint32_t record[11]={2,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor,b.forgets,
+   (owner ? 1U : 0U)|(scanout ? 2U : 0U)};
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
+  SYSLOG("igfx","eDP blank: power state %u -> %u (%s)",current,state,
+   action==B::Action::Blank ? "blanked" : action==B::Action::Unblank ? (forgot ? "released, panel not scanned out" : "unblanked") :
+   action==B::Action::Keep ? "unchanged" : "donor");
+ }
+ // Not ours (or no longer ours after an unblank): the donor's own transition.
+ if(!eligible || action==B::Action::Native)return false;
+ result=kIOReturnSuccess;
+ return true;
 }
 
 // Shared exact-donor panel corrections; physical adapters own admission.
