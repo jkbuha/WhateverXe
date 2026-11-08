@@ -10158,6 +10158,7 @@ void XE::display13WMArmUpdate(IOService *fb) {
 	snprintf(property,sizeof(property),"N97FBPipe%uWMLatch",pipe);root->setProperty(property,record,sizeof(record));
 }
 
+static void wexBootSnapshotArm();
 bool XE::enableDisplay13EngineLocked(void *power) {
 	auto &c=display13FBPower;
 	if(!c.lock || power!=c.power || !c.controller)return false;
@@ -10197,6 +10198,7 @@ bool XE::enableDisplay13EngineLocked(void *power) {
 		if(status==Display13DBUF::Status::Complete)status=Display13DBUF::tracker(io,c.dbuf);
 	}
 	c.engineEnabled=status==Display13DBUF::Status::Complete;
+	if(c.engineEnabled && !c.restoreEpoch)wexBootSnapshotArm();
     // This method already holds a sleepable owner lock. Qualify immutable BAR
     // binding here, then publish only the native VA for the nonblocking writer.
     const auto writerBase=c.engineEnabled && adlnWriterMappingBound() ? Display13FBMemory::field<uintptr_t>(c.access,0x50) : 0;
@@ -10466,6 +10468,42 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
     }
     wexResumeSnapshotIndex=index+1;
     if(!index) {uint64_t deadline;clock_interval_to_deadline(20,kSecondScale,&deadline);thread_call_enter_delayed(wexResumeSnapshotCall,deadline);}
+}
+// H8 baseline: one identical snapshot on a normal boot, 60 s after the
+// display engine first starts, for a register-by-register comparison.
+static thread_call_t wexBootSnapshotCall;
+static bool wexBootSnapshotArmed;
+static uint32_t wexBootSnapshotData[ResumeSnapshot::Words],wexBootSnapshotPTE[ResumeSnapshot::PTEWords];
+static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
+    auto &c=display13FBPower;
+    if(!c.map || !c.map->getVirtualAddress() || c.map->getLength()!=0x1000000)return;
+    void *owner=tglHost.owner;
+    auto wake=reinterpret_cast<void (*)(void *,bool,unsigned)>(adlnKernelContextWake);
+    const auto gtBase=owner?reinterpret_cast<uintptr_t>(Display13FBMemory::field<volatile uint8_t *>(owner,0x1240)):0;
+    const bool lease=wake && owner && gtBase;
+    if(lease)wake(owner,true,1);
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    WEXResumeSnapshotIO io {c.map->getVirtualAddress(),lease?gtBase:c.map->getVirtualAddress()};
+    ResumeSnapshot::capture(io,wexBootSnapshotData,0xB007,ns,lease);
+    if(lease)wake(owner,false,1);
+    const auto &d=wexBootSnapshotData;
+    auto at=[&](uint32_t reg)->uint32_t {
+        for(unsigned i=0;i<ResumeSnapshot::DisplayCount;++i)if(ResumeSnapshot::display[i]==reg)return d[ResumeSnapshot::Header+i];
+        for(unsigned i=0;i<ResumeSnapshot::GTCount;++i)if(ResumeSnapshot::gt[i]==reg)return d[ResumeSnapshot::Header+ResumeSnapshot::DisplayCount+i];
+        return 0;
+    };
+    const auto ring=at(0x2038);
+    ResumeSnapshot::capturePTEs(io,wexBootSnapshotPTE,at(0x701AC),at(0x70084),ring==UINT32_MAX?0:ring);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXBootSnapshot",wexBootSnapshotData,sizeof(wexBootSnapshotData));
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXBootGGTT",wexBootSnapshotPTE,sizeof(wexBootSnapshotPTE));
+}
+static void wexBootSnapshotArm() {
+    if(wexBootSnapshotArmed || !checkKernelArgument("-wex-resume-snapshot"))return;
+    wexBootSnapshotArmed=true;
+    wexBootSnapshotCall=thread_call_allocate(wexBootSnapshotFire,nullptr);
+    if(!wexBootSnapshotCall)return;
+    uint64_t deadline;clock_interval_to_deadline(60,kSecondScale,&deadline);
+    thread_call_enter_delayed(wexBootSnapshotCall,deadline);
 }
 static void wexResumeSnapshotArm(uint32_t epoch) {
     if(epoch==wexResumeSnapshotEpoch || !checkKernelArgument("-wex-resume-snapshot"))return;
