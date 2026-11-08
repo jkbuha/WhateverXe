@@ -14571,6 +14571,20 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 		that->removeProperty("IOGVAScaler");
 		SYSLOG("igfx", "TGL accelerator scaler key removed (-wex-no-gva-scaler)");
 	}
+	if (result && checkKernelArgument("-wex-no-gva")) {
+		// Opt-in diagnostic: unpublish every IOGVA* key so VideoToolbox decodes and
+		// converts on the CPU; IOVARendererID and the Metal device are unaffected.
+		if (auto props = that->dictionaryWithProperties()) {
+			if (auto keys = OSCollectionIterator::withCollection(props)) {
+				unsigned removed = 0;
+				while (auto key = OSDynamicCast(OSSymbol, keys->getNextObject()))
+					if (!strncmp(key->getCStringNoCopy(), "IOGVA", 5)) {that->removeProperty(key);removed++;}
+				SYSLOG("igfx", "TGL accelerator removed %u IOGVA keys (-wex-no-gva)", removed);
+				keys->release();
+			}
+			props->release();
+		}
+	}
 	tglObserveAccelerator(that, 2, true, result, reinterpret_cast<uintptr_t>(provider));
 	tglRecordStartOrder(6,that,9,0,0,result);
 	SYSLOG("igfx", "TGL accelerator start returned %d", result);
