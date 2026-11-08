@@ -23,4 +23,15 @@ int main() {
     for(auto d:display){assert(!(d&3));for(auto g:gt)assert(d!=g);}
     for(auto g:gt)assert(!(g&3) && g<0x40000);
     for(auto d:display)assert(d>=0x40000);
+    // GGTT rows: entry address = 8 MiB + (gpu >> 9), two dwords per entry.
+    uint32_t p[PTEWords];IO c;capturePTEs(c,p,0x46E00123,0x04040000,0x402E4000);
+    assert(p[0]==1 && p[1]==0x46E00123 && p[4]==0x46E00000 && p[5]==((0x800000+(0x46E00000U>>9))^0x5A5A0000U));
+    assert(p[6]==((0x800000+(0x46E00000U>>9)+4)^0x5A5A0000U));
+    assert(p[4+3*6]==0x04040000 && p[4+3*7]==0x402E4000 && p[4+3*2]==0x46E00000+0x100000);
+    for(unsigned i=0;i<PTECount;++i){const auto e=0x800000+(p[4+3*i]>>9);assert(c.seen.count(e) && c.seen.count(e+4));}
+    assert(c.seen.size()==2*PTECount);
+    // Unprogrammed addresses are not followed; nothing outside the GGTT is read.
+    IO z;capturePTEs(z,p,0,0,0);assert(z.seen.empty());
+    for(unsigned i=0;i<PTECount;++i)assert(p[5+3*i]==UINT32_MAX && p[6+3*i]==UINT32_MAX);
+    IO hi;capturePTEs(hi,p,0xFFFFF000U,0,0);for(auto r:hi.seen)assert(r>=0x800000 && r<0x1000000);
 }

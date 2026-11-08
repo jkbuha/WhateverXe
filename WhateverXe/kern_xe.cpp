@@ -10418,6 +10418,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 static thread_call_t wexResumeSnapshotCall;
 static uint32_t wexResumeSnapshotIndex,wexResumeSnapshotEpoch;
 static uint32_t wexResumeSnapshotData[2][ResumeSnapshot::Words];
+static uint32_t wexResumeSnapshotPTE[2][ResumeSnapshot::PTEWords];
 struct WEXResumeSnapshotIO {
     uintptr_t display,gt;
     uint32_t read(uint32_t r) const {
@@ -10440,6 +10441,18 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
     WEXResumeSnapshotIO io {c.map->getVirtualAddress(),lease?gtBase:c.map->getVirtualAddress()};
     ResumeSnapshot::capture(io,wexResumeSnapshotData[index],index,ns,lease);
     if(lease)wake(owner,false,1);
+    {
+        // Follow the live scanout, cursor and RCS ring addresses into the GGTT.
+        const auto &d=wexResumeSnapshotData[index];
+        auto at=[&](uint32_t reg)->uint32_t {
+            for(unsigned i=0;i<ResumeSnapshot::DisplayCount;++i)if(ResumeSnapshot::display[i]==reg)return d[ResumeSnapshot::Header+i];
+            for(unsigned i=0;i<ResumeSnapshot::GTCount;++i)if(ResumeSnapshot::gt[i]==reg)return d[ResumeSnapshot::Header+ResumeSnapshot::DisplayCount+i];
+            return 0;
+        };
+        const auto ring=at(0x2038);
+        ResumeSnapshot::capturePTEs(io,wexResumeSnapshotPTE[index],at(0x701AC),at(0x70084),ring==UINT32_MAX?0:ring);
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeGGTT",wexResumeSnapshotPTE,sizeof(wexResumeSnapshotPTE));
+    }
     stage[2]=2;IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshotStage",stage,sizeof(stage));
     IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshot",wexResumeSnapshotData,sizeof(wexResumeSnapshotData));
     {
@@ -10458,7 +10471,7 @@ static void wexResumeSnapshotArm(uint32_t epoch) {
     if(epoch==wexResumeSnapshotEpoch || !checkKernelArgument("-wex-resume-snapshot"))return;
     if(!wexResumeSnapshotCall)wexResumeSnapshotCall=thread_call_allocate(wexResumeSnapshotFire,nullptr);
     if(!wexResumeSnapshotCall)return;
-    wexResumeSnapshotEpoch=epoch;wexResumeSnapshotIndex=0;bzero(wexResumeSnapshotData,sizeof(wexResumeSnapshotData));
+    wexResumeSnapshotEpoch=epoch;wexResumeSnapshotIndex=0;bzero(wexResumeSnapshotData,sizeof(wexResumeSnapshotData));bzero(wexResumeSnapshotPTE,sizeof(wexResumeSnapshotPTE));
     uint64_t deadline;clock_interval_to_deadline(10,kSecondScale,&deadline);
     thread_call_enter_delayed(wexResumeSnapshotCall,deadline);
 }

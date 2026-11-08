@@ -34,5 +34,26 @@ template<class IO> void capture(IO &io,uint32_t (&out)[Words],uint32_t index,uin
     for(unsigned i=0;i<DisplayCount;++i)out[Header+i]=io.read(display[i]);
     for(unsigned i=0;i<GTCount;++i)out[Header+DisplayCount+i]=gtLease?io.read(gt[i]):UINT32_MAX;
 }
+// GGTT entries behind the captured scanout/cursor/ring addresses. The GGTT
+// starts 8 MiB into the 16 MiB BAR, one 64-bit entry per 4 KiB page. Several
+// pages across the primary surface distinguish a restored mapping from one
+// left pointing at a common scratch page after a hibernation cold boot.
+constexpr uint32_t SurfaceOffsets[] {0,0x1000,0x100000,0x400000,0x800000,0x8C0000};
+constexpr unsigned PTECount=sizeof(SurfaceOffsets)/sizeof(SurfaceOffsets[0])+2;
+constexpr unsigned PTEWords=4+PTECount*3;
+// out: [schema, surface, cursor, ring] then (gpu, pte_lo, pte_hi) rows.
+template<class IO> void capturePTEs(IO &io,uint32_t (&out)[PTEWords],uint32_t surface,uint32_t cursor,uint32_t ring) {
+    out[0]=1;out[1]=surface;out[2]=cursor;out[3]=ring;
+    uint32_t gpu[PTECount];unsigned n=0;
+    // An unprogrammed register (0) is not followed.
+    for(auto o:SurfaceOffsets)gpu[n++]=surface?(surface&~4095U)+o:0;
+    gpu[n++]=cursor&~4095U;gpu[n++]=ring&~4095U;
+    for(unsigned i=0;i<PTECount;++i) {
+        auto row=out+4+3*i;row[0]=gpu[i];
+        const uint64_t entry=0x800000+(uint64_t(gpu[i])>>9);
+        if(!gpu[i] || entry+8>0x1000000) {row[1]=row[2]=UINT32_MAX;continue;}
+        row[1]=io.read(static_cast<uint32_t>(entry));row[2]=io.read(static_cast<uint32_t>(entry+4));
+    }
+}
 }
 #endif
