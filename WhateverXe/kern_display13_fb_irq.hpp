@@ -37,6 +37,13 @@ struct HandlerScopes {
 };
 constexpr uint32_t Driver=0x45404, Master=0x44200, GfxMaster=0x190010;
 constexpr uint32_t Enable=1U<<31, PipeOwned=0x8060E00D, PCHOwned=3U<<16;
+// ADL hard/soft and FIFO underrun. Reported once per arming, like i915: a pipe that keeps
+// underrunning re-fires per line and livelocks CPU 0 in the MSI filter.
+constexpr uint32_t PipeUnderruns=0x80600000U;
+// Display interrupts collected back to back without a vblank before the master is cut. A
+// storm fires thousands per frame; normal traffic between vblanks is a few events, and the
+// control path resets the count whenever the native driver configures VBL.
+constexpr uint32_t StormLimit=2000;
 constexpr uint32_t PCHTypeC=0x3F000000, PCHCombo=7U<<16;
 constexpr uint32_t TCControl=0xC4034;
 constexpr uint32_t DDIControl=0xC4030, DDIStatus=0x33, DDIEnable=0x88;
@@ -55,6 +62,7 @@ struct State {
     uint32_t active {},configured {},priorIER[3] {},priorIMR[3] {},priorPCHIER {},priorPCHIMR {};
     uint32_t priorTCEnable {},priorDDIEnable {},priorDSB[3][3] {},lastMaster {},raw[3] {},lastPCH {},lastDDI {},lastTC {},foreign {};
     uint64_t interrupts {},vblanks[3] {},flips[3] {},underruns[3] {},dsbErrors[3] {};
+    uint32_t sinceVBlank {},storms {};
 };
 struct Events {uint32_t pipe {},aux {},hotplug {};Status status {Status::Unavailable};};
 struct ActivePipes {Status status {Status::Unavailable};uint32_t active {},allowed {};};
@@ -544,10 +552,13 @@ template<class IO> Status vblank(IO &io,State &s,unsigned pipe,bool enabled) {
 // registry serialization, PCI config access, or unpowered pipe reads here.
 template<class IO> Events collect(IO &io,State &s) {
     Events e;
-    if(!s.begun || !s.enabled || s.faulted)return e;
+    if(!s.begun)return e;
+    // A disabled or faulted bank must not leave the DE master armed: the native handler would
+    // re-read the display bit forever. Keep pending statuses for the next permitted handler.
+    if(!s.enabled || s.faulted) {if(io.readable(Master))io.write(Master,0);return e;}
     const auto master=io.read(Master),wells=io.read(Driver);s.lastMaster=master;
     if(master==UINT32_MAX) {e.status=fail(io,s,Status::Readback);return e;}
-    io.write(Master,0);++s.interrupts;
+    io.write(Master,0);++s.interrupts;bool sawVBlank=false;
     for(unsigned p=0;p<3;++p)if(master&(1U<<(16+p))) {
         if(!powered(wells,p)) {e.status=fail(io,s,Status::Power);return e;}
         if(!(s.active&(1U<<p))) {e.status=fail(io,s,Status::Topology);return e;}
@@ -557,7 +568,14 @@ template<class IO> Events collect(IO &io,State &s) {
         const auto raw=pending&PipeOwned,owned=status&PipeOwned;
         if(owned)io.write(PipeIIR(p),owned);
         e.pipe|=nativePipe(raw,p);
-        if(raw&1)++s.vblanks[p];if(raw&8)++s.flips[p];if(raw&0x80600000)++s.underruns[p];
+        if(raw&1)++s.vblanks[p];if(raw&8)++s.flips[p];if(raw&PipeUnderruns)++s.underruns[p];
+        if(raw&1)sawVBlank=true;
+        if(raw&PipeUnderruns) {
+            // Mask further underrun reports on this pipe until enable() or
+            // extendActivePipes() re-arms the bank at the next modeset/wake.
+            io.write(PipeIIR(p)-4,io.read(PipeIIR(p)-4)|PipeUnderruns);
+            io.write(PipeIIR(p)+4,io.read(PipeIIR(p)+4)&~PipeUnderruns);
+        }
         for(unsigned dsb=0;dsb<3;++dsb)if(raw&(1U<<(13+dsb))) {
             const auto reg=DSBInterrupt(p,dsb),value=io.read(reg),errors=value&0xE;
             if(value==UINT32_MAX) {e.status=fail(io,s,Status::Readback);return e;}
@@ -596,6 +614,11 @@ template<class IO> Events collect(IO &io,State &s) {
     }
     const uint32_t supported=(7U<<16)|(1U<<23)|(s.typeC?(1U<<21):0U)|Enable;
     if(master&~supported) {s.foreign|=master&~supported;e.status=fail(io,s,Status::ForeignIRQ);return e;}
+    if(sawVBlank)s.sinceVBlank=0;
+    else if(++s.sinceVBlank>=StormLimit) {
+        // Leave the master off: a frozen picture is recoverable, a CPU 0 livelock is a panic.
+        ++s.storms;e.status=fail(io,s,Status::Faulted,Master,master);return e;
+    }
     io.write(Master,Enable);e.status=Status::Complete;return e;
 }
 }
