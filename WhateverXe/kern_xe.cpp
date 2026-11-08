@@ -10417,6 +10417,10 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 // snapshots, 10 s and 30 s after a lost-power shared display resume. Display
 // registers through the display owner's BAR mapping; RCS/BCS registers only
 // under a finite native render force-wake lease. No writes.
+static thread_call_t wexBootSnapshotCall;
+static volatile bool wexBootSnapshotFrozen; // set at the first lost-power resume
+static uint32_t wexBootSnapshotData[ResumeSnapshot::Words],wexBootSnapshotPTE[ResumeSnapshot::PTEWords];
+static void wexSamplePage(uint64_t pte,uint32_t *out);
 static thread_call_t wexResumeSnapshotCall;
 static uint32_t wexResumeSnapshotIndex,wexResumeSnapshotEpoch;
 static uint32_t wexResumeSnapshotData[2][ResumeSnapshot::Words];
@@ -10454,6 +10458,15 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
         const auto ring=at(0x2038);
         ResumeSnapshot::capturePTEs(io,wexResumeSnapshotPTE[index],at(0x701AC),at(0x70084),ring==UINT32_MAX?0:ring);
         IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeGGTT",wexResumeSnapshotPTE,sizeof(wexResumeSnapshotPTE));
+        // H9: page content behind the six surface entries, now and pre-sleep.
+        static uint32_t content[2][1+12*6];
+        auto &o=content[index];o[0]=1;
+        for(unsigned i=0;i<6;++i) {
+            const auto *r=wexResumeSnapshotPTE[index]+4+3*i,*b=wexBootSnapshotPTE+4+3*i;
+            wexSamplePage((uint64_t(r[2])<<32)|r[1],o+1+6*i);
+            wexSamplePage((uint64_t(b[2])<<32)|b[1],o+1+36+6*i);
+        }
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeContent",content,sizeof(content));
     }
     stage[2]=2;IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshotStage",stage,sizeof(stage));
     IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeSnapshot",wexResumeSnapshotData,sizeof(wexResumeSnapshotData));
@@ -10471,11 +10484,11 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
 }
 // H8 baseline: one identical snapshot on a normal boot, 60 s after the
 // display engine first starts, for a register-by-register comparison.
-static thread_call_t wexBootSnapshotCall;
 static bool wexBootSnapshotArmed;
-static uint32_t wexBootSnapshotData[ResumeSnapshot::Words],wexBootSnapshotPTE[ResumeSnapshot::PTEWords];
 static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
     auto &c=display13FBPower;
+    // H9: rolling pre-sleep baseline. A resume freezes the last pre-sleep copy.
+    if(wexBootSnapshotFrozen || c.restoreEpoch)return;
     if(!c.map || !c.map->getVirtualAddress() || c.map->getLength()!=0x1000000)return;
     void *owner=tglHost.owner;
     auto wake=reinterpret_cast<void (*)(void *,bool,unsigned)>(adlnKernelContextWake);
@@ -10496,6 +10509,27 @@ static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
     ResumeSnapshot::capturePTEs(io,wexBootSnapshotPTE,at(0x701AC),at(0x70084),ring==UINT32_MAX?0:ring);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXBootSnapshot",wexBootSnapshotData,sizeof(wexBootSnapshotData));
     IORegistryEntry::getRegistryRoot()->setProperty("WEXBootGGTT",wexBootSnapshotPTE,sizeof(wexBootSnapshotPTE));
+    if(!wexBootSnapshotFrozen && !c.restoreEpoch) {
+        uint64_t deadline;clock_interval_to_deadline(30,kSecondScale,&deadline);
+        thread_call_enter_delayed(wexBootSnapshotCall,deadline);
+    }
+}
+// Read-only content sample of one physical RAM page behind a GGTT entry:
+// nonzero dword count and XOR over the first 1 KiB, plus the first dwords.
+static void wexSamplePage(uint64_t pte,uint32_t *out) {
+    out[0]=static_cast<uint32_t>(pte);out[1]=static_cast<uint32_t>(pte>>32);out[2]=out[3]=out[4]=out[5]=UINT32_MAX;
+    const uint64_t physical=pte&0x7FFFFFF000ULL;
+    if(!(pte&1) || pte==~0ULL || !physical)return;
+    auto md=IOMemoryDescriptor::withPhysicalAddress(physical,4096,kIODirectionIn);
+    if(!md)return;
+    if(auto map=md->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapReadOnly)) {
+        auto p=reinterpret_cast<volatile const uint32_t *>(map->getVirtualAddress());
+        uint32_t nonzero=0,x=0;
+        for(unsigned i=0;i<256;++i){const auto v=p[i];nonzero+=v!=0;x^=v*(i+1);}
+        out[2]=nonzero;out[3]=x;out[4]=p[0];out[5]=p[1];
+        map->release();
+    }
+    md->release();
 }
 static void wexBootSnapshotArm() {
     if(wexBootSnapshotArmed || !checkKernelArgument("-wex-resume-snapshot"))return;
@@ -10507,6 +10541,7 @@ static void wexBootSnapshotArm() {
 }
 static void wexResumeSnapshotArm(uint32_t epoch) {
     if(epoch==wexResumeSnapshotEpoch || !checkKernelArgument("-wex-resume-snapshot"))return;
+    wexBootSnapshotFrozen=true;if(wexBootSnapshotCall)thread_call_cancel(wexBootSnapshotCall);
     if(!wexResumeSnapshotCall)wexResumeSnapshotCall=thread_call_allocate(wexResumeSnapshotFire,nullptr);
     if(!wexResumeSnapshotCall)return;
     wexResumeSnapshotEpoch=epoch;wexResumeSnapshotIndex=0;bzero(wexResumeSnapshotData,sizeof(wexResumeSnapshotData));bzero(wexResumeSnapshotPTE,sizeof(wexResumeSnapshotPTE));
