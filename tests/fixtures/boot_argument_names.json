@@ -143,6 +143,7 @@
     "-wxebeta"
   ],
   "-wex-noaccel": [],
+  "-wex-no-gva-scaler": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
   "-wex-adlp-load-only": [],

@@ -14564,6 +14564,13 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
   } else tglHost.owner=nullptr;
  }
  tglHost.startingOwner=nullptr;
+	if (result && checkKernelArgument("-wex-no-gva-scaler")) {
+		// Opt-in: the donor VA driver faults (null+8) in VideoToolbox pixel transfer
+		// (AVFPixelProcess_PrepareToTransferImages). Without the scaler key VideoToolbox
+		// scales on Metal or the CPU; HEVC decode and encode keys stay published.
+		that->removeProperty("IOGVAScaler");
+		SYSLOG("igfx", "TGL accelerator scaler key removed (-wex-no-gva-scaler)");
+	}
 	tglObserveAccelerator(that, 2, true, result, reinterpret_cast<uintptr_t>(provider));
 	tglRecordStartOrder(6,that,9,0,0,result);
 	SYSLOG("igfx", "TGL accelerator start returned %d", result);
