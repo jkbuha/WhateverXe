@@ -10420,6 +10420,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 static thread_call_t wexBootSnapshotCall;
 static volatile bool wexBootSnapshotFrozen; // set at the first lost-power resume
 static uint32_t wexBootSnapshotData[ResumeSnapshot::Words],wexBootSnapshotPTE[ResumeSnapshot::PTEWords];
+static uint32_t wexBootBlocks[ResumeSnapshot::BlockWords],wexResumeBlocks[ResumeSnapshot::BlockWords];
 static void wexSamplePage(uint64_t pte,uint32_t *out);
 static void wexFlushSurface(uintptr_t bar,uint32_t surface,uint32_t *out);
 static thread_call_t wexResumeSnapshotCall;
@@ -10447,6 +10448,10 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
     uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
     WEXResumeSnapshotIO io {c.map->getVirtualAddress(),lease?gtBase:c.map->getVirtualAddress()};
     ResumeSnapshot::capture(io,wexResumeSnapshotData[index],index,ns,lease);
+    if(!index) {
+        ResumeSnapshot::captureBlocks(io,wexResumeBlocks,lease);
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeBlocks",wexResumeBlocks,sizeof(wexResumeBlocks));
+    }
     // H13 (opt-in -wex-resume-flush): at the first snapshot invalidate the GGTT
     // TLBs (GFX_FLSH_CNTL, as after any GGTT update); at the second, write back
     // CPU cache lines for every page behind the live scanout surface. The panel
@@ -10561,11 +10566,16 @@ static void wexBootSnapshotFire(thread_call_param_t,thread_call_param_t) {
     // so the retained copy is the last state with the panel actually showing.
     static uint32_t candidate[ResumeSnapshot::Words];
     ResumeSnapshot::capture(io,candidate,0xB007,ns,lease);
+    static uint32_t candidateBlocks[ResumeSnapshot::BlockWords];
+    ResumeSnapshot::captureBlocks(io,candidateBlocks,lease);
     if(lease)wake(owner,false,1);
     bool live=false;
     for(unsigned i=0;i<ResumeSnapshot::DisplayCount;++i)
         if(ResumeSnapshot::display[i]==0x70008)live=(candidate[ResumeSnapshot::Header+i]&0xC0000000U)==0xC0000000U;
-    if(live)memcpy(wexBootSnapshotData,candidate,sizeof(candidate));
+    if(live) {
+        memcpy(wexBootSnapshotData,candidate,sizeof(candidate));memcpy(wexBootBlocks,candidateBlocks,sizeof(candidateBlocks));
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXBootBlocks",wexBootBlocks,sizeof(wexBootBlocks));
+    }
     const auto &d=wexBootSnapshotData;
     auto at=[&](uint32_t reg)->uint32_t {
         for(unsigned i=0;i<ResumeSnapshot::DisplayCount;++i)if(ResumeSnapshot::display[i]==reg)return d[ResumeSnapshot::Header+i];

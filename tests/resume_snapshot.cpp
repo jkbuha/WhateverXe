@@ -34,4 +34,10 @@ int main() {
     IO z;capturePTEs(z,p,0,0,0);assert(z.seen.empty());
     for(unsigned i=0;i<PTECount;++i)assert(p[5+3*i]==UINT32_MAX && p[6+3*i]==UINT32_MAX);
     IO hi;capturePTEs(hi,p,0xFFFFF000U,0,0);for(auto r:hi.seen)assert(r>=0x800000 && r<0x1000000);
+    // Block dumps: no gamma palette reads; GT blocks only under the lease.
+    static uint32_t blk[BlockWords];IO d;captureBlocks(d,blk,false);
+    for(auto r:d.seen){assert(r<0x4A000 || r>=0x4B000);assert(r>=0x40000 && r<0x100000);}
+    unsigned n=0;for(auto &b:blocks)for(uint32_t o=0;o<b.bytes;o+=4,++n)if(b.gt)assert(blk[n]==UINT32_MAX);else assert(blk[n]==((b.start+o)^0x5A5A0000U));
+    IO e;captureBlocks(e,blk,true);assert(e.seen.size()==BlockWords);
+    for(auto &b:blocks)assert(!(b.start&3) && !(b.bytes&3) && b.bytes);
 }

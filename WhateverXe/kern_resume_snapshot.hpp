@@ -84,5 +84,22 @@ template<class IO> void capturePTEs(IO &io,uint32_t (&out)[PTEWords],uint32_t su
         row[1]=io.read(static_cast<uint32_t>(entry));row[2]=io.read(static_cast<uint32_t>(entry+4));
     }
 }
+// H15: whole-block dumps for a word-by-word diff between the live pre-sleep
+// baseline and the resume. Display blocks are on PW1/pipe A (powered whenever
+// pipe A scans out); GT blocks are read only under the render lease. The
+// gamma palette index/data block (0x4A000) is excluded: data reads advance it.
+struct Block {uint32_t start,bytes;bool gt;};
+constexpr Block blocks[] {
+    {0x42000,0x1000,false},{0x44000,0x1000,false},{0x45000,0x1000,false},{0x46000,0x1000,false},
+    {0x60000,0x1000,false},{0x64000,0x400,false},{0x68000,0x1000,false},{0x70000,0x1000,false},
+    {0x4000,0x1000,true},{0x7000,0x400,true},{0x9400,0x200,true},{0xB000,0x200,true},
+    {0xE000,0x600,true},{0x101000,0x100,true}
+};
+constexpr unsigned blockWords() {unsigned n=0;for(auto &b:blocks)n+=b.bytes/4;return n;}
+constexpr unsigned BlockWords=blockWords();
+template<class IO> void captureBlocks(IO &io,uint32_t (&out)[BlockWords],bool gtLease) {
+    unsigned n=0;
+    for(auto &b:blocks)for(uint32_t o=0;o<b.bytes;o+=4)out[n++]=(b.gt && !gtLease)?UINT32_MAX:io.read(b.start+o);
+}
 }
 #endif
