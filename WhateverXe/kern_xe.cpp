@@ -14755,6 +14755,18 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	tglObserveAccelerator(that, 2, false, 0, reinterpret_cast<uintptr_t>(provider));
 	SYSLOG("igfx", "TGL accelerator start entered");
 	bool result = FunctionCast(wrapTGLAcceleratorStart, callbackXE->orgTGLAcceleratorStart)(that, provider);
+	// Apple's TGL VA VideoProcessing kernels are Gen11 ISA: on Xe they hang the
+	// RCS, and mechanically reassembled ports run but write nothing. AppleGVA's
+	// encoder and CoreMedia's decoder utilities only use the hardware scaler when
+	// the accelerator publishes IOGVAScaler; without it they scale in software or
+	// Metal. Opt-in: withdraw the scaler capability; codec capabilities remain.
+	if (result && checkKernelArgument("-wex-no-gva-scaler")) {
+		auto old = OSDynamicCast(OSString, that->getProperty("IOGVAScaler"));
+		char before[16] {};if (old) strlcpy(before, old->getCStringNoCopy(), sizeof(before));
+		that->removeProperty("IOGVAScaler");
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXGVAScalerRemoved", old ? before : "absent");
+		SYSLOG("igfx", "IOGVAScaler withdrawn (was %s)", old ? before : "absent");
+	}
 	if (result) IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSAtStart",
 		*reinterpret_cast<uint8_t *>(reinterpret_cast<uint8_t *>(that)+0x1474),32);
 	if (tglHost.owner==that) {
