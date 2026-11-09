@@ -14760,12 +14760,18 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	// encoder and CoreMedia's decoder utilities only use the hardware scaler when
 	// the accelerator publishes IOGVAScaler; without it they scale in software or
 	// Metal. Opt-in: withdraw the scaler capability; codec capabilities remain.
+	// The encoder's hardware BGRA->YUV conversion (IOGVABGRAEnc) runs on the same
+	// VideoProcessing kernels: withdraw both video-processing capabilities.
 	if (result && checkKernelArgument("-wex-no-gva-scaler")) {
-		auto old = OSDynamicCast(OSString, that->getProperty("IOGVAScaler"));
-		char before[16] {};if (old) strlcpy(before, old->getCStringNoCopy(), sizeof(before));
-		that->removeProperty("IOGVAScaler");
-		IORegistryEntry::getRegistryRoot()->setProperty("WEXGVAScalerRemoved", old ? before : "absent");
-		SYSLOG("igfx", "IOGVAScaler withdrawn (was %s)", old ? before : "absent");
+		static const char *keys[] {"IOGVAScaler","IOGVABGRAEnc"};
+		for (auto key : keys) {
+			auto old = OSDynamicCast(OSString, that->getProperty(key));
+			char before[16] {};if (old) strlcpy(before, old->getCStringNoCopy(), sizeof(before));
+			that->removeProperty(key);
+			char record[48];snprintf(record, sizeof(record), "WEXGVA%sRemoved", key+5);
+			IORegistryEntry::getRegistryRoot()->setProperty(record, old ? before : "absent");
+			SYSLOG("igfx", "%s withdrawn (was %s)", key, old ? before : "absent");
+		}
 	}
 	if (result) IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSAtStart",
 		*reinterpret_cast<uint8_t *>(reinterpret_cast<uint8_t *>(that)+0x1474),32);
