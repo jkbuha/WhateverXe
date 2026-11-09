@@ -152,6 +152,7 @@
   "-wex-adln-cctl-reload": [],
   "-wex-adln-ctx-invalidate": [],
   "-wex-resume-flush": [],
+  "-wex-resume-lineartest": [],
   "-wex-resume-park": [],
   "-wex-resume-snapshot": []
 }

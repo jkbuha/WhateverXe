@@ -10482,6 +10482,26 @@ static void wexResumeSnapshotFire(thread_call_param_t,thread_call_param_t) {
         flushRecord[3]=flushed;flushRecord[4]=surface;absolutetime_to_nanoseconds(mach_absolute_time(),&flushRecord[5]);
     }
     if(flushTrial)IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeFlush",flushRecord,sizeof(flushRecord));
+    // H14 (opt-in -wex-resume-lineartest): visible tiled-vs-linear fetch test.
+    // For 5 s scan the same live surface as linear (stride kept in bytes),
+    // then restore the native PLANE_CTL/STRIDE and latch with PLANE_SURF.
+    // Scrambled colour = the plane fetches the pixels (tiled path broken);
+    // black = the plane does not read that memory at all.
+    if(!index && checkKernelArgument("-wex-resume-lineartest")) {
+        const auto display=c.map->getVirtualAddress();
+        auto reg=[&](uint32_t r)->volatile uint32_t &{return *reinterpret_cast<volatile uint32_t *>(display+r);};
+        uint32_t lin[8] {1,reg(0x70180),reg(0x70188),reg(0x7019C),0,0,0,0};
+        const uint32_t tiling=(lin[1]>>10)&7;
+        if((lin[1]&0x80000000U) && tiling==4 && lin[3] && lin[2] && lin[2]<0x400) {
+            reg(0x70188)=lin[2]*2;reg(0x70180)=lin[1]&~(7U<<10);reg(0x7019C)=lin[3];
+            lin[4]=reg(0x70180);lin[5]=reg(0x70188);
+            IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeLinearTest",lin,sizeof(lin));
+            IOSleep(5000);
+            reg(0x70188)=lin[2];reg(0x70180)=lin[1];reg(0x7019C)=lin[3];
+            lin[6]=reg(0x70180);lin[7]=reg(0x70188);
+        } else lin[0]=2; // not a qualified enabled Y-tiled scanout; no writes
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeLinearTest",lin,sizeof(lin));
+    }
     {
         // Follow the live scanout, cursor and RCS ring addresses into the GGTT.
         const auto &d=wexResumeSnapshotData[index];
