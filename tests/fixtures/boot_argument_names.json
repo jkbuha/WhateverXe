@@ -148,5 +148,9 @@
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
-  "-wex-dsi-power-test": []
+  "-wex-dsi-power-test": [],
+  "-wex-tc1-legacy": [],
+  "-wex-tc2-legacy": [],
+  "-wex-tc3-legacy": [],
+  "-wex-tc4-legacy": []
 }
