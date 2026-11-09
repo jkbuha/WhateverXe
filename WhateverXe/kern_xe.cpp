@@ -3939,6 +3939,17 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
         board=XELP::VBT::selectHDMI(true,wiring?wiring->getBytesNoCopy():nullptr,
             wiring?wiring->getLength():0,firmwarePorts,3);
     }
+    // Some boards ship a VBT that flags a fixed TC output (an on-board DP-to-HDMI
+    // converter, RPL-P mini PC TC3) as Type-C + Thunderbolt. display13Fixed then puts it on the
+    // DP-alt route and the port never lights. -wex-tc1-legacy .. -wex-tc4-legacy keep
+    // the named ports in the DP set but take them off the Type-C route, as a legacy TC port.
+    uint32_t tcLegacy=(checkKernelArgument("-wex-tc1-legacy")?0x08U:0)|(checkKernelArgument("-wex-tc2-legacy")?0x10U:0)|
+        (checkKernelArgument("-wex-tc3-legacy")?0x20U:0)|(checkKernelArgument("-wex-tc4-legacy")?0x40U:0);
+    tcLegacy&=board.typeC&0x78;
+    if(tcLegacy) {
+        board.typeC&=~tcLegacy;
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCLegacyOverride",true);
+    }
     if(checkKernelArgument("-wex-dsi-adopt")) {
         // The old HDMI experiment tears down the firmware DSI link. Never
         // combine that handoff with adoption, or replace an existing A route.
