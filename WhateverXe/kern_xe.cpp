@@ -24,6 +24,7 @@
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
 #include "kern_display13_resume_park.hpp"
+#include "kern_display13_dmc.hpp"
 #include "kern_display13_boot.hpp"
 #include "kern_display13_dsi_trial.hpp"
 #include "kern_dsi_readout.hpp"
@@ -4722,6 +4723,29 @@ struct Display13FBPowerContext {
     uint64_t powerContext[24] {1}; // Bounded CPU-only execution-context evidence.
 };
 static Display13FBPowerContext display13FBPower;
+// Opt-in (-wex-dmc) main DMC firmware, guarded by display13FBPower.lock.
+// Loaded once the shared engine (PW1, CDCLK, DBUF) is up, as Linux does after
+// display core init; handlers are disabled before the engine is stopped.
+struct Display13DMCState {bool loaded {};uint32_t loads {},disables {},failures {};Display13DMC::Result last {};};
+static Display13DMCState display13DMC;
+// Program RAM, the main DMC register block, DC_STATE_DEBUG/EN and CHICKEN_DCPR_2 only.
+struct Display13FBDMCIO {
+    IOMemoryMap *map;
+    bool ready() const {return map && map->getLength()==0x1000000 && map->getVirtualAddress();}
+    uint32_t read(uint32_t reg) const {return *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+reg);}
+    bool write(uint32_t reg,uint32_t value) {
+        if((reg&3) || !((reg>=Display13DMC::Start && reg<=Display13DMC::RamEnd) ||
+           (reg>=Display13DMC::RegsStart && reg<=Display13DMC::RegsEnd) || reg==Display13DMC::DCStateDebug || reg==Display13DMC::ChickenDCPR2 || reg==Display13DMC::DCStateEnable))return false;
+        *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+reg)=value;return true;
+    }
+};
+static void publishDisplay13DMC(Display13FBDMCIO &io,uint32_t event) {
+    const auto &d=display13DMC;const auto &r=d.last;
+    uint32_t record[20] {1,event,static_cast<uint32_t>(r.status),r.stage,r.writes,r.mismatchIndex,r.expected,r.observed,
+        r.dcStateEnable,r.debugBefore,r.debugAfter,r.stackBase,r.handler0,r.control0,d.loads,d.disables,d.failures,
+        Display13DMCFirmware::PackageVersion,io.ready() ? io.read(0x46434) : UINT32_MAX,io.ready() ? io.read(0x45504) : UINT32_MAX};
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DMC",record,sizeof(record));
+}
 #include "kern_dsi_adapter_state.inc"
 
 // AlderLakeN start bypasses the generic TGL framebuffer path and its power sampler.
@@ -10172,6 +10196,17 @@ bool XE::enableDisplay13EngineLocked(void *power) {
 	auto root=IORegistryEntry::getRegistryRoot();root->setProperty("N97FBEngine",record,sizeof(record));
 	if(!record[26] && !root->getProperty("N97FBEngineFirstEmptyResume"))
 		root->setProperty("N97FBEngineFirstEmptyResume",record,sizeof(record));
+	if(c.engineEnabled && checkKernelArgument("-wex-dmc")) {
+		Display13FBDMCIO io {c.map};
+		if(io.ready() && (io.read(Display13Power::Driver)&3)==3) {
+			auto &dmc=display13DMC;
+			dmc.last=Display13DMC::load([&](uint32_t r){return io.read(r);},[&](uint32_t r,uint32_t v){return io.write(r,v);},!dmc.loaded,checkKernelArgument("-wex-dmc-dc6"));
+			dmc.loaded=dmc.last.status==Display13DMC::Status::Complete || dmc.last.status==Display13DMC::Status::AlreadyLoaded;
+			if(dmc.last.status==Display13DMC::Status::Complete)++dmc.loads;
+			else if(!dmc.loaded)++dmc.failures;
+			publishDisplay13DMC(io,1);
+		}
+	}
 	return c.engineEnabled;
 }
 
@@ -10189,6 +10224,16 @@ void XE::stopDisplay13Engine(void *power,bool systemSuspend) {
 	uint64_t record[12] {},hotplug[16] {},irqRelease[12] {};Display13Power::Result released;Display13Clock::Change clock;
 	IOWorkLoop *acquiredGate=nullptr;bool gateAttempted=false,gateReady=false;uint64_t gateEvidence[8] {};
 	Display13DBUF::Status status=Display13DBUF::Status::Unavailable;IOLockLock(c.lock);
+    if(display13DMC.loaded) {
+        // Linux display core uninit: no DMC handler runs while the engine goes down.
+        Display13FBDMCIO io {c.map};
+        if(io.ready() && (io.read(Display13Power::Driver)&1)) {
+            Display13DMC::clearDCStates([&](uint32_t r){return io.read(r);},[&](uint32_t r,uint32_t v){return io.write(r,v);});
+            Display13DMC::disableHandlers([&](uint32_t r,uint32_t v){return io.write(r,v);});
+            ++display13DMC.disables;
+        }
+        display13DMC.loaded=false;publishDisplay13DMC(io,2);
+    }
     const bool dual=Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring);
     auto ensureGate=[&]() {
         if(!dual)return true;
