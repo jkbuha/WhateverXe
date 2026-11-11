@@ -9381,6 +9381,15 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
                 else {
                     gateBusy=true;
                     recordDisplay13GateBusy(loop,callbackXE->display13DPImage);
+                    // The first eDP mode set (IOGraphics -> setDisplayMode ->
+                    // LightUpEDP -> enableClocks) can arrive while the work loop
+                    // owns the gate for the whole retry window, so retrying never
+                    // wins (#78). With no pipe scanning out, continue without the
+                    // gate: only the cold change below can run (it needs
+                    // active==0, re-measured after the relock), and its clock
+                    // guard stops display interrupts and checks every transcoder
+                    // is off before writing. [27] |= 0x200 marks this path.
+                    if(!active) {ready=true;evidence[27]|=0x200;}
                 }
             }
         }
