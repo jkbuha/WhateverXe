@@ -1,3 +1,6 @@
+// Sleep-mode park stub: production stops pipe A with Display13ResumePark.
+static unsigned sleepStops;
+static bool display13EDPBlankSleepStop(uint32_t,uint32_t){++sleepStops;display13EDPBlankSleepPark[0]=1;return true;}
 // -wex-edp-keep through the production wrappers: the donor's receiver-caps
 // reads (wrapDisplay13ReadAUX) and its mode-set decision
 // (wrapDisplay13RegsNeedUpdate) over the panel path the IdeaPad Slim 5
@@ -211,12 +214,13 @@ void blankScenarios() {
   assert(display13EDPBlankState.fb==reinterpret_cast<uintptr_t>(f.fb));
   // Doze -> Off is a system sleep (S3/hibernation): the blank is released
   // without a register write and the donor runs its own Off transition.
-  // The donor gets its real state back (Wake) so it runs the full Wake -> Off
-  // shutdown and stops pipe A; a Doze -> Off would leave the pipe running.
-  assert(!power(f,0) && powerOf(f)==2 && !display13EDPBlankState.blanked && !display13EDPBlankState.fb);
+  // WhateverXe stops pipe A itself (sleep-mode park) and leaves the donor at
+  // Doze, so the donor only takes Doze -> Off and never tears the link down.
+  {const auto before=sleepStops;
+  assert(!power(f,0) && powerOf(f)==1 && !display13EDPBlankState.blanked && !display13EDPBlankState.fb && sleepStops==before+1);}
   assert(display13EDPBlankState.blanks==1 && display13EDPBlankState.forgets==1 && display13EDPBlankState.unblanks==0);
   assert(!(mmio(B::PlaneCtl)&B::PlaneEnable) && mmio(B::CurCtl)==(liveCursor&~B::CursorMode));
-  {const auto r=blankRecord();assert(r[1]==0 && r[2]==2 && r[4]==unsigned(B::Action::Native) && r[9]==1);}
+  {const auto r=blankRecord();assert(r[1]==0 && r[2]==1 && r[4]==unsigned(B::Action::Native) && r[9]==1);}
   // The donor's Off records state 0 (the fixture's donor does not run).
   {const uint32_t off=0;memcpy(f.fb+0x4284,&off,sizeof(off));}
   // The wake after a system sleep is the donor's own wake: nothing restored here.
