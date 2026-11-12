@@ -211,10 +211,14 @@ void blankScenarios() {
   assert(display13EDPBlankState.fb==reinterpret_cast<uintptr_t>(f.fb));
   // Doze -> Off is a system sleep (S3/hibernation): the blank is released
   // without a register write and the donor runs its own Off transition.
-  assert(!power(f,0) && powerOf(f)==1 && !display13EDPBlankState.blanked && !display13EDPBlankState.fb);
+  // The donor gets its real state back (Wake) so it runs the full Wake -> Off
+  // shutdown and stops pipe A; a Doze -> Off would leave the pipe running.
+  assert(!power(f,0) && powerOf(f)==2 && !display13EDPBlankState.blanked && !display13EDPBlankState.fb);
   assert(display13EDPBlankState.blanks==1 && display13EDPBlankState.forgets==1 && display13EDPBlankState.unblanks==0);
   assert(!(mmio(B::PlaneCtl)&B::PlaneEnable) && mmio(B::CurCtl)==(liveCursor&~B::CursorMode));
-  {const auto r=blankRecord();assert(r[1]==0 && r[4]==unsigned(B::Action::Native) && r[9]==1);}
+  {const auto r=blankRecord();assert(r[1]==0 && r[2]==2 && r[4]==unsigned(B::Action::Native) && r[9]==1);}
+  // The donor's Off records state 0 (the fixture's donor does not run).
+  {const uint32_t off=0;memcpy(f.fb+0x4284,&off,sizeof(off));}
   // The wake after a system sleep is the donor's own wake: nothing restored here.
   assert(!power(f,2) && display13EDPBlankState.unblanks==0 && !display13EDPBlankState.blanked);
   assert(blankRecord()[4]==unsigned(B::Action::Native));
