@@ -25,8 +25,18 @@ static XELP::VBT::Ports firmwarePortsWithPanelHint(IOPCIDevice *pci,const void *
 // Firmware is read once, before topology/hook selection. No PCI BAR/ROM scan,
 // power acquisition, or MMIO probing occurs here. Explicit properties win later.
 void XE::xelpReadFirmware(IOPCIDevice *pci) {
+    captureFirmware(pci,xeProfile);
+}
+
+void XE::captureFirmware(IOPCIDevice *pci,const XELP::Profile &profile) {
     // Wiring is needed by framebuffer-only profiles before Render is admitted.
-    if(!pci || !xeProfile.displayAdmitted())return;
+    if(!pci || !profile.displayAdmitted())return;
+    // Registry IDs identify the physical owner for this boot without retaining
+    // a borrowed DeviceInfo pointer. Never replace a valid early snapshot with
+    // a later missing/reclaimed OpRegion, or reuse it for a different device.
+    const auto owner=pci->getRegistryEntryID();
+    if(owner && firmwareOwnerID==owner && firmwareFamily==profile.family && firmwarePorts.valid())return;
+    firmwarePorts={};firmwareOwnerID=0;
     const uint32_t asls=pci->configRead32(0xFC);
     uint32_t source=0;
     if(asls && asls<=0xFFFFE000U) {
@@ -44,14 +54,14 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
                     auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
                     if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
                         const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
-                        firmwarePorts=firmwarePortsWithPanelHint(pci,data,region.bytes,xeProfile.family);
+                        firmwarePorts=firmwarePortsWithPanelHint(pci,data,region.bytes,profile.family);
                         if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
                     }
                     if(vbtMap)vbtMap->release();
                     if(vbtMemory)vbtMemory->release();
                 }
                 if(!firmwarePorts.valid()) {
-                    const auto embedded=firmwarePortsWithPanelHint(pci,bytes+0x400,region.inlineBytes,xeProfile.family);
+                    const auto embedded=firmwarePortsWithPanelHint(pci,bytes+0x400,region.inlineBytes,profile.family);
                     if(embedded.valid()) {
                         firmwarePorts=embedded;source=1;
                         publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
@@ -74,6 +84,7 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
     const auto &panel=firmwarePorts.panel;
     uint32_t panelFacts[]={panel.valid,panel.type,panel.ddi,panel.lowSwing,panel.hobl};
     pci->setProperty("WhateverXeFirmwarePanel",panelFacts,sizeof(panelFacts));
+    if(firmwarePorts.valid()){firmwareOwnerID=owner;firmwareFamily=profile.family;}
     if(checkKernelArgument("-wex-dsi-audit")) {
         // Synchronous audit of the existing copied firmware property. Never
         // retain borrowed sequence pointers, acquire power, or authorize IO.
