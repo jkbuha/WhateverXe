@@ -9326,7 +9326,33 @@ bool XE::display13PanelOnlyClock() {
 		Display13FBTopology::panelOnlyClock(callbackXE->adlnOutputWiring,c.bridge.bootPort,c.pipe[0].memoryFramebuffer,c.pipe[1].memoryFramebuffer,c.pipe[2].memoryFramebuffer);
 	IOLockUnlock(c.lock);return only;
 }
+// Opt-in (-wex-keep-cdclk): when firmware already runs CDCLK faster than the
+// mode needs, keep it instead of crawling it down under a live eDP scanout
+// (XPS 17 9720 firmware hands over 652.8 MHz; the 9320 hands over 179.2 MHz).
+// A higher CDCLK only costs power. WEXDisplay13KeepClock: {version, requests,
+// kept, last requested native Hz lo/hi, last kept native Hz lo/hi}.
+static uint32_t display13KeepClockRecord[7] {1};
+static uint64_t display13KeepFirmwareClock(uint64_t nativeHz) {
+	if(!checkKernelArgument("-wex-keep-cdclk"))return nativeHz;
+	auto &c=display13FBPower;if(!c.lock)return nativeHz;
+	uint64_t chosen=nativeHz;
+	IOLockLock(c.lock);
+	if(c.map) {
+		Display13FBClockIO io {c.map};
+		const auto current=Display13Clock::read(io,display13ClockVariant());
+		if(current.status==Display13Clock::Status::Complete && current.nativeHz()>nativeHz)chosen=current.nativeHz();
+	}
+	auto &r=display13KeepClockRecord;++r[1];if(chosen!=nativeHz)++r[2];
+	r[3]=static_cast<uint32_t>(nativeHz);r[4]=static_cast<uint32_t>(nativeHz>>32);
+	r[5]=static_cast<uint32_t>(chosen);r[6]=static_cast<uint32_t>(chosen>>32);
+	uint32_t copy[7];memcpy(copy,r,sizeof(copy));
+	IOLockUnlock(c.lock);
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13KeepClock",copy,sizeof(copy));
+	if(chosen!=nativeHz)SYSLOG("igfx","Display13 clock: keeping firmware %llu instead of %llu",chosen,nativeHz);
+	return chosen;
+}
 void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
+	nativeHz=display13KeepFirmwareClock(nativeHz);
 	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {
 		if(!display13PanelOnlyClock()) {adlnSetDualClock(controller,nativeHz);return;}
 		SYSLOG("igfx","Display13 clock: %llu on the single-output path, only the panel has a framebuffer",nativeHz);
