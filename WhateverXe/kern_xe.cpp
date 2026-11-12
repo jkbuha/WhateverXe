@@ -6409,6 +6409,11 @@ IOReturn XE::wrapDisplay13FBPerformFlip(IOService *fb,void *transaction,uint64_t
 	if(!display13FlipFirst[0])memcpy(display13FlipFirst,r,sizeof(r));
 	return ret;
 }
+static void display13FlipStageArm(bool before) {
+	auto &r=display13FlipStages;
+	if(before) {r[0]=1;++r[4];if(display13FlipDepth)++r[12];}
+	else r[11]=display13FlipPlaneA(0x7019C);
+}
 void XE::wrapDisplay13PlaneConfigure(void *plane,void *args) {
 	auto &r=display13FlipStages;r[0]=1;++r[1];if(display13FlipDepth)++r[12];
 	r[13]=args ? *reinterpret_cast<uint8_t *>(args) : 0xFF;
@@ -6420,53 +6425,47 @@ void XE::wrapDisplay13PlaneUpdate(void *plane,bool arg) {
 	FunctionCast(wrapDisplay13PlaneUpdate,callbackXE->orgDisplay13PlaneUpdate)(plane,arg);
 	r[10]=display13FlipPlaneA(0x7019C);
 }
-void XE::wrapDisplay13FBArmUpdate(IOService *fb) {
-	auto &r=display13FlipStages;r[0]=1;++r[4];if(display13FlipDepth)++r[12];
-	FunctionCast(wrapDisplay13FBArmUpdate,callbackXE->orgDisplay13FBArmUpdate)(fb);
-	r[11]=display13FlipPlaneA(0x7019C);
-}
 void XE::wrapDisplay13FBSetTransactionIRQ(IOService *controller,bool enable,IOService *fb,uint32_t bits) {
 	auto &r=display13FlipStages;r[0]=1;++r[5];r[6]=enable;r[7]=bits;if(enable)++r[8];if(display13FlipDepth)++r[12];
 	FunctionCast(wrapDisplay13FBSetTransactionIRQ,callbackXE->orgDisplay13FBSetTransactionIRQ)(controller,enable,fb,bits);
 	r[14]=controller==__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE) ? *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xE14) : 0xDEADBEEF;
 }
+// Per-hook install result, published as WEXDisplay13FlipHooks:
+// {Validate, PerformFlip, configurePlane, updatePlane, hwSetInterruptForTransaction, armUpdate}
+// 0 gate closed, 1 symbol missing, 2 offset differs, 3 entry bytes differ,
+// 4 route failed, 5 installed. armUpdate is already routed by the watermark
+// backend (wrapDisplay13WMArmUpdate); it is counted there, 5 when that route is live.
+static uint32_t display13FlipHooks[6];
 bool XE::processDisplay13FramebufferFlipProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
-	static const char *symbols[] {
-		"__ZN21AppleIntelFramebuffer19ValidateTransactionEP30IOAccelDisplayPipeTransaction2y",
-		"__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams",
+	struct Hook {const char *symbol;uintptr_t offset;void *wrapper;mach_vm_address_t *org;};
+	const Hook hooks[] {
+		{"__ZN21AppleIntelFramebuffer19ValidateTransactionEP30IOAccelDisplayPipeTransaction2y",0x2B4BA,
+			reinterpret_cast<void *>(wrapDisplay13FBValidate),&orgDisplay13FBValidate},
+		{"__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams",0x2B602,
+			reinterpret_cast<void *>(wrapDisplay13FBPerformFlip),&orgDisplay13FBPerformFlip},
+		{"__ZN15AppleIntelPlane14configurePlaneEP19FlipTransactionArgs",0x2198,
+			reinterpret_cast<void *>(wrapDisplay13PlaneConfigure),&orgDisplay13PlaneConfigure},
+		{"__ZN15AppleIntelPlane11updatePlaneEb",0x1B68,
+			reinterpret_cast<void *>(wrapDisplay13PlaneUpdate),&orgDisplay13PlaneUpdate},
+		{"__ZN31AppleIntelFramebufferController28hwSetInterruptForTransactionEbP21AppleIntelFramebufferj",0x728FC,
+			reinterpret_cast<void *>(wrapDisplay13FBSetTransactionIRQ),&orgDisplay13FBSetTransactionIRQ},
 	};
-	// Same donor layout as the IRQ routes; the field offsets above come from
-	// its logFBState/PerformFlipTransaction.
-	static const uintptr_t offsets[] {0x2B4BA,0x2B602};
+	// Same donor layout as the IRQ routes; field offsets come from its
+	// logFBState/PerformFlipTransaction. Each hook installs on its own.
 	static const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56};
-	bool known=display13FramebufferRequested && display13FBIRQReady && size>0x2B612;
-	for(unsigned i=0;i<2;++i) {
-		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size);patcher.clearError();
-		known=known && fn==address+offsets[i] && !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
+	const bool gate=display13FramebufferRequested && display13FBIRQReady && size>0x2B612;
+	for(unsigned i=0;i<arrsize(hooks);++i) {
+		if(!gate) {display13FlipHooks[i]=0;continue;}
+		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,hooks[i].symbol,address,size);patcher.clearError();
+		if(!fn) {display13FlipHooks[i]=1;continue;}
+		if(fn!=address+hooks[i].offset) {display13FlipHooks[i]=2;continue;}
+		if(memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry))) {display13FlipHooks[i]=3;continue;}
+		KernelPatcher::RouteRequest route {hooks[i].symbol,hooks[i].wrapper,*hooks[i].org};
+		display13FlipHooks[i]=patcher.routeMultiple(index,&route,1,address,size) ? 5 : 4;patcher.clearError();
 	}
-	if(!known)return false;
-	static const char *stageSymbols[] {
-		"__ZN15AppleIntelPlane14configurePlaneEP19FlipTransactionArgs",
-		"__ZN15AppleIntelPlane11updatePlaneEb",
-		"__ZN21AppleIntelFramebuffer9armUpdateEv",
-		"__ZN31AppleIntelFramebufferController28hwSetInterruptForTransactionEbP21AppleIntelFramebufferj",
-	};
-	static const uintptr_t stageOffsets[] {0x2198,0x1B68,0x38C70,0x728FC};
-	for(unsigned i=0;i<4;++i) {
-		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,stageSymbols[i],address,size);patcher.clearError();
-		known=known && fn==address+stageOffsets[i] && !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
-	}
-	if(!known)return false;
-	KernelPatcher::RouteRequest routes[] {
-		{symbols[0],wrapDisplay13FBValidate,orgDisplay13FBValidate},
-		{symbols[1],wrapDisplay13FBPerformFlip,orgDisplay13FBPerformFlip},
-		{stageSymbols[0],wrapDisplay13PlaneConfigure,orgDisplay13PlaneConfigure},
-		{stageSymbols[1],wrapDisplay13PlaneUpdate,orgDisplay13PlaneUpdate},
-		{stageSymbols[2],wrapDisplay13FBArmUpdate,orgDisplay13FBArmUpdate},
-		{stageSymbols[3],wrapDisplay13FBSetTransactionIRQ,orgDisplay13FBSetTransactionIRQ},
-	};
-	const bool routed=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
-	patcher.clearError();return routed;
+	display13FlipHooks[5]=display13FBWatermarkHooksReady ? 5 : 0;
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13FlipHooks",display13FlipHooks,sizeof(display13FlipHooks));
+	return display13FlipHooks[1]==5;
 }
 
 void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t *aux,uint32_t *hotplug) {
@@ -10207,6 +10206,9 @@ void XE::wrapDisplay13WMArmUpdate(IOService *fb) {
 }
 
 void XE::display13WMArmUpdate(IOService *fb) {
+	// Flip probe stage counter (read-only); see display13FlipStages.
+	display13FlipStageArm(true);
+	struct ArmAfter {~ArmAfter(){display13FlipStageArm(false);}} armAfter;
 	auto &c=display13FBPower;bool owner=false;
 	const auto pipe=Display13FBMemory::boundPipe(c.pipe,fb);
 	Display13WM::TriggerSurfaces intent;OSObject *path=nullptr;uint32_t packetCount=0;
