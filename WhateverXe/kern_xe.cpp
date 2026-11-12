@@ -4751,6 +4751,8 @@ static uint32_t display13AUXLog[1+16*8];
 // so vblank() was skipped.
 static uint32_t display13VBLLast[16],display13VBLFirstRefusal[16],display13VBLCalls,display13VBLRefusals;
 static uint32_t display13VBLByPipe[3*2];  // {enable calls, refused} per pipe
+// Flip submission probe records; layout documented at wrapDisplay13FBPerformFlip.
+static uint32_t display13FlipLast[24],display13FlipFirst[24],display13FlipFirstFailure[24];
 static uint32_t display13ScanoutShots;
 static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
     auto &c=display13FBPower;if(!c.lock)return;
@@ -4773,6 +4775,10 @@ static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
         root->setProperty("WEXDisplay13VBL",vbl,sizeof(vbl));
         if(vblFirst[0])root->setProperty("WEXDisplay13VBLFirstRefusal",vblFirst,sizeof(vblFirst));
         root->setProperty("WEXDisplay13VBLByPipe",vblPipes,sizeof(vblPipes));
+        uint32_t flip[24];memcpy(flip,display13FlipLast,sizeof(flip));
+        root->setProperty("WEXDisplay13Flip",flip,sizeof(flip));
+        if(display13FlipFirst[0]) {memcpy(flip,display13FlipFirst,sizeof(flip));root->setProperty("WEXDisplay13FlipFirst",flip,sizeof(flip));}
+        if(display13FlipFirstFailure[0]) {memcpy(flip,display13FlipFirstFailure,sizeof(flip));root->setProperty("WEXDisplay13FlipFirstFailure",flip,sizeof(flip));}
     }
     if(display13ScanoutShots<4) {
         uint64_t deadline;clock_interval_to_deadline(10U<<display13ScanoutShots,kSecondScale,&deadline);
@@ -5637,6 +5643,7 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 
 	display13FBIRQReady=processDisplay13FramebufferIRQ(patcher,index,address,size);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBIRQHooksReady",display13FBIRQReady);
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13FlipProbeReady",processDisplay13FramebufferFlipProbe(patcher,index,address,size));
 	display13FBABIReady=framebufferDonorCommonReady;
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBCommonABIReady",display13FBABIReady);
 	display13FBLifecycleHooksReady=processDisplay13FramebufferLifecycle(patcher,index,address,size);
@@ -6326,6 +6333,85 @@ void XE::wrapDisplay13FBSWIRQ(IOService *controller,IOInterruptEventSource *sour
 		if(!irq.softwareHandlers)irq.softwareThread=0;
 		IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
 	}
+}
+
+// Read-only flip submission probe (#78: one flip-done against thousands of
+// vblanks, PLANE_SURF never written). Records what Apple's framebuffer flip
+// entry points are called with and return; it never changes arguments,
+// results, ordering or any register. logFBState's "Flip called without
+// enabling VBL" tests the software per-pipe interrupt mask at controller+0xE14
+// (bit 3 = VBL, owned by hwSetInterruptState/hwSetInterruptForTransaction),
+// so that mask is sampled around each flip as well.
+// {version, validate calls, validate last ret, validate failures, validate first failure,
+//  validate last options lo, flip calls, flip last ret, flip failures, flip first failure,
+//  flip options lo, flip options hi, pipe, swMask before, swMask after,
+//  PLANE_CTL_1_A after, PLANE_SURF_1_A before, PLANE_SURF_1_A after, PLANE_SURFLIVE_1_A after,
+//  IIR flips[pipe A], IIR vblanks[pipe A], fb index, flips with swMask==0, flips that changed PLANE_SURF}
+static uint32_t display13FlipPipe(IOService *fb) {
+	if(!fb || fb->getMetaClass()->getClassSize()<0x4A10)return 0xFF;
+	auto f=reinterpret_cast<uint8_t *>(fb);
+	auto path=*reinterpret_cast<OSObject **>(f+(*reinterpret_cast<int32_t *>(f+0x3FD8)!=-1 ? 0x4A08 : 0x49F0));
+	if(!path || path->getMetaClass()->getClassSize()<0x3730)return 0xFF;
+	const auto pipe=Display13FBMemory::field<uint32_t>(path,0x3640);
+	return pipe<3 ? pipe : 0xFF;
+}
+static uint32_t display13FlipMask(IOService *fb,uint32_t pipe) {
+	if(pipe>=3 || !fb)return 0xDEADBEEF;
+	auto controller=*reinterpret_cast<IOService **>(reinterpret_cast<uint8_t *>(fb)+0x1D0);
+	if(!controller || controller!=__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE))return 0xDEADBEEF;
+	return *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xE14+4*pipe);
+}
+static uint32_t display13FlipPlaneA(uint32_t reg) {
+	Display13FBIRQIO io {display13FBIRQ.base};
+	if(!io.readable(reg) || !Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),0))return 0xDEADBEEF;
+	return io.read(reg);
+}
+IOReturn XE::wrapDisplay13FBValidate(IOService *fb,void *transaction,uint64_t options) {
+	const auto ret=FunctionCast(wrapDisplay13FBValidate,callbackXE->orgDisplay13FBValidate)(fb,transaction,options);
+	auto &r=display13FlipLast;
+	r[0]=1;++r[1];r[2]=static_cast<uint32_t>(ret);r[5]=static_cast<uint32_t>(options);
+	if(ret!=kIOReturnSuccess) {if(!r[3])r[4]=static_cast<uint32_t>(ret);++r[3];}
+	return ret;
+}
+IOReturn XE::wrapDisplay13FBPerformFlip(IOService *fb,void *transaction,uint64_t options,void *params) {
+	auto &r=display13FlipLast;
+	const auto pipe=display13FlipPipe(fb);
+	const auto maskBefore=display13FlipMask(fb,pipe),surfBefore=display13FlipPlaneA(0x7019C);
+	const auto ret=FunctionCast(wrapDisplay13FBPerformFlip,callbackXE->orgDisplay13FBPerformFlip)(fb,transaction,options,params);
+	const auto surfAfter=display13FlipPlaneA(0x7019C);
+	r[0]=1;++r[6];r[7]=static_cast<uint32_t>(ret);
+	r[10]=static_cast<uint32_t>(options);r[11]=static_cast<uint32_t>(options>>32);r[12]=pipe;
+	r[13]=maskBefore;r[14]=display13FlipMask(fb,pipe);
+	r[15]=display13FlipPlaneA(0x70180);r[16]=surfBefore;r[17]=surfAfter;r[18]=display13FlipPlaneA(0x701AC);
+	r[19]=static_cast<uint32_t>(display13FBIRQ.state.flips[0]);r[20]=static_cast<uint32_t>(display13FBIRQ.state.vblanks[0]);
+	r[21]=fb && fb->getMetaClass()->getClassSize()>=0x1E0 ? *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x1DC) : 0xFF;
+	if(!maskBefore)++r[22];
+	if(surfAfter!=surfBefore)++r[23];
+	if(ret!=kIOReturnSuccess) {if(!r[8]) {r[9]=static_cast<uint32_t>(ret);memcpy(display13FlipFirstFailure,r,sizeof(r));}++r[8];}
+	if(!display13FlipFirst[0])memcpy(display13FlipFirst,r,sizeof(r));
+	return ret;
+}
+bool XE::processDisplay13FramebufferFlipProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+	static const char *symbols[] {
+		"__ZN21AppleIntelFramebuffer19ValidateTransactionEP30IOAccelDisplayPipeTransaction2y",
+		"__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams",
+	};
+	// Same donor layout as the IRQ routes; the field offsets above come from
+	// its logFBState/PerformFlipTransaction.
+	static const uintptr_t offsets[] {0x2B4BA,0x2B602};
+	static const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56};
+	bool known=display13FramebufferRequested && display13FBIRQReady && size>0x2B612;
+	for(unsigned i=0;i<2;++i) {
+		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size);patcher.clearError();
+		known=known && fn==address+offsets[i] && !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
+	}
+	if(!known)return false;
+	KernelPatcher::RouteRequest routes[] {
+		{symbols[0],wrapDisplay13FBValidate,orgDisplay13FBValidate},
+		{symbols[1],wrapDisplay13FBPerformFlip,orgDisplay13FBPerformFlip},
+	};
+	const bool routed=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+	patcher.clearError();return routed;
 }
 
 void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t *aux,uint32_t *hotplug) {

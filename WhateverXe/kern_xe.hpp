@@ -494,6 +494,10 @@ private:
 	static void wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop);
 	mach_vm_address_t orgDisplay13FBIRQ[5] {};
 	mach_vm_address_t orgDisplay13FBSWIRQ {};
+	mach_vm_address_t orgDisplay13FBValidate {},orgDisplay13FBPerformFlip {};
+	__attribute__((noinline)) bool processDisplay13FramebufferFlipProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+	static IOReturn wrapDisplay13FBValidate(IOService *framebuffer,void *transaction,uint64_t options);
+	static IOReturn wrapDisplay13FBPerformFlip(IOService *framebuffer,void *transaction,uint64_t options,void *params);
 	mach_vm_address_t adlnWorkLoopInGate {},adlnWorkLoopOnThread {};
 	mach_vm_address_t adlnWorkLoopTryClose {},adlnWorkLoopOpen {};
 	__attribute__((noinline)) bool processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
