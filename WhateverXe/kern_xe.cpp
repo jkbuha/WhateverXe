@@ -13,6 +13,7 @@
 #include "kern_dsi_native_backing.hpp"
 #include "kern_dsi_native_mode.hpp"
 #include "kern_xe.hpp"
+#include <sys/proc.h>
 #include "kern_framebuffer_donor.hpp"
 #include "kern_xelp_os.hpp"
 #include "kern_xelp_call_target.hpp"
@@ -4761,6 +4762,13 @@ static uint32_t display13FlipLast[24],display13FlipFirst[24],display13FlipFirstF
 //  after armUpdate, stage calls made inside PerformFlip, last configurePlane
 //  plane count byte, hwSetInterruptForTransaction ctrl+0xE14[0] after, reserved}
 static uint32_t display13FlipParams[24],display13FlipParamsFirst[24],display13FlipStages[16];
+// Accelerator display-pipe client probe (#78: the only framebuffer flip is
+// empty). Per hook {calls, last ret lo, non-zero rets, first non-zero ret,
+// last pid, first pid}; hooks: validateTransaction, submitTransaction,
+// performTransaction, submitFlipBuffer, submitScanoutFlipBuffer. Index 0 is
+// the version, then 5x6 dwords. WEXDisplay13PipeHooks: per-hook install result
+// (0 gate, 1 symbol, 3 entry bytes, 4 route, 5 installed).
+static uint32_t display13Pipe[1+5*6],display13PipeHooks[5];
 static volatile uint32_t display13FlipDepth;
 static uint32_t display13ScanoutShots;
 static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
@@ -4791,6 +4799,7 @@ static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
         memcpy(flip,display13FlipParams,sizeof(flip));root->setProperty("WEXDisplay13FlipParams",flip,sizeof(flip));
         memcpy(flip,display13FlipParamsFirst,sizeof(flip));root->setProperty("WEXDisplay13FlipParamsFirst",flip,sizeof(flip));
         uint32_t stages[16];memcpy(stages,display13FlipStages,sizeof(stages));root->setProperty("WEXDisplay13FlipStages",stages,sizeof(stages));
+        uint32_t pipe[sizeof(display13Pipe)/4];memcpy(pipe,display13Pipe,sizeof(pipe));root->setProperty("WEXDisplay13Pipe",pipe,sizeof(pipe));
     }
     if(display13ScanoutShots<4) {
         uint64_t deadline;clock_interval_to_deadline(10U<<display13ScanoutShots,kSecondScale,&deadline);
@@ -6429,6 +6438,39 @@ void XE::wrapDisplay13FBSetTransactionIRQ(IOService *controller,bool enable,IOSe
 	auto &r=display13FlipStages;r[0]=1;++r[5];r[6]=enable;r[7]=bits;if(enable)++r[8];if(display13FlipDepth)++r[12];
 	FunctionCast(wrapDisplay13FBSetTransactionIRQ,callbackXE->orgDisplay13FBSetTransactionIRQ)(controller,enable,fb,bits);
 	r[14]=controller==__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE) ? *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xE14) : 0xDEADBEEF;
+}
+static void display13PipeNote(unsigned hook,uint64_t ret) {
+	auto r=display13Pipe+1+6*hook;const auto pid=static_cast<uint32_t>(proc_selfpid());
+	display13Pipe[0]=1;++r[0];r[1]=static_cast<uint32_t>(ret);r[4]=pid;if(r[0]==1)r[5]=pid;
+	if(static_cast<uint32_t>(ret)) {if(!r[2])r[3]=static_cast<uint32_t>(ret);++r[2];}
+}
+// ABI-transparent pass-through: integer arguments only, rax returned unchanged.
+#define WEX_PIPE_WRAP(n) uint64_t XE::wrapDisplay13Pipe##n(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e) { \
+	const auto ret=FunctionCast(wrapDisplay13Pipe##n,callbackXE->orgDisplay13Pipe[n])(a,b,c,d,e);display13PipeNote(n,ret);return ret;}
+WEX_PIPE_WRAP(0) WEX_PIPE_WRAP(1) WEX_PIPE_WRAP(2) WEX_PIPE_WRAP(3) WEX_PIPE_WRAP(4)
+#undef WEX_PIPE_WRAP
+void XE::processDisplay13PipeProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+	static const char *symbols[] {
+		"__ZN18IGAccelDisplayPipe19validateTransactionEP30IOAccelDisplayPipeTransaction2",
+		"__ZN18IGAccelDisplayPipe17submitTransactionEP30IOAccelDisplayPipeTransaction2",
+		"__ZN18IGAccelDisplayPipe18performTransactionEP30IOAccelDisplayPipeTransaction2",
+		"__ZN18IGAccelDisplayPipe16submitFlipBufferEP12IOAccelEventjP16IOAccelResource2S3_",
+		"__ZN18IGAccelDisplayPipe23submitScanoutFlipBufferEP12IOAccelEventjP16IOAccelResource2S3_",
+	};
+	void *wrappers[] {reinterpret_cast<void *>(wrapDisplay13Pipe0),reinterpret_cast<void *>(wrapDisplay13Pipe1),
+		reinterpret_cast<void *>(wrapDisplay13Pipe2),reinterpret_cast<void *>(wrapDisplay13Pipe3),reinterpret_cast<void *>(wrapDisplay13Pipe4)};
+	// Unrouted native prologue: push rbp; mov rbp,rsp. Any earlier route
+	// (WhateverXe or another patcher) fails this check instead of chaining.
+	static const uint8_t entry[] {0x55,0x48,0x89,0xE5};
+	for(unsigned i=0;i<5;++i) {
+		if(!display13FramebufferRequested) {display13PipeHooks[i]=0;continue;}
+		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size);patcher.clearError();
+		if(!fn || fn<address || fn-address>=size) {display13PipeHooks[i]=1;continue;}
+		if(memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry))) {display13PipeHooks[i]=3;continue;}
+		KernelPatcher::RouteRequest route {symbols[i],wrappers[i],orgDisplay13Pipe[i]};
+		display13PipeHooks[i]=patcher.routeMultiple(index,&route,1,address,size) ? 5 : 4;patcher.clearError();
+	}
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13PipeHooks",display13PipeHooks,sizeof(display13PipeHooks));
 }
 // Per-hook install result, published as WEXDisplay13FlipHooks:
 // {Validate, PerformFlip, configurePlane, updatePlane, hwSetInterruptForTransaction, armUpdate}
@@ -12637,6 +12679,8 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLAcceleratorAdmissionReady", tglAcceleratorReady);
 			patcher.clearError();
    tglRecordStartOrder(2,nullptr);
+			// Read-only display-pipe client probe (#78); independent per hook.
+			processDisplay13PipeProbe(patcher,index,address,size);
 			return true;
 }
 

@@ -495,6 +495,13 @@ private:
 	mach_vm_address_t orgDisplay13FBIRQ[5] {};
 	mach_vm_address_t orgDisplay13FBSWIRQ {};
 	mach_vm_address_t orgDisplay13FBValidate {},orgDisplay13FBPerformFlip {};
+	mach_vm_address_t orgDisplay13Pipe[5] {};
+	__attribute__((noinline)) void processDisplay13PipeProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+	static uint64_t wrapDisplay13Pipe0(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+	static uint64_t wrapDisplay13Pipe1(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+	static uint64_t wrapDisplay13Pipe2(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+	static uint64_t wrapDisplay13Pipe3(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+	static uint64_t wrapDisplay13Pipe4(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 	mach_vm_address_t orgDisplay13PlaneConfigure {},orgDisplay13PlaneUpdate {},orgDisplay13FBSetTransactionIRQ {};
 	static void wrapDisplay13PlaneConfigure(void *plane,void *args);
 	static void wrapDisplay13PlaneUpdate(void *plane,bool arg);
