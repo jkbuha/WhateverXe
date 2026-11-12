@@ -5087,7 +5087,8 @@ struct Display13FBResumeParkIO : Display13FBBootIO {
     explicit Display13FBResumeParkIO(IOMemoryMap *m):Display13FBBootIO{m} {}
     bool write(uint32_t r,uint32_t v) {
         static constexpr uint32_t allowed[] {0x70180,0x7019C,0x70008,0x68170,0x68174,0x68180,0x68270,0x68274,0x68280,
-            0x60404,0x60400,0x64000,0x64100,0x64200,0x60540,0x46140,0x7027C,0x7037C,0x7017C};
+            0x60404,0x60400,0x64000,0x64100,0x64200,0x60540,0x46140,0x7027C,0x7037C,0x7017C,
+            0x70080,0x70084}; // cursor A: sleep-mode park only (resume park qualifies the cursor off)
         for(auto a:allowed)if(a==r) {*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;return true;}
         return false;
     }
@@ -14145,6 +14146,11 @@ static bool display13EDPBlankRequested() {
  return v==1;
 }
 static Display13EDPBlank::State display13EDPBlankState;
+// System-sleep stop of the kept boot panel (defined after display13EDPBlankPower):
+// {version, count, park status, stage, writes, last register, TRANSCONF,
+//  TRANS_DDI_FUNC_CTL, CTL2|cmtgSecondary<<8, prior donor state}.
+static uint32_t display13EDPBlankSleepPark[10];
+static bool display13EDPBlankSleepStop(uint32_t current,uint32_t panelPorts);
 bool XE::display13EDPBlankReady() {
  auto s=callbackXE;auto &c=display13FBPower;
  return display13EDPBlankRequested() && s && c.lock && c.map && s->orgDisplay13RegsNeedUpdate &&
@@ -14179,16 +14185,20 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
    eligible=scanout && Display13FBMemory::field<uint32_t>(path,0x3644)==2 &&
     display13EDPKeepPath==reinterpret_cast<uintptr_t>(path);
   }
-  // A system sleep (Off) is the donor's: drop a display-sleep blank without
-  // touching registers, so the following wake is the donor's as well. The
-  // blank recorded Doze at fb+0x4284 while pipe, transcoder and link kept
-  // running; hand the donor back its real state (Wake) so it runs the full
-  // Wake -> Off shutdown. Otherwise it only takes Doze -> Off, pipe A stays
-  // on, the engine stop refuses (DBUF Conflict) and a hibernation resume
-  // skips the shared restore.
-  if(state==0 && owner) {
-   B::forget(b);forgot=true;owner=false;
-   if(current==1){*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=B::Wake;current=B::Wake;}
+  // A system sleep (Off) is the donor's, but not its Wake -> Off: on the XPS
+  // 17 9720 that link teardown hangs the machine on the way into sleep. A
+  // display-sleep blank (or an awake kept panel) leaves pipe A, transcoder and
+  // link running, and the engine stop then refuses (DBUF Conflict), so stop
+  // that one firmware-kept scanout here with the hibernation resume park
+  // (Linux disable order, CMTG secondary kept, refused without writes for any
+  // other topology), record Doze and let the donor take only Doze -> Off.
+  // The following wake is the donor's own (from Off).
+  if(state==0 && (owner || (eligible && current==B::Wake))) {
+   if(owner){B::forget(b);forgot=true;owner=false;}
+   if(eligible) {
+    display13EDPBlankSleepStop(current,s->adlnOutputWiring.panel);
+    *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=1;current=1;
+   }
   }
   action=B::decide(eligible,owner,current,state,b.blanked);
   struct IO {
@@ -14210,6 +14220,7 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
   const uint32_t record[11]={2,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor,b.forgets,
    (owner ? 1U : 0U)|(scanout ? 2U : 0U)};
   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
+  if(display13EDPBlankSleepPark[0])IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankSleepPark",display13EDPBlankSleepPark,sizeof(display13EDPBlankSleepPark));
   SYSLOG("igfx","eDP blank: power state %u -> %u (%s)",current,state,
    action==B::Action::Blank ? "blanked" : action==B::Action::Unblank ? (forgot ? "released, panel not scanned out" : "unblanked") :
    action==B::Action::Keep ? "unchanged" : "donor");
@@ -14218,6 +14229,18 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
  if(!eligible || action==B::Action::Native)return false;
  result=kIOReturnSuccess;
  return true;
+}
+
+// Caller holds display13FBPower.lock. Stops the one firmware-kept pipe A
+// scanout with the resume park in sleep mode; any other topology is refused
+// without writes and the record says why.
+static bool display13EDPBlankSleepStop(uint32_t current,uint32_t panelPorts) {
+ auto &c=display13FBPower;auto &r=display13EDPBlankSleepPark;
+ Display13FBResumeParkIO parkIO{c.map};
+ const auto park=Display13ResumePark::park(parkIO,c.transcoders,panelPorts,true);
+ r[0]=1;++r[1];r[2]=static_cast<uint32_t>(park.status);r[3]=park.stage;r[4]=park.writes;r[5]=park.lastReg;
+ r[6]=park.conf;r[7]=park.trans;r[8]=park.cmtgSecondary?park.ctl2|0x100U:park.ctl2;r[9]=current;
+ return park.status==Display13ResumePark::Status::Complete;
 }
 
 // Shared exact-donor panel corrections; physical adapters own admission.

@@ -58,6 +58,18 @@ int main() {
     {auto x=live();x.r[0x70280]=0x80000000U;refuse(x,1);}          // second plane
     {auto x=live();x.r[0x70080]=0x27;refuse(x,1);}                 // cursor
     {auto x=live();x.r[0x70B08]=1;refuse(x,1);}                    // DSB
+    // Sleep mode (-wex-edp-blank system sleep of a kept boot panel): a cursor
+    // that is on is turned off first; a plane already blanked by display sleep
+    // is accepted; everything else qualifies exactly as the resume park.
+    {auto x=live();x.r[0x70080]=0x04000027U;x.r[0x70084]=0x01230000U;auto r=park(x,edp,1,true);
+     assert(r.status==Status::Complete && r.stage==9 && !(x.r[0x70080]&63) && x.r[0x70084]==0x01230000U);
+     assert(x.order.size()>=4 && x.order[0]==0x70080 && x.order[1]==0x70084 && x.order[2]==0x70180 && x.order[3]==0x7019C);
+     assert(!(x.r[0x70008]&0xC0000000U) && !(x.r[0x60400]&Enable) && !(x.r[0x64000]&Enable));}
+    {auto x=live();x.r[0x70180]=0x04000000U;auto r=park(x,edp,1,true);       // display-sleep blanked plane
+     assert(r.status==Status::Complete && x.order[0]==0x70180 && !(x.r[0x70008]&0xC0000000U));}
+    {auto x=live();x.r[0x70180]=0x04000000U;refuse(x,1);}          // resume park still needs the firmware plane
+    {auto x=live();x.r[0x70280]=0x80000000U;const auto copy=x.r;auto r=park(x,edp,1,true);
+     assert(r.status==Status::Topology && !r.writes && x.r==copy);}  // sleep mode: second plane still refused
     {auto x=live();x.r[0x46140]=3U<<28;refuse(x,1);}               // clock from another DDI
     {auto x=live();x.r[0x70008]=0;refuse(x,1);}                    // nothing scanning out
     {auto x=live();x.r[0x64000]=0x80U;refuse(x,1);}                // buffer already off

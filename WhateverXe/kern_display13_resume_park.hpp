@@ -36,7 +36,10 @@ constexpr uint32_t PSRControl=0x60800,PSR2Control=0x60900;
 inline uint32_t planeCtl(unsigned n){return 0x70180+0x100*n;}
 inline uint32_t planeSurf(unsigned n){return 0x7019C+0x100*n;}
 // Read-only qualification. panelPorts is the board's eDP DDI mask.
-template<class IO> bool qualify(IO &io,const Display13Transcoder::Bindings &t,uint32_t panelPorts,Result &r) {
+// sleep: a system-sleep stop of the boot panel kept by -wex-edp-keep. A
+// display-sleep blank may already have cleared the primary plane, and the
+// cursor may be on; both are accepted and stage 1 turns the cursor off.
+template<class IO> bool qualify(IO &io,const Display13Transcoder::Bindings &t,uint32_t panelPorts,Result &r,bool sleep=false) {
     r.status=Status::Topology;
     if(!t.valid() || t.dsi(0) || t.dsi0Pipe!=UINT32_MAX)return false;
     for(unsigned p=1;p<3;++p) {
@@ -65,13 +68,13 @@ template<class IO> bool qualify(IO &io,const Display13Transcoder::Bindings &t,ui
         if(v==UINT32_MAX || (v&Enable))return false;
     }
     const auto cursor=io.read(0x70080);
-    if(cursor==UINT32_MAX || (cursor&63))return false;
+    if(cursor==UINT32_MAX || ((cursor&63) && !sleep))return false;
     for(unsigned n=0;n<5;++n) {
         const auto ctl=io.read(planeCtl(n));
         if(ctl==UINT32_MAX)return false;
         if(ctl&Enable)r.planes|=1U<<n;
     }
-    if(!(r.planes&1) || (r.planes&~1U))return false; // Firmware presents one primary plane.
+    if((!(r.planes&1) && !sleep) || (r.planes&~1U))return false; // Firmware presents one primary plane.
     for(unsigned d=0;d<3;++d) {
         // Display13FBIRQ::DSBControl(0,d) = DSBInterrupt(0,d)-0x20.
         const auto ctl=io.read(0x70B08+0x100*d);
@@ -79,9 +82,9 @@ template<class IO> bool qualify(IO &io,const Display13Transcoder::Bindings &t,ui
     }
     return true;
 }
-template<class IO> Result park(IO &io,const Display13Transcoder::Bindings &t,uint32_t panelPorts) {
+template<class IO> Result park(IO &io,const Display13Transcoder::Bindings &t,uint32_t panelPorts,bool sleep=false) {
     Result r;
-    if(!qualify(io,t,panelPorts,r))return r;
+    if(!qualify(io,t,panelPorts,r,sleep))return r;
     const auto power=io.read(0x45404);
     // Nothing else may change shared power while this transaction runs.
     auto stable=[&]{return io.read(0x45404)==power;};
@@ -99,6 +102,12 @@ template<class IO> Result park(IO &io,const Display13Transcoder::Bindings &t,uin
     // 1. Primary plane off, latched by a surface write; drain two real frames.
     r.stage=1;
     const auto frames=io.read(0x70040),ctl=io.read(planeCtl(0)),surface=io.read(planeSurf(0));
+    if(sleep) {
+        // Cursor off (CUR_CTL mode 0), latched by the CUR_BASE write.
+        const auto cursor=io.read(0x70080);
+        if(cursor==UINT32_MAX){r.status=Status::Readback;return r;}
+        if((cursor&63) && (!write(0x70080,cursor&~63U) || !write(0x70084,io.read(0x70084))))return r;
+    }
     if(!write(planeCtl(0),ctl&~Enable) || !write(planeSurf(0),surface))return r;
     uint32_t after=0;
     if(!XELPGOP::poll(io,stable,[&](uint32_t v){return uint32_t(v-frames)>=2 && uint32_t(v-frames)<0x10000000U;},
