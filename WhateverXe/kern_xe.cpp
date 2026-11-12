@@ -4736,6 +4736,9 @@ struct Display13WorkLoopPeek : IOWorkLoop {
 static thread_call_t display13ScanoutCall;
 // Native AUX run/failure counts per DDI, written under display13FBPower.lock.
 static uint32_t display13AUXRuns[7],display13AUXFailures[7];
+// Last 16 native AUX runs, any DDI: {sequence, ddi, command, length|flag<<16,
+// request header (packet[0]) before, packet[0] after, native result, DDI_AUX_CTL after}.
+static uint32_t display13AUXLog[1+16*8];
 static uint32_t display13ScanoutShots;
 static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
     auto &c=display13FBPower;if(!c.lock)return;
@@ -4751,6 +4754,8 @@ static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
         if(!root->getProperty("WEXDisplay13ScanoutFirst"))root->setProperty("WEXDisplay13ScanoutFirst",snapshot,sizeof(snapshot));
         uint32_t aux[14];IOLockLock(c.lock);for(unsigned d=0;d<7;++d){aux[d]=display13AUXRuns[d];aux[7+d]=display13AUXFailures[d];}IOLockUnlock(c.lock);
         root->setProperty("WEXDisplay13AUXRuns",aux,sizeof(aux));
+        uint32_t log[sizeof(display13AUXLog)/4];IOLockLock(c.lock);memcpy(log,display13AUXLog,sizeof(log));IOLockUnlock(c.lock);
+        root->setProperty("WEXDisplay13AUXLog",log,sizeof(log));
     }
     if(display13ScanoutShots<4) {
         uint64_t deadline;clock_interval_to_deadline(10U<<display13ScanoutShots,kSecondScale,&deadline);
@@ -7462,14 +7467,16 @@ uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,ui
 }
 // Read-only AUX transaction evidence (#78: "[AUX] ddi = 0 Time out" during the
 // first complete modeset). Counts every native AUX run per DDI and publishes
-// the channel and AUX power-well state, before and after, for each failure.
+// the channel, AUX power-well and panel power state, before and after, for
+// each failure, plus a ring of the last 16 requests with their headers.
 static uint32_t display13AUXRead(uint32_t reg) {
  auto map=display13FBPower.map;
  if(!map || map->getLength()!=0x1000000 || !map->getVirtualAddress())return 0xDEADBEEF;
  return *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+reg);
 }
-static void display13AUXPublish(const uint32_t (&record)[20]) {
+static void display13AUXPublish(const uint32_t (&record)[26]) {
  auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WEXDisplay13AUXLog",display13AUXLog,sizeof(display13AUXLog));
  root->setProperty("WEXDisplay13AUXFailure",const_cast<uint32_t *>(record),sizeof(record));
  if(!root->getProperty("WEXDisplay13AUXFailureFirst"))root->setProperty("WEXDisplay13AUXFailureFirst",const_cast<uint32_t *>(record),sizeof(record));
 }
@@ -7477,9 +7484,11 @@ uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,ui
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,true);
  const auto ddi=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : 7;
- uint32_t before[3] {};
+ uint32_t before[5] {};
+ const uint32_t header=packet && length>=4 ? packet[0] : 0;
  if(ready && ddi<7) {
   before[0]=display13AUXRead(0x64010+0x100*ddi);before[1]=display13AUXRead(0x45440);before[2]=display13AUXRead(0x45444);
+  before[3]=display13AUXRead(0xC7200);before[4]=display13AUXRead(0xC7204);
   if(display13AUXRuns[ddi]<UINT32_MAX)++display13AUXRuns[ddi];
  }
  IOLockUnlock(c.lock);if(!ready)return kIOReturnNotReady;
@@ -7490,13 +7499,19 @@ uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,ui
  const bool protectedCompletion=held && display13AUXReady(port,false,true);
  const bool complete=protectedCompletion && display13AUXReady(port,false);
  if(!protectedCompletion)adlnFault(c.bridge.state.faulted,__LINE__);
+ if(ddi<7) {
+  auto &head=display13AUXLog[0];auto *e=&display13AUXLog[1+8*(head%16)];
+  e[0]=++head;e[1]=ddi;e[2]=command;e[3]=length|(static_cast<uint32_t>(flag)<<16);
+  e[4]=header;e[5]=packet && length>=4 ? packet[0] : 0;e[6]=r;e[7]=display13AUXRead(0x64010+0x100*ddi);
+ }
  if(ddi<7 && (r || !complete)) {
   if(display13AUXFailures[ddi]<UINT32_MAX)++display13AUXFailures[ddi];
   const auto &lease=c.bridge.auxLease[ddi];
-  uint32_t record[20] {1,ddi,command,r,display13AUXRuns[ddi],display13AUXFailures[ddi],
+  uint32_t record[26] {2,ddi,command,r,display13AUXRuns[ddi],display13AUXFailures[ddi],
    held,protectedCompletion,complete,c.bridge.auxRefs[ddi],c.bridge.auxCommands[ddi],lease.domains,
    lease.owner==&c.bridge.state,c.bridge.state.faulted,before[0],before[1],before[2],
-   display13AUXRead(0x64010+0x100*ddi),display13AUXRead(0x45440),display13AUXRead(0x45444)};
+   display13AUXRead(0x64010+0x100*ddi),display13AUXRead(0x45440),display13AUXRead(0x45444),
+   header,length|(static_cast<uint32_t>(flag)<<16),before[3],before[4],display13AUXRead(0xC7200),display13AUXRead(0xC7204)};
   display13AUXPublish(record);
  }
  IOLockUnlock(c.lock);return r ? r : complete ? 0 : kIOReturnNotReady;
