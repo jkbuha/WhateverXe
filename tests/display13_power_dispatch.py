@@ -58,6 +58,8 @@ struct XE {
  bool quiesceDSIPath(IOService*,IOService*,OSObject*,bool=false){assert(false);return false;}
  bool restoreDisplay13Ports(IOService*){assert(!held);return portsReady;}
  static bool prepareDisplay13Wake(IOService*){return hardwareReady;}
+ // -wex-edp-blank (kern_xe.cpp): never taken here; covered by display13_edp_blank.
+ static bool display13EDPBlankPower(IOService*,uint32_t,uint32_t&){return false;}
  static void recordDSIClient(IOService*,unsigned,uint32_t,uint32_t){}
  bool ownedDisplay13Framebuffer(IOService*)const;
  bool finishDisplay13SystemWake(IOService*,bool=false);
