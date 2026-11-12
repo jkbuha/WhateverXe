@@ -14180,8 +14180,16 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
     display13EDPKeepPath==reinterpret_cast<uintptr_t>(path);
   }
   // A system sleep (Off) is the donor's: drop a display-sleep blank without
-  // touching registers, so the following wake is the donor's as well.
-  if(state==0 && owner) {B::forget(b);forgot=true;owner=false;}
+  // touching registers, so the following wake is the donor's as well. The
+  // blank recorded Doze at fb+0x4284 while pipe, transcoder and link kept
+  // running; hand the donor back its real state (Wake) so it runs the full
+  // Wake -> Off shutdown. Otherwise it only takes Doze -> Off, pipe A stays
+  // on, the engine stop refuses (DBUF Conflict) and a hibernation resume
+  // skips the shared restore.
+  if(state==0 && owner) {
+   B::forget(b);forgot=true;owner=false;
+   if(current==1){*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=B::Wake;current=B::Wake;}
+  }
   action=B::decide(eligible,owner,current,state,b.blanked);
   struct IO {
    uintptr_t base;
