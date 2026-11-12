@@ -15,6 +15,8 @@ base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
 base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',functions)
 base=base.replace('struct OSObject {','void *nativePortObject=nullptr;\nstruct OSObject {').replace('return size;','return this==nativePortObject?0x700:size;')
 base=base.replace('bool adlnWriterMappingBound()', 'void adlnFault(bool &fault,unsigned){fault=true;}\nbool adlnWriterMappingBound()')
+# The AUX evidence counters and BAR reader live outside the extracted wrappers.
+base=base.replace('bool adlnWriterMappingBound()', 'uint32_t display13AUXRuns[7],display13AUXFailures[7];\nuint32_t display13AUXRead(uint32_t r){auto m=display13FBPower.map;if(!m)return 0xDEADBEEFU;auto it=m->regs.find(r);return it==m->regs.end()?0xDEADBEEFU:it->second;}\nuint32_t display13AUXPublished[20];void display13AUXPublish(const uint32_t (&r)[20]){for(unsigned i=0;i<20;++i)display13AUXPublished[i]=r[i];}\nbool adlnWriterMappingBound()',1)
 header=(r/'WhateverXe/kern_xe.hpp').read_text()
 extra=header[header.index(' bool display13FBAUXHooksReady'):header.index(' mach_vm_address_t orgDisplay13TrainingPattern')]
 extra=extra.replace(' bool processDisplay13FramebufferAUX(KernelPatcher &,size_t,mach_vm_address_t,size_t);','').replace('mach_vm_address_t','uintptr_t')

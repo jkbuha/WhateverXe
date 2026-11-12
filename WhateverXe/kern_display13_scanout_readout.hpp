@@ -4,7 +4,8 @@
 // Read-only Display 13 pipe A scanout snapshot, published as a registry
 // record after primary-plane updates. It answers "running pipe, black panel":
 // DPT/GGTT mode (CHICKEN_MISC_2 bit 30), DP transport, PSR, the primary plane,
-// scaler, DDI buffer, PLL selection and pipe A interrupt state. Nothing is
+// scaler, DDI buffer, PLL selection, pipe A interrupt state and the DDI A AUX
+// channel with its power-well requests. Nothing is
 // written. Pipe-domain registers are read only while PW1 reports powered.
 namespace Display13ScanoutReadout {
 struct Reg {uint32_t reg;bool pipe;};
@@ -50,10 +51,16 @@ constexpr Reg regs[] {
     {0x68170,true},   // PS_WIN_POS_1_A
     {0x68174,true},   // PS_WIN_SZ_1_A
     {0x68180,true},   // PS_CTRL_1_A
+    {0x44404,true},   // DE_PIPE_A_IMR
+    {0x4440C,true},   // DE_PIPE_A_IER (bit 0: vblank delivered)
+    {0x45440,false},  // PWR_WELL_CTL_AUX1 (BIOS request)
+    {0x45444,false},  // PWR_WELL_CTL_AUX2 (driver request)
+    {0x64010,true},   // DDI_AUX_CTL_A
+    {0x64014,true},   // DDI_AUX_DATA_A_0
     {0x70040,true},   // PIPE_FRMCOUNT_A (second read, after Settle)
 };
 constexpr unsigned Count=sizeof(regs)/sizeof(regs[0]),Header=4,Size=Header+Count;
-constexpr uint32_t Version=1,Unread=0xDEADBEEF,SettleUs=20000;
+constexpr uint32_t Version=2,Unread=0xDEADBEEF,SettleUs=20000;
 // record: {version, sequence, flags (bit0 PW1 powered), register count, values...}.
 // delay(us) runs once before the final frame-counter read.
 template<class Read,class Delay> void capture(Read read,Delay delay,uint32_t sequence,uint32_t (&record)[Size]) {

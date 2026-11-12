@@ -4,7 +4,8 @@
 #include <vector>
 int main() {
     using namespace Display13ScanoutReadout;
-    static_assert(Count==41 && Size==45,"published layout");
+    static_assert(Count==47 && Size==51,"published layout");
+    assert(regs[40].reg==0x44404 && regs[41].reg==0x4440C && regs[44].reg==0x64010 && !regs[42].pipe && !regs[43].pipe);
     assert(regs[2].reg==0x42084 && !regs[2].pipe);
     assert(regs[Count-1].reg==0x70040 && regs[25].reg==0x70040);
     // Every register is dword aligned inside the 16 MiB BAR.
