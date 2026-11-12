@@ -6185,11 +6185,29 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	return swRouted;
 }
 
+// -wex-no-edp-hpd: keep the internal eDP panel's HPD-A masked, as the DSI
+// route already does. On the XPS 17 9720 (ADL-H 46A6) the panel raises one
+// PCH HPD-A interrupt ~35 ms after link training and the machine hard-freezes
+// right after; with the bit never unmasked it runs normally. The panel is
+// fixed, so no hotplug on Combo A is lost.
+static bool display13NoEdpHPD(const Display13OutputWiring &w) {
+	static int cached=-1;
+	if(cached<0)cached=checkKernelArgument("-wex-no-edp-hpd") && (w.panel&1) ? 1 : 0;
+	return cached==1;
+}
+static uint32_t display13HotplugPorts(const Display13OutputWiring &w) {
+	const auto ports=w.hotplug();
+	return display13NoEdpHPD(w) ? (ports&~1U) : ports;
+}
+static uint32_t display13ExcludedHotplug(const void *platform,uint32_t bytes,const Display13OutputWiring &w) {
+	const auto excluded=Display13FBTopology::excludedHotplug(platform,bytes,w);
+	return display13NoEdpHPD(w) ? (excluded|(1U<<16)) : excluded;
+}
 IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	if(!callbackXE->display13FBIRQReady || !adlnIRQOwner(controller))return kIOReturnNotReady;
 	auto &c=display13FBIRQ;uint64_t record[32] {},check[42] {3};Display13FBIRQIO io {c.base};
 	const auto excluded=controller==callbackXE->adlnTopologyController ?
-		Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
+		display13ExcludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
 	const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
 	// Preserve enable evidence even when start rejects its unpublished
 	// controller. Inspect only pipe banks already qualified as powered.
@@ -6216,7 +6234,7 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 		const auto actual=Display13FBIRQ::readActivePipes(io,admitted,c.state.transcoders);
 		c.status=c.quiescing ? Display13FBIRQ::Status::Power : actual.status;
 		if(c.status==Display13FBIRQ::Status::Complete)c.status=c.state.begun && c.state.enabled ?
-			Display13FBIRQ::extendActivePipes(io,c.state,admitted) : Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),actual.active,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+			Display13FBIRQ::extendActivePipes(io,c.state,admitted) : Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),actual.active,display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
 	} else if(c.quiescing)c.status=Display13FBIRQ::Status::Power;
 	else if(c.state.begun && !c.state.faulted && !(c.state.enabled && c.state.active) &&
 		!Display13Transcoder::running(io,0,c.state.transcoders)) {
@@ -6233,7 +6251,7 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 		const auto parked=c.state.enabled ? Display13FBIRQ::disable(io,c.state) : Display13FBIRQ::Status::Complete;
 		if(parked==Display13FBIRQ::Status::Complete)c.state.active=0;
 		c.status=parked==Display13FBIRQ::Status::Complete ? Display13FBIRQ::Status::Power : parked;
-	} else c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+	} else c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
 	adlnIRQCache(controller,io);adlnIRQRecord(record,1);
 	check[23]=static_cast<uint32_t>(c.status);check[24]=c.state.begun;
 	check[25]=c.state.enabled;check[26]=c.state.faulted;check[27]=c.state.active;check[28]=c.state.configured;
@@ -6295,9 +6313,9 @@ bool XE::display13FBRearmParked(IOService *controller) {
 			if(c.status==Display13FBIRQ::Status::Complete)c.powerLost=false;
 		} else {
 			const auto excluded=controller==callbackXE->adlnTopologyController ?
-				Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
+				display13ExcludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
 			c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),multi ? actual.active : 1U,
-				callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+				display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
 		}
 		attempted=true;done=c.status==Display13FBIRQ::Status::Complete;
 		++attempts;if(done)++completes;
@@ -6389,8 +6407,8 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		if(!Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && c.state.begun && (!c.state.enabled || !c.state.active) && !c.state.faulted &&
 			Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),pipe) && Display13Transcoder::running(io,pipe,c.state.transcoders)) {
 			const auto excluded=controller==callbackXE->adlnTopologyController ?
-				Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
-			c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+				display13ExcludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
+			c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
 		}
 		if(!c.state.faulted)c.status=Display13FBIRQ::vblank(io,c.state,pipe,enabled);
 	}
