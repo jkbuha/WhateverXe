@@ -495,6 +495,11 @@ private:
 	mach_vm_address_t orgDisplay13FBIRQ[5] {};
 	mach_vm_address_t orgDisplay13FBSWIRQ {};
 	mach_vm_address_t orgDisplay13FBValidate {},orgDisplay13FBPerformFlip {};
+	mach_vm_address_t orgDisplay13PlaneConfigure {},orgDisplay13PlaneUpdate {},orgDisplay13FBArmUpdate {},orgDisplay13FBSetTransactionIRQ {};
+	static void wrapDisplay13PlaneConfigure(void *plane,void *args);
+	static void wrapDisplay13PlaneUpdate(void *plane,bool arg);
+	static void wrapDisplay13FBArmUpdate(IOService *framebuffer);
+	static void wrapDisplay13FBSetTransactionIRQ(IOService *controller,bool enable,IOService *framebuffer,uint32_t bits);
 	__attribute__((noinline)) bool processDisplay13FramebufferFlipProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 	static IOReturn wrapDisplay13FBValidate(IOService *framebuffer,void *transaction,uint64_t options);
 	static IOReturn wrapDisplay13FBPerformFlip(IOService *framebuffer,void *transaction,uint64_t options,void *params);

@@ -4753,6 +4753,15 @@ static uint32_t display13VBLLast[16],display13VBLFirstRefusal[16],display13VBLCa
 static uint32_t display13VBLByPipe[3*2];  // {enable calls, refused} per pipe
 // Flip submission probe records; layout documented at wrapDisplay13FBPerformFlip.
 static uint32_t display13FlipLast[24],display13FlipFirst[24],display13FlipFirstFailure[24];
+// Raw first 0x60 bytes of FlipTransactionParams (byte 0 = plane count, plane
+// entries of 0x58 from +8) at the latest and first flip, and stage counters:
+// {version, configurePlane calls, updatePlane calls, updatePlane last arg,
+//  armUpdate calls, hwSetInterruptForTransaction calls, last enable, last bits,
+//  enable=true calls, PLANE_SURF_1_A after configurePlane, after updatePlane,
+//  after armUpdate, stage calls made inside PerformFlip, last configurePlane
+//  plane count byte, hwSetInterruptForTransaction ctrl+0xE14[0] after, reserved}
+static uint32_t display13FlipParams[24],display13FlipParamsFirst[24],display13FlipStages[16];
+static volatile uint32_t display13FlipDepth;
 static uint32_t display13ScanoutShots;
 static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
     auto &c=display13FBPower;if(!c.lock)return;
@@ -4779,6 +4788,9 @@ static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
         root->setProperty("WEXDisplay13Flip",flip,sizeof(flip));
         if(display13FlipFirst[0]) {memcpy(flip,display13FlipFirst,sizeof(flip));root->setProperty("WEXDisplay13FlipFirst",flip,sizeof(flip));}
         if(display13FlipFirstFailure[0]) {memcpy(flip,display13FlipFirstFailure,sizeof(flip));root->setProperty("WEXDisplay13FlipFirstFailure",flip,sizeof(flip));}
+        memcpy(flip,display13FlipParams,sizeof(flip));root->setProperty("WEXDisplay13FlipParams",flip,sizeof(flip));
+        memcpy(flip,display13FlipParamsFirst,sizeof(flip));root->setProperty("WEXDisplay13FlipParamsFirst",flip,sizeof(flip));
+        uint32_t stages[16];memcpy(stages,display13FlipStages,sizeof(stages));root->setProperty("WEXDisplay13FlipStages",stages,sizeof(stages));
     }
     if(display13ScanoutShots<4) {
         uint64_t deadline;clock_interval_to_deadline(10U<<display13ScanoutShots,kSecondScale,&deadline);
@@ -6377,7 +6389,13 @@ IOReturn XE::wrapDisplay13FBPerformFlip(IOService *fb,void *transaction,uint64_t
 	auto &r=display13FlipLast;
 	const auto pipe=display13FlipPipe(fb);
 	const auto maskBefore=display13FlipMask(fb,pipe),surfBefore=display13FlipPlaneA(0x7019C);
+	if(params) {
+		memcpy(display13FlipParams,params,sizeof(display13FlipParams));
+		if(!display13FlipParamsFirst[0] && !display13FlipFirst[0])memcpy(display13FlipParamsFirst,params,sizeof(display13FlipParamsFirst));
+	}
+	__atomic_fetch_add(&display13FlipDepth,1U,__ATOMIC_RELAXED);
 	const auto ret=FunctionCast(wrapDisplay13FBPerformFlip,callbackXE->orgDisplay13FBPerformFlip)(fb,transaction,options,params);
+	__atomic_fetch_sub(&display13FlipDepth,1U,__ATOMIC_RELAXED);
 	const auto surfAfter=display13FlipPlaneA(0x7019C);
 	r[0]=1;++r[6];r[7]=static_cast<uint32_t>(ret);
 	r[10]=static_cast<uint32_t>(options);r[11]=static_cast<uint32_t>(options>>32);r[12]=pipe;
@@ -6390,6 +6408,27 @@ IOReturn XE::wrapDisplay13FBPerformFlip(IOService *fb,void *transaction,uint64_t
 	if(ret!=kIOReturnSuccess) {if(!r[8]) {r[9]=static_cast<uint32_t>(ret);memcpy(display13FlipFirstFailure,r,sizeof(r));}++r[8];}
 	if(!display13FlipFirst[0])memcpy(display13FlipFirst,r,sizeof(r));
 	return ret;
+}
+void XE::wrapDisplay13PlaneConfigure(void *plane,void *args) {
+	auto &r=display13FlipStages;r[0]=1;++r[1];if(display13FlipDepth)++r[12];
+	r[13]=args ? *reinterpret_cast<uint8_t *>(args) : 0xFF;
+	FunctionCast(wrapDisplay13PlaneConfigure,callbackXE->orgDisplay13PlaneConfigure)(plane,args);
+	r[9]=display13FlipPlaneA(0x7019C);
+}
+void XE::wrapDisplay13PlaneUpdate(void *plane,bool arg) {
+	auto &r=display13FlipStages;r[0]=1;++r[2];r[3]=arg;if(display13FlipDepth)++r[12];
+	FunctionCast(wrapDisplay13PlaneUpdate,callbackXE->orgDisplay13PlaneUpdate)(plane,arg);
+	r[10]=display13FlipPlaneA(0x7019C);
+}
+void XE::wrapDisplay13FBArmUpdate(IOService *fb) {
+	auto &r=display13FlipStages;r[0]=1;++r[4];if(display13FlipDepth)++r[12];
+	FunctionCast(wrapDisplay13FBArmUpdate,callbackXE->orgDisplay13FBArmUpdate)(fb);
+	r[11]=display13FlipPlaneA(0x7019C);
+}
+void XE::wrapDisplay13FBSetTransactionIRQ(IOService *controller,bool enable,IOService *fb,uint32_t bits) {
+	auto &r=display13FlipStages;r[0]=1;++r[5];r[6]=enable;r[7]=bits;if(enable)++r[8];if(display13FlipDepth)++r[12];
+	FunctionCast(wrapDisplay13FBSetTransactionIRQ,callbackXE->orgDisplay13FBSetTransactionIRQ)(controller,enable,fb,bits);
+	r[14]=controller==__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE) ? *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xE14) : 0xDEADBEEF;
 }
 bool XE::processDisplay13FramebufferFlipProbe(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
 	static const char *symbols[] {
@@ -6406,9 +6445,25 @@ bool XE::processDisplay13FramebufferFlipProbe(KernelPatcher &patcher,size_t inde
 		known=known && fn==address+offsets[i] && !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
 	}
 	if(!known)return false;
+	static const char *stageSymbols[] {
+		"__ZN15AppleIntelPlane14configurePlaneEP19FlipTransactionArgs",
+		"__ZN15AppleIntelPlane11updatePlaneEb",
+		"__ZN21AppleIntelFramebuffer9armUpdateEv",
+		"__ZN31AppleIntelFramebufferController28hwSetInterruptForTransactionEbP21AppleIntelFramebufferj",
+	};
+	static const uintptr_t stageOffsets[] {0x2198,0x1B68,0x38C70,0x728FC};
+	for(unsigned i=0;i<4;++i) {
+		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,stageSymbols[i],address,size);patcher.clearError();
+		known=known && fn==address+stageOffsets[i] && !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
+	}
+	if(!known)return false;
 	KernelPatcher::RouteRequest routes[] {
 		{symbols[0],wrapDisplay13FBValidate,orgDisplay13FBValidate},
 		{symbols[1],wrapDisplay13FBPerformFlip,orgDisplay13FBPerformFlip},
+		{stageSymbols[0],wrapDisplay13PlaneConfigure,orgDisplay13PlaneConfigure},
+		{stageSymbols[1],wrapDisplay13PlaneUpdate,orgDisplay13PlaneUpdate},
+		{stageSymbols[2],wrapDisplay13FBArmUpdate,orgDisplay13FBArmUpdate},
+		{stageSymbols[3],wrapDisplay13FBSetTransactionIRQ,orgDisplay13FBSetTransactionIRQ},
 	};
 	const bool routed=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
 	patcher.clearError();return routed;
