@@ -209,15 +209,22 @@ void blankScenarios() {
   assert(!(mmio(B::CurCtl)&B::CursorMode) && mmio(B::PlaneSurf)==0x00200000U && mmio(B::CurBase)==0x01230000U);
   {const auto r=blankRecord();assert(r[1]==1 && r[2]==2 && r[3]==1 && r[4]==unsigned(B::Action::Blank) && r[5]==1 && r[6]==0 && r[7]==livePlane && r[8]==liveCursor && r[9]==0 && r[10]==2);}
   assert(display13EDPBlankState.fb==reinterpret_cast<uintptr_t>(f.fb));
-  // Doze -> Off while dark changes nothing but the recorded state.
-  assert(power(f,0) && powerOf(f)==0 && display13EDPBlankState.blanks==1 && !(mmio(B::PlaneCtl)&B::PlaneEnable));
-  // Wake: the enables come back, no donor transition.
-  assert(power(f,2) && result==kIOReturnSuccess && powerOf(f)==2);
-  assert(mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
-  {const auto r=blankRecord();assert(r[1]==2 && r[2]==0 && r[4]==unsigned(B::Action::Unblank) && r[6]==1 && r[10]==3 && !display13EDPBlankState.fb);}
-  // Awake again: nothing to do, still not the donor's.
-  assert(power(f,2) && powerOf(f)==2 && display13EDPBlankState.blanks==1 && display13EDPBlankState.unblanks==1);
-  assert(blankRecord()[4]==unsigned(B::Action::Keep));
+  // Doze -> Off is a system sleep (S3/hibernation): the blank is released
+  // without a register write and the donor runs its own Off transition.
+  assert(!power(f,0) && powerOf(f)==1 && !display13EDPBlankState.blanked && !display13EDPBlankState.fb);
+  assert(display13EDPBlankState.blanks==1 && display13EDPBlankState.forgets==1 && display13EDPBlankState.unblanks==0);
+  assert(!(mmio(B::PlaneCtl)&B::PlaneEnable) && mmio(B::CurCtl)==(liveCursor&~B::CursorMode));
+  {const auto r=blankRecord();assert(r[1]==0 && r[4]==unsigned(B::Action::Native) && r[9]==1);}
+  // The wake after a system sleep is the donor's own wake: nothing restored here.
+  assert(!power(f,2) && display13EDPBlankState.unblanks==0 && !display13EDPBlankState.blanked);
+  assert(blankRecord()[4]==unsigned(B::Action::Native));
+  assert(!locked && objectRefs.empty());++scenarios;}
+  // Display sleep and wake (Doze -> Wake) still never reach the donor.
+  {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(power(f,1) && result==kIOReturnSuccess && powerOf(f)==1 && !(mmio(B::PlaneCtl)&B::PlaneEnable));
+  assert(power(f,2) && result==kIOReturnSuccess && powerOf(f)==2 && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor);
+  {const auto r=blankRecord();assert(r[1]==2 && r[2]==1 && r[4]==unsigned(B::Action::Unblank) && r[6]==1 && r[10]==3);}
+  assert(power(f,2) && powerOf(f)==2 && blankRecord()[4]==unsigned(B::Action::Keep));
   assert(!locked && objectRefs.empty());++scenarios;}
  // A donor reprogramming of the plane while dark survives the wake.
  {Fixture f(0,0,0);Map map;blankPrepare(f,map);

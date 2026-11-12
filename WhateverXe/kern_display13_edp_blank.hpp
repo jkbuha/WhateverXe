@@ -35,6 +35,11 @@ inline Action decide(bool eligible,bool owner,uint32_t current,uint32_t requeste
     // Another framebuffer (an external display, an offline connector) never
     // touches the blanked panel: only the panel's own wake brings it back.
     if(blanked && !owner)return Action::Native;
+    // Off is a system sleep (S3, hibernation): the display hardware may lose
+    // power and the firmware relights the panel on resume. Never intercept it:
+    // the donor must run its own sleep preparation and, afterwards, its own
+    // wake. The caller releases any blank state first without a register write.
+    if(requested==0)return Action::Native;
     // The panel's own wake never leaves it dark, kept link or not.
     if(!eligible || requested>Wake || current>Wake)return blanked && requested==Wake ? Action::Unblank : Action::Native;
     if(requested<Wake)return blanked ? Action::Keep : Action::Blank;
