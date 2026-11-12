@@ -20,8 +20,12 @@ int main() {
     // Decisions (eligible, owner, current, requested, blanked).
     assert(decide(false,false,2,1,false)==Action::Native);
     assert(decide(true,false,2,1,false)==Action::Blank);
-    assert(decide(true,false,2,0,false)==Action::Blank);
-    assert(decide(true,true,1,0,true)==Action::Keep);
+    // Off is a system sleep (S3/hibernation): always the donor's, blanked or not.
+    assert(decide(true,false,2,0,false)==Action::Native);
+    assert(decide(true,true,1,0,true)==Action::Native);
+    assert(decide(true,false,1,0,false)==Action::Native);
+    // The wake after a native Off is the donor's own wake too.
+    assert(decide(true,false,0,2,false)==Action::Native);
     assert(decide(true,true,1,2,true)==Action::Unblank);
     assert(decide(true,true,0,2,true)==Action::Unblank);
     assert(decide(true,false,2,2,false)==Action::Keep);

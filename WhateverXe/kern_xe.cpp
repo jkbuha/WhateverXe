@@ -14055,6 +14055,9 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
    eligible=scanout && Display13FBMemory::field<uint32_t>(path,0x3644)==2 &&
     display13EDPKeepPath==reinterpret_cast<uintptr_t>(path);
   }
+  // A system sleep (Off) is the donor's: drop a display-sleep blank without
+  // touching registers, so the following wake is the donor's as well.
+  if(state==0 && owner) {B::forget(b);forgot=true;owner=false;}
   action=B::decide(eligible,owner,current,state,b.blanked);
   struct IO {
    uintptr_t base;
