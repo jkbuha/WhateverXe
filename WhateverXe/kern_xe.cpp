@@ -4739,6 +4739,18 @@ static uint32_t display13AUXRuns[7],display13AUXFailures[7];
 // Last 16 native AUX runs, any DDI: {sequence, ddi, command, length|flag<<16,
 // request header (packet[0]) before, packet[0] after, native result, DDI_AUX_CTL after}.
 static uint32_t display13AUXLog[1+16*8];
+// hwConfigureVBLInterrupt outcomes (#78: "Flip called without enabling VBL",
+// PLANE_SURF never written). Written under the native IRQ simple lock, so no
+// registry work there: the scanout timer publishes the copies.
+// {version, calls, pipe, enabled|getLock<<1|valid<<2|multiOutput<<3, quiescing,
+//  blockedPipes, admittedPipes, outcome, status, IER after, IMR after,
+//  rearmPending|stateEnabled<<1|stateActive<<2|stateFaulted<<3, refusals,
+//  vblanks[pipe], flips[pipe], interrupts}
+// outcome: 1 quiescing/blocked return, 2 multi-output not admitted return,
+// 3 vblank() applied, 4 invalid path/pipe (Topology fail), 5 bridge faulted
+// so vblank() was skipped.
+static uint32_t display13VBLLast[16],display13VBLFirstRefusal[16],display13VBLCalls,display13VBLRefusals;
+static uint32_t display13VBLByPipe[3*2];  // {enable calls, refused} per pipe
 static uint32_t display13ScanoutShots;
 static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
     auto &c=display13FBPower;if(!c.lock)return;
@@ -4756,6 +4768,11 @@ static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
         root->setProperty("WEXDisplay13AUXRuns",aux,sizeof(aux));
         uint32_t log[sizeof(display13AUXLog)/4];IOLockLock(c.lock);memcpy(log,display13AUXLog,sizeof(log));IOLockUnlock(c.lock);
         root->setProperty("WEXDisplay13AUXLog",log,sizeof(log));
+        uint32_t vbl[16],vblFirst[16],vblPipes[6];
+        memcpy(vbl,display13VBLLast,sizeof(vbl));memcpy(vblFirst,display13VBLFirstRefusal,sizeof(vblFirst));memcpy(vblPipes,display13VBLByPipe,sizeof(vblPipes));
+        root->setProperty("WEXDisplay13VBL",vbl,sizeof(vbl));
+        if(vblFirst[0])root->setProperty("WEXDisplay13VBLFirstRefusal",vblFirst,sizeof(vblFirst));
+        root->setProperty("WEXDisplay13VBLByPipe",vblPipes,sizeof(vblPipes));
     }
     if(display13ScanoutShots<4) {
         uint64_t deadline;clock_interval_to_deadline(10U<<display13ScanoutShots,kSecondScale,&deadline);
@@ -6214,8 +6231,21 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	const bool valid=display13FBAssociations(controller,0x1C20,fb,fb->getMetaClass()->getClassSize(),display13FBExpectedOwner(controller)) &&
 		path->getMetaClass()->getClassSize()>=0x3730;
 	const auto pipe=valid ? Display13FBMemory::field<uint32_t>(path,0x3640) : 3;
+	// Read-only outcome record; see display13VBLLast.
+	auto vblNote=[&](uint32_t outcome) {
+		auto &r=display13VBLLast;const bool multi=Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring);
+		r[0]=1;r[1]=++display13VBLCalls;r[2]=pipe;r[3]=uint32_t(enabled)|uint32_t(getLock)<<1|uint32_t(valid)<<2|uint32_t(multi)<<3;
+		r[4]=c.quiescing;r[5]=c.blockedPipes;r[6]=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);r[7]=outcome;r[8]=static_cast<uint32_t>(c.status);
+		const bool readable=pipe<3 && Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),pipe);
+		r[9]=readable ? io.read(Display13FBIRQ::PipeIIR(pipe)+4) : 0xDEADBEEF;r[10]=readable ? io.read(Display13FBIRQ::PipeIIR(pipe)-4) : 0xDEADBEEF;
+		r[11]=uint32_t(c.rearmPending)|uint32_t(c.state.enabled)<<1|uint32_t(c.state.active)<<2|uint32_t(c.state.faulted)<<3;
+		const bool refused=enabled && outcome!=3;if(refused)++display13VBLRefusals;r[12]=display13VBLRefusals;
+		r[13]=pipe<3 ? static_cast<uint32_t>(c.state.vblanks[pipe]) : 0;r[14]=pipe<3 ? static_cast<uint32_t>(c.state.flips[pipe]) : 0;r[15]=static_cast<uint32_t>(c.state.interrupts);
+		if(pipe<3 && enabled) {++display13VBLByPipe[2*pipe];if(refused)++display13VBLByPipe[2*pipe+1];}
+		if(refused && !display13VBLFirstRefusal[0])memcpy(display13VBLFirstRefusal,r,sizeof(r));
+	};
 	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && (c.quiescing || (pipe<3 && (c.blockedPipes&(1U<<pipe))))) {
-		c.status=Display13FBIRQ::Status::Power;adlnIRQCache(controller,io);
+		c.status=Display13FBIRQ::Status::Power;adlnIRQCache(controller,io);vblNote(1);
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
 	}
 	if(valid && pipe<3 && !(c.blockedPipes&(1U<<pipe))) {
@@ -6242,7 +6272,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && !c.quiescing) {
 			const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
 			c.status=(admitted&(1U<<pipe)) ? Display13FBIRQ::extendActivePipes(io,c.state,admitted) : Display13FBIRQ::Status::Topology;
-			if(c.status!=Display13FBIRQ::Status::Complete) {adlnIRQCache(controller,io);if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;}
+			if(c.status!=Display13FBIRQ::Status::Complete) {adlnIRQCache(controller,io);vblNote(2);if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;}
 		}
 		// Native enablePipe enables PIPECONF before this VBL callback. Re-arm
 		// the full pipe bank only at that real activation boundary after idle HPD.
@@ -6253,8 +6283,9 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 			c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
 		}
 		if(!c.state.faulted)c.status=Display13FBIRQ::vblank(io,c.state,pipe,enabled);
+		vblNote(c.state.faulted ? 5 : 3);
 	}
-	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
+	else {c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);vblNote(4);}
 	adlnIRQCache(controller,io);
 	if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
 }
