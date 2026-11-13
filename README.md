@@ -86,6 +86,9 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P/U select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
 - If an Alder Lake-H/P/U / Raptor Lake-H/P/U internal panel goes dark when macOS takes over the boot screen, add `-wex-edp-keep` and set OpenCore `UEFI > Output > Resolution` to `Max`. WEX then keeps the panel link the firmware trained instead of training it again; a scaled resolution keeps that link and changes only the pipe scaler. For display sleep also add `-wex-edp-blank`: the panel stays powered and its link keeps running, and only scanning out stops, so the screen shows black (an OLED emits no light). Without it, disable display sleep. With it, system sleep blanks the panel the same way.
+- If waking the internal panel from display sleep hangs the whole machine (the native log ends with `Hotplug received on closable display`), also add `-wex-no-edp-hpd`: WEX keeps the internal panel's hot-plug interrupt masked so the spurious pulse after link training does not reach the framebuffer.
+- If the internal panel's port is rejected at boot even though the firmware lit it (the port is left in native mode 0), `-wex-panel-handoff` admits that port at the firmware hand-off. It applies only to the VBT panel DDI and only when the normal admission did not already accept it.
+- If an HDMI or DisplayPort output on a USB-C connector stays dark, check whether the connector is actually wired to a fixed DP/HDMI route rather than Type-C alt mode, and add `-wex-tcN-legacy` (N = 1-4, the Type-C port number) for that port.
 
 ### Optional: hibernation resume
 
