@@ -4401,10 +4401,14 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
     return ready;
 }
 
+void wexCanaryStart();
+namespace {static void display13AudioWakeEarly(IOPCIDevice *pci);} // defined in the later anonymous namespace
 void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	wexCanaryStart(); // -wex-canary diagnostic only
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+	if(xeProfile.mobileDisplay13())display13AudioWakeEarly(physicalGPU); // -wex-audio-wake only
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
@@ -4818,6 +4822,265 @@ static bool display13TCFIASerialize(void *target,void *,OSSerialize *serializer)
   for(unsigned f=0;f<2;++f) {
    const uint32_t fia=f?0x16E000:0x163000;const uint32_t off[]{0x880,0x890,0x894,0x8A0};
    for(unsigned i=0;i<4;++i)q[3+4*f+i]=*reinterpret_cast<volatile uint32_t *>(base+fia+off[i]);
+  }
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Read-only HDMI/DP audio diagnostic (XPS 17 9720). Counts Apple's native
+// display-audio entry points (pass-through wrappers, arguments untouched) and
+// reads the display-side audio registers on demand. WEXDisplay13Audio:
+// {version, reads, valid, enableCalls, enableLastRet, disableCalls, disableLastRet,
+//  supportCalls, supportTrue, propsCalls, bufDisableCalls,
+//  AUDIO_PIN_BUF_CTL 0x48414, AUD_PIN_ELD_CP_VLD 0x650C0, AUD_CHICKENBIT 0x65F10,
+//  AUD_FREQ_CNTRL 0x65900, PWR_WELL_CTL1 0x45400, PWR_WELL_CTL2 0x45404, PWR_WELL_CTL4 0x4540C,
+//  DC_STATE_EN 0x45504, AUD_CONFIG A..D 0x65000+0x100*t, AUD_CNTL_ST A..D 0x650B4+0x100*t}.
+// AUD_HDMIW_HDMIEDID (ELD FIFO) is never read: reading it advances the FIFO.
+namespace {
+volatile uint32_t d13AudEnableCalls,d13AudDisableCalls,d13AudSupportCalls,d13AudSupportTrue,d13AudPropsCalls,d13AudBufDisableCalls;
+volatile uint64_t d13AudEnableRet,d13AudDisableRet;
+mach_vm_address_t orgD13AudEnable,orgD13AudDisable,orgD13AudSupport,orgD13AudProps,orgD13AudBufDisable;
+uint64_t wrapD13AudEnable(void *c,void *fb,void *path) {
+ __atomic_add_fetch(&d13AudEnableCalls,1U,__ATOMIC_RELAXED);
+ const auto r=FunctionCast(wrapD13AudEnable,orgD13AudEnable)(c,fb,path);d13AudEnableRet=r;return r;
+}
+uint64_t wrapD13AudDisable(void *c,void *fb,void *path) {
+ __atomic_add_fetch(&d13AudDisableCalls,1U,__ATOMIC_RELAXED);
+ const auto r=FunctionCast(wrapD13AudDisable,orgD13AudDisable)(c,fb,path);d13AudDisableRet=r;return r;
+}
+bool wrapD13AudSupport(void *fb,uint8_t *edid) {
+ __atomic_add_fetch(&d13AudSupportCalls,1U,__ATOMIC_RELAXED);
+ const bool r=FunctionCast(wrapD13AudSupport,orgD13AudSupport)(fb,edid);
+ if(r)__atomic_add_fetch(&d13AudSupportTrue,1U,__ATOMIC_RELAXED);return r;
+}
+uint64_t wrapD13AudProps(void *fb) {
+ __atomic_add_fetch(&d13AudPropsCalls,1U,__ATOMIC_RELAXED);
+ return FunctionCast(wrapD13AudProps,orgD13AudProps)(fb);
+}
+uint64_t wrapD13AudBufDisable(void *c) {
+ __atomic_add_fetch(&d13AudBufDisableCalls,1U,__ATOMIC_RELAXED);
+ return FunctionCast(wrapD13AudBufDisable,orgD13AudBufDisable)(c);
+}
+} // namespace
+static bool display13AudioProbeInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ KernelPatcher::RouteRequest routes[] {
+  {"__ZN31AppleIntelFramebufferController13hwEnableAudioEP21AppleIntelFramebufferP21AppleIntelDisplayPath",wrapD13AudEnable,orgD13AudEnable},
+  {"__ZN31AppleIntelFramebufferController14hwDisableAudioEP21AppleIntelFramebufferP21AppleIntelDisplayPath",wrapD13AudDisable,orgD13AudDisable},
+  {"__ZN21AppleIntelFramebuffer23IsDisplayAudioSupportedEPh",wrapD13AudSupport,orgD13AudSupport},
+  {"__ZN21AppleIntelFramebuffer18setAudioPropertiesEv",wrapD13AudProps,orgD13AudProps},
+  {"__ZN31AppleIntelFramebufferController20hwDisableAudioBufferEv",wrapD13AudBufDisable,orgD13AudBufDisable}};
+ const bool ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioProbeReady",ready);
+ return ready;
+}
+static bool display13AudioSerialize(void *target,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[11+8+8] {1};volatile uint8_t *base=nullptr;
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ q[3]=d13AudEnableCalls;q[4]=static_cast<uint32_t>(d13AudEnableRet);q[5]=d13AudDisableCalls;q[6]=static_cast<uint32_t>(d13AudDisableRet);
+ q[7]=d13AudSupportCalls;q[8]=d13AudSupportTrue;q[9]=d13AudPropsCalls;q[10]=d13AudBufDisableCalls;
+ if(q[1]<4096 && display13TCReadable(target,base)) {
+  auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(base+r);};
+  static constexpr uint32_t regs[] {0x48414,0x650C0,0x65F10,0x65900,0x45400,0x45404,0x4540C,0x45504};
+  q[2]=1;for(unsigned i=0;i<8;++i)q[11+i]=rd(regs[i]);
+  for(unsigned t=0;t<4;++t) {q[19+t]=rd(0x65000+0x100*t);q[23+t]=rd(0x650B4+0x100*t);}
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// -wex-audio-wake (experimental, opt-in): drive the display codec-wake override
+// like i915's codec_wake_override(): HSW_AUD_CHICKENBIT 0x65F10 bit15 cleared,
+// 1 ms, set, 1 ms, so the iDisp codec answers the HDA controller's link reset.
+// The original value is restored 300 s later. Stage 4 = set early from
+// processKernel (BAR0 own mapping), 2 = set at FB start (fallback). Single register, read-modify-write.
+// WEXDisplay13AudioWake: {version, stage, before, afterSet, afterRestore, setNs, restoreNs}.
+namespace {
+volatile uint8_t *d13AudWakeBase;uint32_t d13AudWakeOrig;uint64_t d13AudWakeRec[7] {1};uint32_t d13AudFreqRec[2] {};
+thread_call_t d13AudWakeRestoreCall;
+void d13AudWakePublish(){IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioWake",d13AudWakeRec,sizeof(d13AudWakeRec));}
+void d13AudWakeRestore(thread_call_param_t,thread_call_param_t) {
+ if(!d13AudWakeBase)return;
+ auto reg=reinterpret_cast<volatile uint32_t *>(d13AudWakeBase+0x65F10);
+ *reg=(*reg&~(1U<<15))|(d13AudWakeOrig&(1U<<15));
+ d13AudWakeRec[1]=3;d13AudWakeRec[4]=*reg;uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&d13AudWakeRec[6]);
+ d13AudWakePublish();
+}
+} // namespace
+static void display13AudioWakeAt(volatile uint8_t *base,uint64_t stageSet);
+// -wex-hda-verbtest (diagnostic, opt-in): right after the early codec wake and
+// before AppleHDA owns the controller, send ONE read-only verb through the HDA
+// immediate-command interface: GET_PARAMETER(VENDOR_ID) to codec 2, NID 0.
+// Only runs if the command rings are stopped (CORB/RIRB DMA off), so it can't
+// collide with a running driver. If the controller is in reset, CRST is set
+// first (AppleHDA resets it again when it attaches).
+// WEXHDAVerbTest: {version, stage, GCTL before, STATESTS, CORBCTL|RIRBCTL<<8,
+//  ICIS before, ICIS after, response (ICII), pollIterations, ns,
+//  v2: PCICMD|PMCSR<<16 before, after D0/memory enable,
+//  v3: GCTL after the link reset cycle; STATESTS (slot 3) is now read after the reset,
+//  v4: ppOffset|PPCTL<<32 before, PPCTL after (-wex-hda-noproc)}
+static uint64_t hdaVerbRec[15] {4};
+namespace {IOPCIDevice *wexFindHDA();}
+static void wexHDAVerbTest() {
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAVerbTest",hdaVerbRec,sizeof(hdaVerbRec));};
+ if(!checkKernelArgument("-wex-hda-verbtest"))return;
+ auto pci=wexFindHDA();if(!pci) {hdaVerbRec[1]=1;publish();return;}
+ // The controller is still in D3 / memory decode off until its driver attaches
+ // (BAR reads 0xFFFFFFFF). Do what any driver does at attach: D0 + memory enable.
+ {
+  uint8_t pm=0;const auto pmOff=pci->findPCICapability(kIOPCIPowerManagementCapability,&pm);
+  const uint16_t cmd=pci->configRead16(0x04);
+  const uint16_t pmcsr=pmOff ? pci->configRead16(pmOff+4) : 0xFFFF;
+  hdaVerbRec[10]=cmd|(static_cast<uint64_t>(pmcsr)<<16);
+  if(pmOff && (pmcsr&3)) {pci->configWrite16(pmOff+4,pmcsr&~3);IOSleep(10);}
+  if(!(cmd&2))pci->setMemoryEnable(true);
+  hdaVerbRec[11]=pci->configRead16(0x04)|(static_cast<uint64_t>(pmOff ? pci->configRead16(pmOff+4) : 0xFFFF)<<16);
+ }
+ auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+ if(!map || map->getLength()<0x100 || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);pci->release();hdaVerbRec[1]=2;publish();return;}
+ auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+ auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+ auto r16=[&](uint32_t o){return static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t *>(b+o));};
+ auto w32=[&](uint32_t o,uint32_t v){*reinterpret_cast<volatile uint32_t *>(b+o)=v;};
+ auto w16=[&](uint32_t o,uint16_t v){*reinterpret_cast<volatile uint16_t *>(b+o)=v;};
+ hdaVerbRec[2]=r32(0x08);hdaVerbRec[3]=r16(0x0E);hdaVerbRec[4]=b[0x4C]|(static_cast<uint32_t>(b[0x5C])<<8);hdaVerbRec[5]=r16(0x68);
+ if((b[0x4C]&2) || (b[0x5C]&2)) {hdaVerbRec[1]=3;publish();map->release();pci->release();return;} // rings running: never interfere
+ // -wex-hda-noproc: leave DSP "processing pipe" mode before the reset, so the
+ // controller runs as a plain HDA controller (PPCTL.GPROCEN bit30 = 0), as the
+ // legacy Linux HDA path does. Walk the capability chain for PP (id 3).
+ if(checkKernelArgument("-wex-hda-noproc")) {
+  uint32_t off=r32(0x14)&0xFFFF;unsigned guard=0;
+  while(off && off<0x3F00 && guard++<10) {
+   const auto hdr=r32(off);
+   if(((hdr>>16)&0xFFF)==3) {
+    const auto pp=r32(off+4);hdaVerbRec[13]=off|(static_cast<uint64_t>(pp)<<32);
+    if(pp&(1U<<30)) {w32(off+4,pp&~(1U<<30));IODelay(100);}
+    hdaVerbRec[14]=r32(off+4);break;
+   }
+   const auto next=hdr&0xFFFF;if(next==off)break;off=next;
+  }
+ }
+ // v3: full link reset like a driver's attach, so the woken iDisp codec
+ // announces itself (STATESTS) before the verb: CRST 0 -> 1, then >= 521 us.
+ w16(0x0E,0xFFFF); // clear stale STATESTS (RW1C)
+ w32(0x08,r32(0x08)&~1U);
+ for(unsigned i=0;i<100 && (r32(0x08)&1);++i)IODelay(10);
+ IODelay(100);
+ w32(0x08,r32(0x08)|1U);
+ for(unsigned i=0;i<100 && !(r32(0x08)&1);++i)IODelay(10);
+ IODelay(1000);
+ hdaVerbRec[3]=r16(0x0E);hdaVerbRec[12]=r32(0x08);
+ if(!(hdaVerbRec[12]&1)) {hdaVerbRec[1]=4;publish();map->release();pci->release();return;}
+ // Wait for a free immediate-command slot, clear IRV (RW1C), issue the verb.
+ unsigned n=0;while((r16(0x68)&1) && n<1000) {IODelay(1);++n;}
+ if(r16(0x68)&1) {hdaVerbRec[1]=5;publish();map->release();pci->release();return;}
+ w16(0x68,2);
+ const uint32_t verb=(2U<<28)|(0U<<20)|(0xF00U<<8)|0x00U; // codec 2, NID 0, GET_PARAMETER VENDOR_ID
+ w32(0x60,verb);w16(0x68,1);
+ uint64_t t0;clock_get_uptime(&t0);
+ n=0;while(!(r16(0x68)&2) && n<2000) {IODelay(1);++n;}
+ hdaVerbRec[6]=r16(0x68);hdaVerbRec[7]=r32(0x64);hdaVerbRec[8]=n;
+ uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1-t0,&hdaVerbRec[9]);
+ hdaVerbRec[1]=(hdaVerbRec[6]&2) ? 10 : 6; // 10 = response received, 6 = timeout
+ if(hdaVerbRec[6]&2)w16(0x68,2);
+ publish();map->release();pci->release();
+}
+static IOMemoryMap *d13AudWakeEarlyMap;
+// Early variant: run from processKernel, long before the HDA controller probes
+// its link (AppleHDA via SimpleHDA attaches ~23 s into boot, the FB ~29 s).
+static void display13AudioWakeEarly(IOPCIDevice *pci) {
+ if(d13AudWakeBase || !pci || !checkKernelArgument("-wex-audio-wake"))return;
+ auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+ if(!map || map->getLength()<0x1000000 || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);d13AudWakeRec[1]=8;d13AudWakePublish();return;}
+ d13AudWakeEarlyMap=map; // retained for the restore
+ display13AudioWakeAt(reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress()),4);
+ wexHDAVerbTest();
+}
+static void display13AudioWake(void *target) {
+ volatile uint8_t *base=nullptr;
+ if(d13AudWakeBase || !checkKernelArgument("-wex-audio-wake") || !display13TCReadable(target,base))return;
+ display13AudioWakeAt(base,2);
+}
+static void display13AudioWakeAt(volatile uint8_t *base,uint64_t stageSet) {
+ // -wex-audio-freq: program AUD_FREQ_CNTRL (0x65900) to i915's Gen12 value
+ // AUD_FREQ_GEN12 = AUD_FREQ_8T(2<<2) | AUD_FREQ_PULLCLKS(0) | AUD_FREQ_BCLK_96M(1<<4) = 0x18
+ // before the codec wake, as i915_audio_component_get_power() does.
+ if(checkKernelArgument("-wex-audio-freq")) {
+  auto freq=reinterpret_cast<volatile uint32_t *>(base+0x65900);
+  d13AudFreqRec[0]=*freq;if(d13AudFreqRec[0]!=UINT32_MAX) {*freq=0x18;d13AudFreqRec[1]=*freq;}
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioFreq",d13AudFreqRec,sizeof(d13AudFreqRec));
+ }
+ auto reg=reinterpret_cast<volatile uint32_t *>(base+0x65F10);
+ d13AudWakeOrig=*reg;d13AudWakeRec[2]=d13AudWakeOrig;
+ if(d13AudWakeOrig==UINT32_MAX) {d13AudWakeRec[1]=9;d13AudWakePublish();return;}
+ d13AudWakeBase=base;
+ *reg=d13AudWakeOrig&~(1U<<15);IODelay(1000);
+ *reg=(*reg)|(1U<<15);IODelay(1000);
+ d13AudWakeRec[1]=stageSet;d13AudWakeRec[3]=*reg;uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&d13AudWakeRec[5]);
+ d13AudWakePublish();
+ d13AudWakeRestoreCall=thread_call_allocate(d13AudWakeRestore,nullptr);
+ uint64_t deadline;clock_interval_to_deadline(300,NSEC_PER_SEC,&deadline);
+ if(d13AudWakeRestoreCall)thread_call_enter_delayed(d13AudWakeRestoreCall,deadline);
+}
+// Read-only HDA controller readout (PCI class 0x0403 or 0x0401, e.g. 8086:51C8), for the
+// HDMI-audio bring-up. Never writes; reads only status/capability registers.
+// WEXHDAReadout: {version, reads, valid, vendorDevice, GCAP|VMIN<<16|VMAJ<<24, GCTL,
+//  WAKEEN|STATESTS<<16, INTCTL, LLCH, mlOffset, links, ppOffset, PPCTL,
+//  EM 0x1000..0x103C (16 words), then per link i<8: LCAP, LCTL, LOSIDV, LSDIID,
+//  v2: [61..72] CORBLBASE, CORBUBASE, CORBWP|CORBRP<<16, CORBCTL|STS|SIZE, RIRBLBASE, RIRBUBASE,
+//  RIRBWP|RINTCNT<<16, RIRBCTL|STS|SIZE, ICIS, SSYNC(0x18)?, INTSTS 0x24, WALCLK 0x30;
+//  [73..120] raw 0x500..0x53C, 0x800..0x83C, 0xC00..0xC3C}.
+namespace {
+IOMemoryMap *wexHDAMap;IOPCIDevice *wexHDADevice;
+IOPCIDevice *wexFindHDA() {
+ auto match=IOService::serviceMatching("IOPCIDevice");if(!match)return nullptr;
+ IOPCIDevice *found=nullptr;
+ if(auto it=IOService::getMatchingServices(match)) {
+  while(auto o=it->getNextObject()) {
+   auto pci=OSDynamicCast(IOPCIDevice,o);if(!pci)continue;
+   auto cc=OSDynamicCast(OSData,pci->getProperty("class-code"));auto vid=OSDynamicCast(OSData,pci->getProperty("vendor-id"));
+   if(cc && cc->getLength()>=4 && vid && vid->getLength()>=2) {
+    auto c=static_cast<const uint8_t *>(cc->getBytesNoCopy());auto v=static_cast<const uint8_t *>(vid->getBytesNoCopy());
+    // 0x0403 = classic HDA; 0x0401 = DSP-capable cAVS/ACE controllers (e.g. 51C8): BAR0 is still the HDA block.
+    if(c[2]==0x04 && (c[1]==0x03 || c[1]==0x01) && v[0]==0x86 && v[1]==0x80) {found=pci;found->retain();break;}
+   }
+  }
+  it->release();
+ }
+ match->release();return found;
+}
+} // namespace
+static bool wexHDASerialize(void *,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[13+16+32+12+48] {2};
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ if(q[1]<4096) {
+  if(!wexHDADevice)wexHDADevice=wexFindHDA();
+  if(wexHDADevice && !wexHDAMap)wexHDAMap=wexHDADevice->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+  if(wexHDAMap && wexHDAMap->getLength()>=0x2000 && wexHDAMap->getVirtualAddress()) {
+   auto b=reinterpret_cast<volatile uint8_t *>(wexHDAMap->getVirtualAddress());
+   auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+   auto r16=[&](uint32_t o){return static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t *>(b+o));};
+   q[2]=1;q[3]=wexHDADevice->configRead32(0);
+   q[4]=r16(0)|(static_cast<uint32_t>(b[2])<<16)|(static_cast<uint32_t>(b[3])<<24);q[5]=r32(0x08);q[6]=r16(0x0C)|(r16(0x0E)<<16);
+   q[7]=r32(0x20);q[8]=r32(0x14);
+   uint32_t off=q[8]&0xFFFF;unsigned guard=0;
+   while(off && off<0x2000-0x200 && guard++<10) {
+    const auto hdr=r32(off);const auto id=(hdr>>16)&0xFFF;
+    if(id==1 && !q[9]) {q[9]=off;}
+    if(id==3 && !q[11]) {q[11]=off;q[12]=r32(off+0x04);}
+    const auto next=hdr&0xFFFF;if(next==off)break;off=next;
+   }
+   for(unsigned i=0;i<16;++i)q[13+i]=r32(0x1000+4*i);
+   // v2: command-ring state (CORB/RIRB/immediate) and raw capability blocks.
+   q[61]=r32(0x40);q[62]=r32(0x44);q[63]=r16(0x48)|(r16(0x4A)<<16);q[64]=r32(0x4C);
+   q[65]=r32(0x50);q[66]=r32(0x54);q[67]=r16(0x58)|(r16(0x5A)<<16);q[68]=r32(0x5C);
+   q[69]=r32(0x68);q[70]=r32(0x18);q[71]=r32(0x24);q[72]=r32(0x30);
+   for(unsigned i=0;i<16;++i) {q[73+i]=r32(0x500+4*i);q[89+i]=r32(0x800+4*i);q[105+i]=r32(0xC00+4*i);}
+   if(q[9]) {
+    q[10]=(r32(q[9]+0x04)&0xF)+1; // MLCD: number of links - 1
+    for(unsigned l=0;l<8 && l<q[10];++l) {
+     const auto lb=q[9]+0x40+0x40*l;if(lb+0x10>=0x2000)break;
+     q[29+4*l]=r32(lb);q[30+4*l]=r32(lb+4);q[31+4*l]=r32(lb+8);q[32+4*l]=r32(lb+0xC);
+    }
+   }
   }
  }
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
@@ -5687,6 +5950,7 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
 	display13FBOutputHooksReady=processDisplay13FramebufferOutput(patcher,index,address,size);
     if(adlnOutputWiring.panel)processDisplay13Panel(patcher,index,address,size);
     display13FBTCHooksReady=processDisplay13FramebufferTC(patcher,index,address,size);
+    display13AudioProbeInstall(patcher,index,address,size); // read-only audio diagnostic
     if(!(adlnOutputWiring.selected()&0x78) && adlnOutputWiring.panel)processDisplay13Training(patcher,index,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCHooksReady",display13FBTCHooksReady);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBOutputHooksReady",display13FBOutputHooksReady);
@@ -8916,6 +9180,9 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   }
   if(auto tc=OSSerializer::forTarget(that,display13TCLiveSerialize)) {that->setProperty("WEXDisplay13TCLive",tc);tc->release();}
   if(auto fia=OSSerializer::forTarget(that,display13TCFIASerialize)) {that->setProperty("WEXDisplay13TCFIA",fia);fia->release();}
+  if(auto aud=OSSerializer::forTarget(that,display13AudioSerialize)) {that->setProperty("WEXDisplay13Audio",aud);aud->release();}
+  display13AudioWake(that);
+  if(auto hda=OSSerializer::forTarget(nullptr,wexHDASerialize)) {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAReadout",hda);hda->release();}
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);
 	return accepted;

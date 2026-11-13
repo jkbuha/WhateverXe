@@ -1,5 +1,10 @@
 {
   "-wex-panel-handoff": [],
+  "-wex-canary": [],
+  "-wex-audio-wake": [],
+  "-wex-audio-freq": [],
+  "-wex-hda-verbtest": [],
+  "-wex-hda-noproc": [],
   "-wex-dsi-audit": [],
   "-wex-dsi-60hz": [],
   "-wex-dsi-adopt": [],
