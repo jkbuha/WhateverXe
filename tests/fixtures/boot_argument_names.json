@@ -1,10 +1,5 @@
 {
   "-wex-panel-handoff": [],
-  "-wex-canary": [],
-  "-wex-audio-wake": [],
-  "-wex-audio-freq": [],
-  "-wex-hda-verbtest": [],
-  "-wex-hda-noproc": [],
   "-wex-dsi-audit": [],
   "-wex-dsi-60hz": [],
   "-wex-dsi-adopt": [],
@@ -149,8 +144,6 @@
     "-wxebeta"
   ],
   "-wex-noaccel": [],
-  "-wex-no-gva": [],
-  "-wex-no-gva-scaler": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
   "-wex-adlp-load-only": [],
