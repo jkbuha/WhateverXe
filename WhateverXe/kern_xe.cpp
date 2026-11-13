@@ -4768,6 +4768,50 @@ static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
 // Use the retained, uncached BAR owner. These GT mirrors require no forcewake,
 // mailbox transaction, MMIO write or native policy intervention.
 // Schema 1285 matches r285 slots; slot15 is the current RP_STATE_CAP mirror.
+// Read-only Type-C live readout (diagnostic, XPS 17 9720 external output):
+// computed on each registry read, never written. WEXDisplay13TCLive:
+// {version, reads, valid, wells 0x45404, AUX 0x45444, DDI 0x45454,
+//  SDEISR, SDEIMR, SDEIIR, SDEIER, SHOTPLUG_CTL_TC 0xC4034,
+//  DE_HPD ISR/IMR/IIR/IER 0x44470-0x4447C, TC_HOTPLUG_CTL 0x44038, TBT_HOTPLUG_CTL 0x44030,
+//  then per TC1..4 (DDI 3..6): TCSS_DDI_STATUS 0x161500+4*tc, DDI_BUF_CTL, port clock, TC PLL}.
+// WEXDisplay13TCFIA (FIA1 0x163000, FIA2 0x16E000): {version, reads, valid,
+//  per FIA: +0x880 pin assignment, +0x890 DFLEXDPPMS, +0x894 DFLEXDPCSSS, +0x8a0 DFLEXDPSP}.
+static bool display13TCReadable(void *target,volatile uint8_t *&base) {
+ auto &c=display13FBPower;auto service=static_cast<IOService *>(target);
+ if(!service || c.controller!=target || !c.map || c.map->getLength()!=0x1000000 || !c.map->getVirtualAddress())return false;
+ base=reinterpret_cast<volatile uint8_t *>(c.map->getVirtualAddress());
+ const auto wells=*reinterpret_cast<volatile uint32_t *>(base+0x45404);
+ return wells!=UINT32_MAX && (wells&3)==3;
+}
+static bool display13TCLiveSerialize(void *target,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[19+4*4] {1};volatile uint8_t *base=nullptr;
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ if(q[1]<4096 && display13TCReadable(target,base)) {
+  auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(base+r);};
+  static constexpr uint32_t regs[] {0x45404,0x45444,0x45454,0xC4000,0xC4004,0xC4008,0xC400C,0xC4034,
+   0x44470,0x44474,0x44478,0x4447C,0x44038,0x44030};
+  q[2]=1;for(unsigned i=0;i<14;++i)q[3+i]=rd(regs[i]);
+  for(unsigned tc=0;tc<4;++tc) {
+   Display13TC::Port port;Display13TC::Port::resolve(tc+3,port);
+   q[19+4*tc]=rd(port.ready);q[20+4*tc]=rd(port.buffer);q[21+4*tc]=rd(port.clock);q[22+4*tc]=rd(port.pll);
+  }
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static bool display13TCFIASerialize(void *target,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[3+2*4] {1};volatile uint8_t *base=nullptr;
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ if(q[1]<1024 && display13TCReadable(target,base)) {
+  q[2]=1;
+  for(unsigned f=0;f<2;++f) {
+   const uint32_t fia=f?0x16E000:0x163000;const uint32_t off[]{0x880,0x890,0x894,0x8A0};
+   for(unsigned i=0;i<4;++i)q[3+4*f+i]=*reinterpret_cast<volatile uint32_t *>(base+fia+off[i]);
+  }
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool adlnGTPowerSerialize(void *target,void *,OSSerialize *serializer) {
  static uint32_t reads=0;
  uint64_t q[16] {1285};auto &c=display13FBPower;
@@ -8859,6 +8903,8 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   if(auto power=OSSerializer::forTarget(that,adlnGTPowerSerialize)) {
    that->setProperty("N97GTPowerSample",power);power->release();
   }
+  if(auto tc=OSSerializer::forTarget(that,display13TCLiveSerialize)) {that->setProperty("WEXDisplay13TCLive",tc);tc->release();}
+  if(auto fia=OSSerializer::forTarget(that,display13TCFIASerialize)) {that->setProperty("WEXDisplay13TCFIA",fia);fia->release();}
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);
 	return accepted;
