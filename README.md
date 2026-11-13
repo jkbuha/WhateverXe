@@ -58,6 +58,8 @@ Graphics installs under `/Library` and rebuilds AuxKC without patching System fi
 
 ## Configuration
 
+For firmware that requests EDID-based panel selection, the optional iGPU Data property `xelp-panel-edid` accepts a validated 128-byte digital EDID base block (only the base block; its extension-count byte is ignored). It selects a unique matching modern VBT panel profile; it does not override an explicit profile, set display timings, or bypass display-state checks. A single internal eDP-A display can retain an enabled firmware common timing generator; its source state must remain unchanged during bootstrap. The native port can adopt that protected boot lease before software mode selection.
+
 ### Required boot arguments
 
 Add to OpenCore's `boot-args`:
@@ -83,6 +85,11 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Add `SSDT-PNLF` for internal-display brightness control.
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P/U select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
+
+### Optional: hibernation resume
+
+Experimental and opt-in. Add `-wex-resume-park` when firmware lights the internal eDP panel during a hibernation (`hibernatemode 25`) resume and the panel stays blank afterwards. WEX turns off only that firmware output before the display resume; other display configurations are left unchanged. Some firmware also needs an OpenCore `UEFI > ReservedMemory` entry for the hibernation image to restore. The internal panel keeps the mode the firmware programmed.
+
 
 ## Tested features and known issues
 

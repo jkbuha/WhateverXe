@@ -190,6 +190,30 @@ template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
         // Display13 DSC/joiner belongs to the corresponding pipe well.
         add(0x78000 + 0x200 * pipe);add(0x78004 + 0x200 * pipe);
     }
+    // Display13+ firmware may retain CMTG secondary mode on a single eDP A
+    // source. Observe its control only while the already-captured source,
+    // port clock and buffer remain enabled and unchanged. No CMTG programming
+    // occurs here; downstream admission requires the full source certificate.
+    // Linux intel_cmtg_sanitize requires the supplying port PLL to remain on.
+    if(r.status==ReadoutStatus::Complete && r.activePipes==1 && (r.poweredPipes&1)) {
+        const auto saved=[&](uint32_t offset,uint32_t &out) {
+            for(unsigned i=0;i<r.count;++i)if(r.registers[i].offset==offset) {
+                out=r.registers[i].value;return out!=UINT32_MAX;
+            }
+            return false;
+        };
+        uint32_t trans=0,secondary=0,clock=0,buffer=0;
+        if(saved(0x60400,trans) && saved(0x60404,secondary) &&
+           saved(0x46140,clock) && saved(0x64000,buffer) &&
+           secondary==8 && (trans&0xFF700000U)==0x8A000000U &&
+           (clock>>28)==1 && (buffer&0x80000000U) &&
+           io.read(0x45404)==power && io.read(0x60400)==trans &&
+           io.read(0x46140)==clock && io.read(0x64000)==buffer) {
+            add(0x6FA88); // CMTG A control; unchanged-source adoption NOT implied.
+            if(io.read(0x60400)!=trans || io.read(0x46140)!=clock || io.read(0x64000)!=buffer)
+                r.status=ReadoutStatus::PowerChanged;
+        }
+    }
     const auto after = add(0x45404);
     if (r.status == ReadoutStatus::Complete && after != power)
         r.status = ReadoutStatus::PowerChanged;
@@ -232,6 +256,13 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
        !value(boot,0x78004+pipe*0x200,dss2) || !value(boot,0x60030+bank,dm) ||
        !value(boot,0x60034+bank,dn) || !value(boot,0x60040+bank,lm) ||
        !value(boot,0x60044+bank,ln))return false;
+    // Preserve an already-running firmware CMTG secondary only for the
+    // single internal A source. Do not treat bit3 as reserved or clear it.
+    // Linux intel_cmtg_regs.h: ENABLE31, STATE23; other configurations require
+    // a separate contract. Native cache/enable writers preserve CTL2 verbatim.
+    uint32_t cmtg=0;
+    const bool secondary=ctl2==8 && panel && !pipe && !ddi && boot.activePipes==1 &&
+        value(boot,0x6FA88,cmtg) && cmtg==((1U<<31)|(1U<<23));
     const unsigned lanes=((trans>>1)&7)+1;
     // Linux v6.12 i915_reg.h: SST, normal training, scrambling, no FEC/MST,
     // port sync, HDCP, DSC or joined pipes. Enhanced framing may be on or off.
@@ -240,7 +271,7 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
     return (trans&0xFF700000U)==(0x82000000U|((ddi+1)<<27)) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && (!ctl2 || secondary) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&
@@ -276,6 +307,19 @@ template<class IO> bool dpSourceUnchanged(IO &io,const DisplayReadout &r,unsigne
         if(reg==Display13Power::AUX)expected|=addedAUXRequest;
         if(io.read(reg)!=expected)return false;
     }
+    uint32_t ctl2=0;
+    if(!value(r,0x60404+bank,ctl2))return false;
+    if(ctl2==8) {
+        // Deliberate sandwich: power-well state (0x45404) and the transcoder
+        // clock (0x46140) are read again after CMTG and the transcoder, so a
+        // change in either while CMTG was sampled refuses the capture.
+        uint32_t cmtg=0,power=0,clock=0,trans=0;
+        if(!value(r,0x6FA88,cmtg) || !value(r,0x45404,power) ||
+           !value(r,0x46140,clock) || !value(r,0x60400,trans) ||
+           !io.readable(0x6FA88) || io.read(0x45404)!=power ||
+           io.read(0x46140)!=clock || io.read(0x6FA88)!=cmtg ||
+           io.read(0x60400)!=trans || io.read(0x46140)!=clock || io.read(0x45404)!=power)return false;
+    }
     return true;
 }
 // The GOP is already driving DP. Keep its physical AUX domain on without
@@ -302,15 +346,24 @@ template<class IO> Display13Power::Result holdDPBootAUX(IO &io,const DisplayRead
 // The caller retains that object on success and then adopts the boot path.
 // No hardware request or native AUX transaction counter changes at handoff.
 template<class IO> Display13Power::Result adoptDPBootAUX(IO &io,const DisplayReadout &boot,
-    Display13Power::NativeBridge &bridge,Display13Power::MainLinkAUX &link,uintptr_t target,unsigned ddi,bool panel=false) {
+    Display13Power::NativeBridge &bridge,Display13Power::MainLinkAUX &link,uintptr_t target,unsigned ddi,bool panel=false,
+    uint32_t *refusal=nullptr) {
     using namespace Display13Power;Result r;
-    if(!target || ddi>=2 || boot.activePipes!=1 || !dpSource(boot,0,ddi,nullptr,panel) || !dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel) ||
-       bridge.bootPort!=ddi || bridge.bootAdopted || !bridge.bootPGProtected || !bridge.bootDDIProtected ||
-       !bridge.outputHeld(io,ddi,0) || !link.bootPending || link.owner || link.port!=ddi ||
-       link.lease.owner!=&bridge.state || link.lease.domains!=dependencies(auxDomain(ddi)) ||
-       !held(io,bridge.state,link.lease.domains))return r;
+    if(refusal)*refusal=0;
+    const auto fail=[&](uint32_t reason) {if(refusal)*refusal=reason;return r;};
+    // Preserve the original short-circuit order, including all IO. Optional
+    // refusal is a caller-owned CPU scalar, not another observation route.
+    if(!target || ddi>=2 || boot.activePipes!=1)return fail(1);
+    if(!dpSource(boot,0,ddi,nullptr,panel))return fail(2);
+    if(!dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel))return fail(3);
+    if(bridge.bootPort!=ddi || bridge.bootAdopted || !bridge.bootPGProtected || !bridge.bootDDIProtected)return fail(4);
+    if(!bridge.outputHeld(io,ddi,0))return fail(5);
+    if(!link.bootPending || link.owner || link.port!=ddi)return fail(6);
+    if(link.lease.owner!=&bridge.state || link.lease.domains!=dependencies(auxDomain(ddi)))return fail(7);
+    if(!held(io,bridge.state,link.lease.domains))return fail(8);
     link.owner=target;link.bootPending=false;r.status=Status::Complete;return r;
 }
+
 enum class LinearStatus : uint32_t {
     NotAdmitted, Ready, Success, NotSingleHDMI, NotLinearFHD, OtherPlaneActive,
     StateChanged, NoVblank, DisableTimeout, EnableTimeout, RollbackFailed, InvalidDPSource, InvalidTCSource

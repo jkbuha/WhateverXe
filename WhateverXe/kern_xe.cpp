@@ -23,6 +23,10 @@
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
+#include "kern_display13_resume_park.hpp"
+#include "kern_display13_scanout_readout.hpp"
+#include <kern/thread_call.h>
+#include <libkern/OSDebug.h>
 #include "kern_display13_boot.hpp"
 #include "kern_display13_dsi_trial.hpp"
 #include "kern_dsi_readout.hpp"
@@ -4726,6 +4730,34 @@ struct Display13FBPowerContext {
     uint64_t powerContext[24] {1}; // Bounded CPU-only execution-context evidence.
 };
 static Display13FBPowerContext display13FBPower;
+// Read-only view of IOWorkLoop's protected gate lock and work thread for the
+// busy-gate diagnostic below; never instantiated.
+struct Display13WorkLoopPeek : IOWorkLoop {
+    static IORecursiveLock *gate(const IOWorkLoop *w){return static_cast<const Display13WorkLoopPeek *>(w)->gateLock;}
+};
+// Read-only pipe A scanout snapshot for "running pipe, black panel" reports.
+// Independent of the watermark/IRQ paths: a thread call fires about 10, 20,
+// 40 and 80 s after the display BAR mapping is published. Only reads.
+static thread_call_t display13ScanoutCall;
+static uint32_t display13ScanoutShots;
+static void display13ScanoutSnapshot(thread_call_param_t,thread_call_param_t) {
+    auto &c=display13FBPower;if(!c.lock)return;
+    IOLockLock(c.lock);auto map=c.map;IOLockUnlock(c.lock);
+    if(map && map->getLength()==0x1000000 && map->getVirtualAddress()) {
+        const auto base=map->getVirtualAddress();uint32_t snapshot[Display13ScanoutReadout::Size] {};
+        Display13ScanoutReadout::capture([&](uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(base+reg);},
+            [](uint32_t us){IOSleep(us/1000);},++display13ScanoutShots,snapshot);
+        auto root=IORegistryEntry::getRegistryRoot();
+        root->setProperty("WEXDisplay13Scanout",snapshot,sizeof(snapshot));
+        char key[32];snprintf(key,sizeof(key),"WEXDisplay13Scanout%u",display13ScanoutShots);
+        root->setProperty(key,snapshot,sizeof(snapshot));
+        if(!root->getProperty("WEXDisplay13ScanoutFirst"))root->setProperty("WEXDisplay13ScanoutFirst",snapshot,sizeof(snapshot));
+    }
+    if(display13ScanoutShots<4) {
+        uint64_t deadline;clock_interval_to_deadline(10U<<display13ScanoutShots,kSecondScale,&deadline);
+        thread_call_enter_delayed(display13ScanoutCall,deadline);
+    }
+}
 #include "kern_dsi_adapter_state.inc"
 
 // AlderLakeN start bypasses the generic TGL framebuffer path and its power sampler.
@@ -4796,6 +4828,9 @@ struct Display13FBIRQContext {
 	IOService *controller {};
 	Display13FBIRQ::State state;
 	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {};uint32_t blockedPipes {};
+	// Set when native enableIRQ ran with no pipe running yet (display wake,
+	// hibernation resume park): the (re)arm is completed at that pipe's VBL enable.
+	bool rearmPending {};
 	uintptr_t softwareThread {};
 	Display13FBIRQ::HandlerScopes scopes;
 	volatile uint32_t admittedPipes {}; // Release-published after actual path/backing proof.
@@ -5039,6 +5074,19 @@ struct Display13FBBootIO : Display13FBPowerIO {
     bool readable(uint32_t r) const {
         return map && map->getVirtualAddress() && map->getLength()==0x1000000 && r<=0x1000000-4;
     }
+};
+// S4 resume park: exactly the pipe A / transcoder A / combo DDI registers that
+// Display13ResumePark::park writes. Reads are unrestricted within the BAR. A
+// register outside the list is not written and the park stops (Denied).
+struct Display13FBResumeParkIO : Display13FBBootIO {
+    explicit Display13FBResumeParkIO(IOMemoryMap *m):Display13FBBootIO{m} {}
+    bool write(uint32_t r,uint32_t v) {
+        static constexpr uint32_t allowed[] {0x70180,0x7019C,0x70008,0x68170,0x68174,0x68180,0x68270,0x68274,0x68280,
+            0x60404,0x60400,0x64000,0x64100,0x64200,0x60540,0x46140,0x7027C,0x7037C,0x7017C};
+        for(auto a:allowed)if(a==r) {*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;return true;}
+        return false;
+    }
+    void delay(){IODelay(100);}
 };
 struct Display13FBTCIO : Display13FBTCAuxIO {
     OSObject *object;Display13Power::Result linkResult;
@@ -6115,7 +6163,11 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	for(unsigned i=0;i<4;++i)check[19+i]=io.read(otherBanks[i]+4)&~io.read(otherBanks[i]-4);
     if(c.powerLost && !c.quiescing) {
         c.status=Display13FBIRQ::restoreAfterPowerLoss(io,c.state,c.admittedPipes);
-        if(c.status==Display13FBIRQ::Status::Complete)c.powerLost=false;
+        if(c.status==Display13FBIRQ::Status::Complete) {c.powerLost=false;c.rearmPending=false;}
+        else if(Display13FBIRQ::deferRearm(io,c.state))c.rearmPending=true;
+    } else if(!c.quiescing && !c.state.enabled && Display13FBIRQ::deferRearm(io,c.state)) {
+        // Display wake: no pipe runs yet. enable() would fault permanently.
+        c.status=Display13FBIRQ::Status::Topology;c.rearmPending=true;
     } else if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {
         const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
 		const auto actual=Display13FBIRQ::readActivePipes(io,admitted,c.state.transcoders);
@@ -6163,6 +6215,26 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
 	}
 	if(valid && pipe<3 && !(c.blockedPipes&(1U<<pipe))) {
+		// Native enableIRQ ran with no pipe running (display wake, hibernation
+		// resume park), so the restore/enable was deferred and both masters
+		// stayed off. Complete it at this real activation boundary, once the
+		// pipe is running: a power-loss restore, else a normal enable.
+		if(c.rearmPending && enabled && !c.quiescing && !c.state.faulted && (c.powerLost || !c.state.enabled) &&
+		   Display13FBIRQ::powered(io.read(Display13FBIRQ::Driver),pipe) && Display13Transcoder::running(io,pipe,c.state.transcoders)) {
+			const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
+			Display13FBIRQ::Status rearm;
+			if(c.powerLost)rearm=Display13FBIRQ::restoreAfterPowerLoss(io,c.state,admitted);
+			else {
+				const auto excluded=controller==callbackXE->adlnTopologyController ?
+					Display13FBTopology::excludedHotplug(callbackXE->adlnPlatform,sizeof(callbackXE->adlnPlatform),callbackXE->adlnOutputWiring) : 0;
+				const auto actual=Display13FBIRQ::readActivePipes(io,admitted,c.state.transcoders);
+				rearm=actual.status!=Display13FBIRQ::Status::Complete ? actual.status :
+					Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),
+						Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) ? actual.active : 1U,
+						callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+			}
+			if(rearm==Display13FBIRQ::Status::Complete) {c.powerLost=false;c.rearmPending=false;}
+		}
 		if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && !c.quiescing) {
 			const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
 			c.status=(admitted&(1U<<pipe)) ? Display13FBIRQ::extendActivePipes(io,c.state,admitted) : Display13FBIRQ::Status::Topology;
@@ -7634,8 +7706,27 @@ uint8_t *XE::display13SSTPort(void *port) {
  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
+ const auto ddi=config[0],mode=Display13FBMemory::field<uint32_t>(p,0x550);
+ const auto expected=ddi>=3?((s->adlnOutputWiring.typeC&(1U<<ddi))?3U:4U):1U;
+ if(mode!=expected) {
+    // A native port can still have its zero-initialized software mode when
+    // adopting the running firmware eDP A. Do not write a guessed mode or
+    // admit other mode0 ports: require the pending protected boot AUX lease,
+    // or the very same port already bound to that lease after path adoption.
+    if(mode || ddi || !(s->adlnOutputWiring.panel&1) || !s->firmwarePorts.panel.valid ||
+       s->firmwarePorts.panel.ddi || !c.bridge.begun || c.bridge.bootPort ||
+       c.bridge.state.faulted || c.bridge.state.suspended)return nullptr;
+    const auto &link=c.mainLink[0];
+    const bool pending=link.bootPending && !link.owner && !c.bridge.bootAdopted &&
+        c.bridge.bootPGProtected && c.bridge.bootDDIProtected;
+    const bool adopted=!link.bootPending && link.owner==reinterpret_cast<uintptr_t>(port) &&
+        c.bridge.bootAdopted && c.bridge.bootPath;
+    if((!pending && !adopted) || link.port || link.lease.owner!=&c.bridge.state ||
+       link.lease.domains!=Display13Power::dependencies(Display13Power::auxDomain(0)) ||
+       !c.bridge.state.refs[0] || !c.bridge.state.refs[8])return nullptr;
+ }
  return p;
 }
 
@@ -8469,7 +8560,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 	// Controller start can publish PCI-backed FB children before the controller
 	// itself becomes a registered service. Publish only copied CPU evidence at
 	// the root so a rejected handoff remains observable through SSH.
-	uint64_t check[38] {3,sourceBound,adlnIRQOwner(controller),irqSource!=nullptr};
+	uint64_t check[57] {4,sourceBound,adlnIRQOwner(controller),irqSource!=nullptr};
 	if(irqSource) {
 		check[4]=irqSource->getProvider()==pci;check[5]=irqSource->getIntIndex();
 		check[6]=irqSource->getWorkLoop()==workLoop;check[7]=irqSource->isEnabled();
@@ -8562,15 +8653,38 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                 const auto ddi=c.bridge.bootPort;
                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
                 bool linked=!dp;
-                if(dp && display13SSTPort(port)) {
+                const bool sst=dp && display13SSTPort(port);
+                check[38]=sst;
+                // Port lifetime/association was admitted above. Read only
+                // bounded scalar fields already used by the SST admission.
+                check[39]=port->getMetaClass()->getClassSize();
+                if(check[39]>=0x624) {
+                    check[40]=Display13FBMemory::field<uint8_t>(port,0x117);
+                    check[41]=Display13FBMemory::field<uint32_t>(port,0x550);
+                    check[42]=Display13FBMemory::field<void *>(port,0x578)==c.access;
+                }
+                check[43]=c.clockStopped | (uint64_t(c.panelFaulted)<<1);
+                if(ddi<2) {
+                    const auto &link=c.mainLink[ddi];check[44]=link.bootPending;check[45]=link.owner!=0;
+                    check[46]=link.port;check[47]=link.lease.owner==&c.bridge.state;check[48]=link.lease.domains;
+                }
+                check[49]=c.bridge.bootAdopted;
+                check[50]=adlnWriterMappingBound();
+                if(sst) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
+                    check[51]=static_cast<uint32_t>(boot.status);
+                    uint32_t cmtg=0,ctl2=0;check[52]=AlderLakeN::value(boot,0x6FA88,cmtg);check[53]=cmtg;
+                    check[54]=AlderLakeN::dpSource(boot,0,ddi,nullptr,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
+                    AlderLakeN::value(boot,0x60404,ctl2);check[56]=ctl2;
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
                         Display13FBTCIO tc{port,ddi-3};
                         linked=tc.owned(ddi) && tc.linkHeld() && boot.activePipes==1 &&
                             AlderLakeN::dpSourceUnchanged(io,boot,0,ddi,0,&source);
                     } else if(ddi<2) {
-                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
+                        uint32_t refusal=0;
+                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0,&refusal);
+                        check[55]=refusal;
                         linked=result.status==Display13Power::Status::Complete;
                         if(linked)port->retain(); // Released only after real buffer stop/idle.
                     }
@@ -9195,13 +9309,40 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 // A shared crawl needs real WM certificates for every active native pipe.
 // Never wait for the controller gate or a peer FB mutex while a caller may
 // already own its own FB mutex. Single-output retains its established path.
+// Busy-gate diagnostic for adlnSetDualClock(), kept out of line so its
+// buffers never count against the caller's kernel stack frame. Caller holds
+// display13FBPower.lock. Published as N97FBClockGateBusy{,First}: [1] current
+// thread, [2] work-loop thread, [3] caller on work-loop thread, [4] gate lock,
+// [5..9] its first 40 bytes (owner thread and count live there), [10..12]
+// pipe 0-2 FB mutex (bit1 exists, bit0 held by caller), [13] donor
+// framebuffer image base, [14] frames, [15..30] caller backtrace.
+static __attribute__((noinline)) void recordDisplay13GateBusy(IOWorkLoop *loop,uint64_t donorImage) {
+    auto &c=display13FBPower;
+    uint64_t g[32] {1,reinterpret_cast<uint64_t>(current_thread()),
+        reinterpret_cast<uint64_t>(loop->getThread()),loop->onThread()};
+    if(auto lock=Display13WorkLoopPeek::gate(loop)) {
+        g[4]=reinterpret_cast<uint64_t>(lock);
+        for(unsigned i=0;i<5;++i)g[5+i]=reinterpret_cast<const volatile uint64_t *>(lock)[i];
+    }
+    for(unsigned p=0;p<3;++p) {
+        auto fb=c.pipe[p].memoryFramebuffer;
+        auto mutex=fb && fb->getMetaClass()->getClassSize()>=0x4B90 ? Display13FBMemory::field<IORecursiveLock *>(fb,0x4220) : nullptr;
+        if(mutex)g[10+p]=2|(IORecursiveLockHaveLock(mutex) ? 1 : 0);
+    }
+    g[13]=donorImage;
+    void *trace[16] {};g[14]=OSBacktrace(trace,16);
+    for(unsigned i=0;i<16;++i)g[15+i]=reinterpret_cast<uint64_t>(trace[i]);
+    auto root=IORegistryEntry::getRegistryRoot();
+    root->setProperty("N97FBClockGateBusy",g,sizeof(g));
+    if(!root->getProperty("N97FBClockGateBusyFirst"))root->setProperty("N97FBClockGateBusyFirst",g,sizeof(g));
+}
 void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
     auto &c=display13FBPower;if(!c.lock)return;
     Display13Clock::Change result;result.requestedHz=nativeHz;
     Display13WM::Latch before[3],after[3];
     IOService *frames[3] {};IORecursiveLock *mutexes[3] {};bool locked[3] {};
     IOWorkLoop *loop=nullptr,*acquired=nullptr;uint32_t active=0;
-    uint64_t evidence[28] {1,nativeHz};
+    uint64_t evidence[28] {1,nativeHz};bool gateBusy=false; // [27]: gate retries, |0x100 if still busy
     IOLockLock(c.lock);
     const bool valid=callbackXE->display13FBClockSetHookReady && controller==c.controller && c.map && c.bridge.begun &&
         !c.bridge.state.faulted && !c.clockFaulted && !c.watermarkFaulted &&
@@ -9233,7 +9374,19 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
             evidence[7]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(loop);
             if(!evidence[7]) {
                 ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
+                // Another thread can hold the gate for a moment (seen on eDP +
+                // TC HDMI cold boots). Retry briefly without the owner lock;
+                // the active-pipe set is re-validated after the relock below.
+                for(unsigned retry=0;!ready && retry<20;++retry) {
+                    IOLockUnlock(c.lock);IOSleep(5);
+                    ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
+                    IOLockLock(c.lock);evidence[27]=retry+1;
+                }
                 if(ready) {acquired=loop;evidence[8]=1;}
+                else {
+                    gateBusy=true;
+                    recordDisplay13GateBusy(loop,callbackXE->display13DPImage);
+                }
             }
         }
         if(ready)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
@@ -9303,6 +9456,11 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
     if(result.status==Display13Clock::ChangeStatus::Complete) {
         c.clock=result.after;c.clockStopped=false;c.resumeClockHz=result.after.nativeHz();
         *reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(controller)+0xE98)=result.after.nativeHz();
+    } else if(gateBusy && !result.writes) {
+        // Nothing was written: the clock is unchanged and still valid. Leave
+        // the lifecycle open so a later request can succeed instead of
+        // refusing every watermark program for the rest of the boot.
+        evidence[27]|=0x100;
     } else adlnFault(c.clockFaulted,__LINE__);
     evidence[16]=static_cast<uint32_t>(result.status);evidence[17]=result.writes;
     for(unsigned p=0;p<3;++p) {
@@ -10296,7 +10454,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 // both enter here; a second caller must not reset an already running peer.
 bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
     auto &c=display13FBPower;
-    uint64_t record[32] {},cold[12] {};Display13Power::Result result;
+    uint64_t record[32] {},cold[14] {};Display13Power::Result result;
     if(power!=c.power || !c.controller || !callbackXE->display13FBLifecycleHooksReady ||
        !c.bridge.begun || c.bridge.state.faulted || c.clockFaulted ||
        !Display13Power::objectAssociations(power,0x80,c.controller,0x1C20))return false;
@@ -10351,6 +10509,23 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
     result=Display13Power::restore(io,c.bridge.state,c.restorePending,selectDSI);
     if(result.status==Display13Power::Status::Complete && c.restorePending) {
         // No clock/MBUS writes after any output starts scanning out.
+        // Hibernation resume: firmware/boot.efi relit the internal eDP on pipe
+        // A for the resume preview. Opt-in: park only that scanout, then
+        // require every consumer stopped exactly as after an S3 power loss.
+        if(!Display13FBIRQ::consumersStopped(io,7,c.transcoders) && checkKernelArgument("-wex-resume-park")) {
+            Display13FBResumeParkIO parkIO{c.map};
+            const auto park=Display13ResumePark::park(parkIO,c.transcoders,callbackXE->adlnOutputWiring.panel);
+            uint32_t parkRecord[16] {1,static_cast<uint32_t>(park.status),park.stage,park.writes,park.port,
+                park.lastReg,park.expected,park.observed,park.conf,park.trans,park.buffer,park.clock,park.transport,
+                park.planes,park.chicken,park.cmtgSecondary?park.ctl2|0x100U:park.ctl2};
+            IORegistryEntry::getRegistryRoot()->setProperty("WEXResumeFirmwarePark",parkRecord,sizeof(parkRecord));
+            if(park.status==Display13ResumePark::Status::Complete) {
+                auto &irq=display13FBIRQ;
+                const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
+                irq.rearmPending=true;
+                IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
+            }
+        }
         if(!Display13FBIRQ::consumersStopped(io,7,c.transcoders))result.status=Display13Power::Status::NotReady;
         else {
             cold[4]=io.read(0x4438C);
@@ -10358,8 +10533,17 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
                 *reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+0x4438C)=c.dbuf.mbus;
             cold[5]=io.read(0x4438C);
             if(cold[5]!=c.dbuf.mbus)result.status=Display13Power::Status::NotReady;
-            else for(unsigned i=0;i<4;++i)
-                if(!(io.read(Display13DBUF::regs[i])&Display13DBUF::Request))c.dbuf.owned&=~(1U<<i);
+            else {
+                for(unsigned i=0;i<4;++i)
+                    if(!(io.read(Display13DBUF::regs[i])&Display13DBUF::Request))c.dbuf.owned&=~(1U<<i);
+                // Every consumer is stopped and no plane is enabled yet: restore
+                // the GGTT scanout mode the hibernation cold boot leaves clear.
+                // A failed readback is recorded only; it does not block resume.
+                uint32_t before=0,after=0;
+                Display13ResumePark::restoreGGTTMode([&](uint32_t r){return io.read(r);},
+                    [&](uint32_t r,uint32_t v){*reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+r)=v;},before,after);
+                cold[12]=before;cold[13]=after;
+            }
         }
     }
     if(result.status==Display13Power::Status::Complete &&
@@ -10699,6 +10883,10 @@ void XE::wrapAlderLakeNPowerInit(void *power,void *controller) {
 			pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache) : nullptr;
 		if(map && map->getLength()==0x1000000 && map->getPhysicalAddress()==physical && map->getVirtualAddress()) {
 			c.controller=controller;c.power=power;c.map=map;
+			if(!display13ScanoutCall && (display13ScanoutCall=thread_call_allocate(display13ScanoutSnapshot,nullptr))) {
+				uint64_t deadline;clock_interval_to_deadline(10,kSecondScale,&deadline);
+				thread_call_enter_delayed(display13ScanoutCall,deadline);
+			}
 			c.access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
 			// Reference failures retain mappings/objects for diagnosis until reboot.
 			service->retain();static_cast<OSObject *>(power)->retain();static_cast<OSObject *>(c.access)->retain();

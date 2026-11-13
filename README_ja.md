@@ -58,6 +58,8 @@ Graphicsは`/Library`への配置とAuxKC生成を行い、Systemファイルや
 
 ## 設定
 
+EDIDによるパネル選択を要求するfirmwareでは、iGPUの任意のDataプロパティ`xelp-panel-edid`に、有効な128バイトのデジタルEDID基本ブロックを指定できます（基本ブロックのみ。拡張ブロック数のバイトは無視します）。対応するmodern VBTパネルプロファイルが一意な場合だけ選択します。明示されたプロファイル、表示タイミング、表示状態の検証は変更しません。 内蔵eDP-Aディスプレイが1台の場合、有効なfirmware共通タイミングジェネレーターを維持できます。bootstrap中はソース状態が変わらないことを検証します。ソフトウェアのモード選択前でも、nativeポートは保護されたbootリースを引き継ぐことができます。
+
 ### 必須ブート引数
 
 OpenCoreの`boot-args`に追加します。
@@ -83,6 +85,11 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - 内蔵画面の輝度調整には`SSDT-PNLF`を追加します。
 - GPUは自動選択するため、通常は`device-id`上書きは不要です。
 - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/P/Uではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
+
+### 任意: ハイバネーションからの復帰
+
+実験的な任意機能です。ハイバネーション (`hibernatemode 25`) からの復帰時にfirmwareが内蔵eDPパネルを点灯させ、その後パネルが真っ暗のままになる場合は `-wex-resume-park` を追加します。WEXはディスプレイの復帰前にそのfirmwareの出力だけを停止し、それ以外のディスプレイ構成は変更しません。firmwareによっては、ハイバネーションイメージを復元するためにOpenCoreの `UEFI > ReservedMemory` の設定も必要です。内蔵パネルはfirmwareが設定したモードのままになります。
+
 
 ## 動作確認済みの機能と既知の問題
 
