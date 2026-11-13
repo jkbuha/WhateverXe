@@ -2,6 +2,9 @@
 
 [English](README.md)
 
+> **このフォーク（`xps-unified`）** は、Dell **XPS 13 Plus 9320**（Raptor Lake-P）と **XPS 17 9720**（Alder Lake-H）で共通のWhateverXeビルドです。詳細は[XPS-UNIFIED.md](XPS-UNIFIED.md)を参照してください。OpenCoreのEFI：
+> [XPS-9320-RaptorLake-OpenCore](https://github.com/jkbuha/XPS-9320-RaptorLake-OpenCore) · [XPS-9720-AlderLake-OpenCore](https://github.com/jkbuha/XPS-9720-AlderLake-OpenCore)。上流への提供：[b00t0x/WhateverXe#125](https://github.com/b00t0x/WhateverXe/issues/125)。
+
 WhateverXeは、WhateverGreenを基に開発した、一部のIntel Xe-LP内蔵GPU向けにAppleのグラフィックスドライバーを適応させるLiluプラグインです。
 [WhateverXe](https://github.com/b00t0x/WhateverXe/releases)と[WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases)は両方とも最新版を使用してください。変更点は[CHANGELOG](CHANGELOG.md)を参照してください。
 

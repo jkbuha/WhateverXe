@@ -2,6 +2,9 @@
 
 [日本語](README_ja.md)
 
+> **This fork (`xps-unified`)** carries one WhateverXe build for the Dell **XPS 13 Plus 9320** (Raptor Lake-P) and **XPS 17 9720** (Alder Lake-H); see [XPS-UNIFIED.md](XPS-UNIFIED.md). Ready-to-use OpenCore EFIs:
+> [XPS-9320-RaptorLake-OpenCore](https://github.com/jkbuha/XPS-9320-RaptorLake-OpenCore) · [XPS-9720-AlderLake-OpenCore](https://github.com/jkbuha/XPS-9720-AlderLake-OpenCore). Upstream contribution: [b00t0x/WhateverXe#125](https://github.com/b00t0x/WhateverXe/issues/125).
+
 WhateverXe is a Lilu plugin, derived from WhateverGreen, that adapts Apple graphics drivers for selected Intel Xe-LP integrated GPUs.
 Use the latest releases of [WhateverXe](https://github.com/b00t0x/WhateverXe/releases) and [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) together. See [CHANGELOG](CHANGELOG.md) for release notes.
 

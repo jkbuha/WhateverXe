@@ -15,6 +15,19 @@ This branch is WhateverXe 0.8.2 (b00t0x/WhateverXe `main`) plus the fixes both l
   - `-wex-edp-keep` / `-wex-edp-blank` / `-wex-no-edp-hpd` (eDP freeze fix), the edp-blank system-sleep handback, `-wex-tcN-legacy` (VBT Type-C ports wired as legacy HDMI), `-wex-no-gva[-scaler]`.
 - **Diagnostics** (opt-in or read-only): `-wex-canary` (memory canary), Type-C live/FIA readouts, display-audio / HDA readouts, `-wex-audio-wake` (iDisp codec wake; see b00t0x/WhateverXe#124).
 
+## OpenCore EFIs
+
+- XPS 13 Plus 9320: [jkbuha/XPS-9320-RaptorLake-OpenCore](https://github.com/jkbuha/XPS-9320-RaptorLake-OpenCore)
+- XPS 17 9720 (iGPU and eGPU configs): [jkbuha/XPS-9720-AlderLake-OpenCore](https://github.com/jkbuha/XPS-9720-AlderLake-OpenCore)
+
+Both use this branch's kext as `WhateverXe.kext`; their SMBIOS fields are blank (generate your own).
+
+## Upstream
+
+The production part of this branch (without the diagnostics) is offered to b00t0x as
+[`contrib/xps-mobile-xelp`](https://github.com/jkbuha/WhateverXe-contrib/tree/contrib/xps-mobile-xelp), see
+[b00t0x/WhateverXe#125](https://github.com/b00t0x/WhateverXe/issues/125).
+
 ## Rollback
 
 - 9320: `/Volumes/EFI/xe-rollback-082.sh [kext|nowex]` (or `/boot/efi/…` from CachyOS) restores WhateverXe 0.8.2 `AF833022` and the previous `config.plist`.
