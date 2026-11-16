@@ -34,6 +34,18 @@ static const char *backlightPath[] { "/System/Library/Extensions/AppleBacklight.
 static KernelPatcher::KextInfo backlight { "com.apple.driver.AppleBacklight",backlightPath,arrsize(backlightPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 static const char *surfacePath[] { "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface" };
 static KernelPatcher::KextInfo surface { "com.apple.iokit.IOSurface",surfacePath,arrsize(surfacePath),{true},{},KernelPatcher::KextInfo::Unloaded };
+// AppleHDAController, loaded at runtime by SimpleHDA (Tahoe) or from SLE.
+static const char *hdaControllerPath[] {
+ "/EFI/OC/Kexts/SimpleHDA.kext/Contents/Resources/Payload/AppleHDA.kext/Contents/PlugIns/AppleHDAController.kext/Contents/MacOS/AppleHDAController",
+ "/System/Library/Extensions/AppleHDA.kext/Contents/PlugIns/AppleHDAController.kext/Contents/MacOS/AppleHDAController" };
+static KernelPatcher::KextInfo hdaController { "com.apple.driver.AppleHDAController",hdaControllerPath,arrsize(hdaControllerPath),{true},{},KernelPatcher::KextInfo::Unloaded };
+bool wexHDADeferProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+static const char *hdaMainPath[] {
+ "/EFI/OC/Kexts/SimpleHDA.kext/Contents/Resources/Payload/AppleHDA.kext/Contents/MacOS/AppleHDA",
+ "/System/Library/Extensions/AppleHDA.kext/Contents/MacOS/AppleHDA" };
+static KernelPatcher::KextInfo hdaMain { "com.apple.driver.AppleHDA",hdaMainPath,arrsize(hdaMainPath),{true},{},KernelPatcher::KextInfo::Unloaded };
+bool wexHDAMainProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+bool wexFBNotifyTraceProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 void XeHost::init() {
  callbackHost=this;
  // Copy the firmware tables while the boot firmware still owns them. This
@@ -46,6 +58,8 @@ void XeHost::init() {
  lilu.onKextLoadForce(&accelFamily);
  lilu.onKextLoadForce(&backlight);
  lilu.onKextLoadForce(&surface);
+ if(checkKernelArgument("-wex-hda-defer") || checkKernelArgument("-wex-hda-reprobe") || checkKernelArgument("-wex-hda-trace") || checkKernelArgument("-wex-hda-regfx") || checkKernelArgument("-wex-hda-discover") || checkKernelArgument("-wex-hda-allpins") || checkKernelArgument("-wex-hdmi-audio"))lilu.onKextLoadForce(&hdaController);
+ if(checkKernelArgument("-wex-hda-trace") || checkKernelArgument("-wex-hda-discover") || checkKernelArgument("-wex-hda-allpins") || checkKernelArgument("-wex-hdmi-audio"))lilu.onKextLoadForce(&hdaMain);
  xe.init();
  XeDataAccess::init();
 }
@@ -132,6 +146,8 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   processKernel(patcher);
  }
  if(!active)return;
+ if(hdaController.loadIndex==index) {wexHDADeferProcess(patcher,index,address,size);return;}
+ if(hdaMain.loadIndex==index) {wexHDAMainProcess(patcher,index,address,size);return;}
  if(xe.isIntelProvider(index)) {
   // Donor imports exist before their native start, but Lilu's already-loaded
   // kmod walk need not notify their provider first. Resolve its exports before
@@ -216,6 +232,7 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
  if(graphics.loadIndex==index) {
   if(graphicsSeen)return;
   graphicsSeen=true;
+  wexFBNotifyTraceProcess(patcher,index,address,size);
   if(systemWakeRecovery) {
    const char *sym="__ZN13IOFramebuffer16setWSAAAttributeEjj";
    // Lilu resolves the symbol, verifies the image range, and builds the
