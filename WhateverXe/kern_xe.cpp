@@ -20,6 +20,7 @@
 #include "kern_xelp_call_target.hpp"
 #include "kern_xelp_native_placement.hpp"
 #include <Headers/kern_disasm.hpp>
+#include <Headers/kern_mach.hpp>
 #include <Headers/kern_crypto.hpp>
 #include "kern_alderlake_n.hpp"
 #include "kern_xelp_device.hpp"
@@ -4729,6 +4730,28 @@ bool XE::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t add
 static bool dsiCachePath(OSObject *);
 static bool dsiLifecycleTarget(IOService *,OSObject *);
 static bool adlnWriterMappingBound();
+static void hdaProbePinSense(); // global scope; defined after the anonymous namespace closes (AppleHDA discovery block)
+static void hdaProbeDisplayAudio(IOService *fb); // global scope; defined with hdaProbePinSense
+static void hdaFixAudioCodecInfo(IOService *fb); // -wex-hdmi-audio: pin byte from TRANS_DDI_FUNC_CTL
+static void hdaAssertAllPins(); // -wex-hdmi-audio: re-apply the Intel enable-all-pins bit
+static void hdaRecordValidEDIDEntry(void *head); // -wex-hda-trace: head + pin state at handleValidEDID
+// -wex-hdmi-audio: Intel display-codec (ADL-P 0x8086281C) HDMI/DP audio through AppleHDA.
+// Enables discovery, enable-all-pins, the fallback path map, the converter caps fix, the ELD
+// write, the audio-codec-info pin fix and the stream/pin binding. The older individual flags
+// (-wex-hda-discover, -wex-hda-allpins, -wex-hda-eld) still enable their parts.
+// WEXHDAHotplug (passive, -wex-hda-trace): 16-entry ring of the HDMI driver's display events.
+// {count, then 16 x 2: ms<<32 | kind (1 handleValidEDID, 2 handleInvalidEDID, 3 createAudioOutputEngineDP,
+//  4 addAdditionalDPAudioSource), ret lo32 | driver engines(+0x168) count<<32}.
+static uint64_t hdaHotplug[1+16*2];
+static void hdaHotplugRecord(void *driver,uint32_t kind,uint64_t ret) {
+ const auto n=hdaHotplug[0]++;auto r=hdaHotplug+1+(n%16)*2;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&t);
+ uint64_t engines=UINT32_MAX;
+ if(driver)if(auto a=OSDynamicCast(OSArray,*reinterpret_cast<OSObject **>(static_cast<uint8_t *>(driver)+0x168)))engines=a->getCount();
+ r[0]=((t/1000000)<<32)|kind;r[1]=static_cast<uint32_t>(ret)|(engines<<32);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAHotplug",hdaHotplug,sizeof(hdaHotplug));
+}
+static bool hdaHdmiAudio() {return checkKernelArgument("-wex-hdmi-audio") || checkKernelArgument("-wex-hda-allpins");}
 namespace {
 struct Display13GMBusScope {
     volatile uintptr_t thread {};
@@ -4829,6 +4852,1953 @@ static Display13FBPowerContext display13FBPower;
 // Use the retained, uncached BAR owner. These GT mirrors require no forcewake,
 // mailbox transaction, MMIO write or native policy intervention.
 // Schema 1285 matches r285 slots; slot15 is the current RP_STATE_CAP mirror.
+// Read-only Type-C live readout (diagnostic, XPS 17 9720 external output):
+// computed on each registry read, never written. WEXDisplay13TCLive:
+// {version, reads, valid, wells 0x45404, AUX 0x45444, DDI 0x45454,
+//  SDEISR, SDEIMR, SDEIIR, SDEIER, SHOTPLUG_CTL_TC 0xC4034,
+//  DE_HPD ISR/IMR/IIR/IER 0x44470-0x4447C, TC_HOTPLUG_CTL 0x44038, TBT_HOTPLUG_CTL 0x44030,
+//  then per TC1..4 (DDI 3..6): TCSS_DDI_STATUS 0x161500+4*tc, DDI_BUF_CTL, port clock, TC PLL}.
+// WEXDisplay13TCFIA (FIA1 0x163000, FIA2 0x16E000): {version, reads, valid,
+//  per FIA: +0x880 pin assignment, +0x890 DFLEXDPPMS, +0x894 DFLEXDPCSSS, +0x8a0 DFLEXDPSP}.
+static bool display13TCReadable(void *target,volatile uint8_t *&base) {
+ auto &c=display13FBPower;auto service=static_cast<IOService *>(target);
+ if(!service || c.controller!=target || !c.map || c.map->getLength()!=0x1000000 || !c.map->getVirtualAddress())return false;
+ base=reinterpret_cast<volatile uint8_t *>(c.map->getVirtualAddress());
+ const auto wells=*reinterpret_cast<volatile uint32_t *>(base+0x45404);
+ return wells!=UINT32_MAX && (wells&3)==3;
+}
+static bool display13TCLiveSerialize(void *target,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[19+4*4] {1};volatile uint8_t *base=nullptr;
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ if(q[1]<4096 && display13TCReadable(target,base)) {
+  auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(base+r);};
+  static constexpr uint32_t regs[] {0x45404,0x45444,0x45454,0xC4000,0xC4004,0xC4008,0xC400C,0xC4034,
+   0x44470,0x44474,0x44478,0x4447C,0x44038,0x44030};
+  q[2]=1;for(unsigned i=0;i<14;++i)q[3+i]=rd(regs[i]);
+  for(unsigned tc=0;tc<4;++tc) {
+   Display13TC::Port port;Display13TC::Port::resolve(tc+3,port);
+   q[19+4*tc]=rd(port.ready);q[20+4*tc]=rd(port.buffer);q[21+4*tc]=rd(port.clock);q[22+4*tc]=rd(port.pll);
+  }
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static bool display13TCFIASerialize(void *target,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[3+2*4] {1};volatile uint8_t *base=nullptr;
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ if(q[1]<1024 && display13TCReadable(target,base)) {
+  q[2]=1;
+  for(unsigned f=0;f<2;++f) {
+   const uint32_t fia=f?0x16E000:0x163000;const uint32_t off[]{0x880,0x890,0x894,0x8A0};
+   for(unsigned i=0;i<4;++i)q[3+4*f+i]=*reinterpret_cast<volatile uint32_t *>(base+fia+off[i]);
+  }
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Read-only HDMI/DP audio diagnostic (XPS 17 9720). Counts Apple's native
+// display-audio entry points (pass-through wrappers, arguments untouched) and
+// reads the display-side audio registers on demand. WEXDisplay13Audio:
+// {version, reads, valid, enableCalls, enableLastRet, disableCalls, disableLastRet,
+//  supportCalls, supportTrue, propsCalls, bufDisableCalls,
+//  AUDIO_PIN_BUF_CTL 0x48414, AUD_PIN_ELD_CP_VLD 0x650C0, AUD_CHICKENBIT 0x65F10,
+//  AUD_FREQ_CNTRL 0x65900, PWR_WELL_CTL1 0x45400, PWR_WELL_CTL2 0x45404, PWR_WELL_CTL4 0x4540C,
+//  DC_STATE_EN 0x45504, AUD_CONFIG A..D 0x65000+0x100*t, AUD_CNTL_ST A..D 0x650B4+0x100*t}.
+// AUD_HDMIW_HDMIEDID (ELD FIFO) is never read: reading it advances the FIFO.
+namespace {
+volatile uint32_t d13AudEnableCalls,d13AudDisableCalls,d13AudSupportCalls,d13AudSupportTrue,d13AudPropsCalls,d13AudBufDisableCalls;
+volatile uint64_t d13AudEnableRet,d13AudDisableRet;
+mach_vm_address_t orgD13AudEnable,orgD13AudDisable,orgD13AudSupport,orgD13AudProps,orgD13AudBufDisable;
+uint64_t wrapD13AudEnable(void *c,void *fb,void *path) {
+ __atomic_add_fetch(&d13AudEnableCalls,1U,__ATOMIC_RELAXED);
+ const auto r=FunctionCast(wrapD13AudEnable,orgD13AudEnable)(c,fb,path);d13AudEnableRet=r;return r;
+}
+uint64_t wrapD13AudDisable(void *c,void *fb,void *path) {
+ __atomic_add_fetch(&d13AudDisableCalls,1U,__ATOMIC_RELAXED);
+ const auto r=FunctionCast(wrapD13AudDisable,orgD13AudDisable)(c,fb,path);d13AudDisableRet=r;return r;
+}
+bool wrapD13AudSupport(void *fb,uint8_t *edid) {
+ __atomic_add_fetch(&d13AudSupportCalls,1U,__ATOMIC_RELAXED);
+ const bool r=FunctionCast(wrapD13AudSupport,orgD13AudSupport)(fb,edid);
+ if(r)__atomic_add_fetch(&d13AudSupportTrue,1U,__ATOMIC_RELAXED);return r;
+}
+uint64_t wrapD13AudProps(void *fb) {
+ __atomic_add_fetch(&d13AudPropsCalls,1U,__ATOMIC_RELAXED);
+ return FunctionCast(wrapD13AudProps,orgD13AudProps)(fb);
+}
+uint64_t wrapD13AudBufDisable(void *c) {
+ __atomic_add_fetch(&d13AudBufDisableCalls,1U,__ATOMIC_RELAXED);
+ return FunctionCast(wrapD13AudBufDisable,orgD13AudBufDisable)(c);
+}
+} // namespace
+// -wex-dp-audio (opt-in): for an EXTERNAL display (fb+0x1e2 set by
+// allocateDisplayResources), Apple's setupDisplayResources sets the display
+// audio flag fb+0x424c from the audio field (+8) of the display's
+// AGDC resource-configuration entry (table at fb+0x21d, 0x3dc-byte entries,
+// index fb+0x3fd8). On real Macs AGDC/display policy supplies that config; on
+// these machines (agdpmod=pikera, zeroed boot defaults) it stays 0, so hwSetMode
+// never enables pipe audio and setAudioProperties publishes audio-codec-info = 0
+// -> AppleHDA's findValidDisplayCodec never registers the iDisp codec, even when
+// Apple's own checks classify the sink as HDMI (fb+0x4289) through an HDMI
+// converter (fb+0x428a == 3). After the original, for an external display with
+// audio still off, read the first EDID extension through Apple's own
+// fbGetDDCBlock and enable audio only if it is a CEA block with basic audio AND
+// an HDMI vendor block. hwSetMode/setAudioProperties then do the rest natively.
+// WEXDPAudio: per FB index 0..3 {calls, external 0x1e2, audio 0x424c before,
+//  hdmiSink 0x4289, converter 0x428a, ddcResult, ceaFlags(1 basic audio, 2 HDMI VSDB),
+//  applied(1) | propsRerun(2) | configAudio<<8 (resource entry +8) | entry<<40};
+//  ddcResult low 32 bits, audio-codec-info after the re-run in the high 32 bits.
+static mach_vm_address_t orgD13SetupRes,d13FbGetDDC,d13SetAudioProps;
+void hdaReprobeSchedule(); // defined with the AppleHDAController hooks (same anonymous namespace)
+static uint64_t d13DPAudioRec[4][8];
+static uint64_t wrapD13SetupRes(void *fb) {
+ const auto r=FunctionCast(wrapD13SetupRes,orgD13SetupRes)(fb);
+ auto object=static_cast<OSObject *>(fb);
+ if(!fb || object->getMetaClass()->getClassSize()<0x4A10)return r;
+ auto p=static_cast<uint8_t *>(fb);
+ const auto idx=*reinterpret_cast<uint32_t *>(p+0x1DC);
+ uint64_t scratch[8] {};auto &rec=idx<4 ? d13DPAudioRec[idx] : scratch;
+ const auto entry=*reinterpret_cast<int32_t *>(p+0x3FD8);
+ rec[0]++;rec[1]=p[0x1E2];rec[2]=p[0x424C];rec[3]=p[0x4289];rec[4]=p[0x428A];
+ rec[7]=static_cast<uint64_t>(static_cast<uint32_t>(entry))<<40;
+ if(entry>=0 && entry<16)rec[7]|=static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(p+0x225+0x3DC*entry))<<8;
+ if(p[0x1E2] && !p[0x424C] && d13FbGetDDC) {
+  auto path=*reinterpret_cast<void **>(p+(entry==-1 ? 0x49F0 : 0x4A08));
+  uint8_t ext[128] {};uint64_t length=sizeof(ext);
+  using DDC=uint32_t (*)(void *,uint32_t,uint8_t *,uint64_t *,uint32_t,void *);
+  const auto res=path ? reinterpret_cast<DDC>(d13FbGetDDC)(fb,2,ext,&length,0,path) : 0xE00002C0U;
+  rec[5]=res;uint64_t flags=0;
+  if(res==0 && length>=128 && ext[0]==2 && ext[1]>=3) {
+   if(ext[3]&0x40)flags|=1;
+   const unsigned end=ext[2]<=127 ? ext[2] : 127;
+   for(unsigned i=4;i<end && i<127;) {
+    const unsigned tag=ext[i]>>5,len=ext[i]&31;
+    if(tag==3 && len>=3 && i+3<128 && ext[i+1]==0x03 && ext[i+2]==0x0C && ext[i+3]==0x00)flags|=2;
+    i+=1+len;
+   }
+  }
+  rec[6]=flags;
+  if(flags==3) {
+   p[0x424C]=1;rec[7]|=1;
+   IOLog("WhateverXe: FB%u external HDMI audio enabled (EDID basic audio + HDMI VSDB, resource audio was 0)\n",idx);
+  }
+ }
+ // Apple runs setAudioProperties (which publishes audio-codec-info only while
+ // fb+0x424c is set) BEFORE setupDisplayResources sets the flag, and does not
+ // run it again, so AppleHDA's findValidDisplayCodec reads 0. Re-run Apple's
+ // own setAudioProperties once the flag is set for an external display.
+ if(p[0x1E2] && p[0x424C] && d13SetAudioProps) {
+  using Props=uint64_t (*)(void *);
+  const auto pr=reinterpret_cast<Props>(d13SetAudioProps)(fb);
+  uint32_t info=0;
+  if(auto d=OSDynamicCast(OSData,static_cast<IOService *>(fb)->getProperty("audio-codec-info")))
+   if(d->getLength()>=4)info=*static_cast<const uint32_t *>(d->getBytesNoCopy());
+  rec[7]|=2;rec[5]=(rec[5]&0xFFFFFFFFULL)|(static_cast<uint64_t>(info)<<32);
+  IOLog("WhateverXe: FB%u setAudioProperties re-run after audio flag: ret=%llx audio-codec-info=%x\n",idx,pr,info);
+  if(info)hdaReprobeSchedule();
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDPAudio",d13DPAudioRec,sizeof(d13DPAudioRec));
+ return r;
+}
+// -wex-audio-snap (read-only diagnostic): what does Apple's FB change between
+// processKernel (codec silent) and the reprobe (codec answers)? Display regs the
+// FB's enableDisplayEngine touches + audio regs + HDA link regs, at 3 points:
+// A = processKernel before the codec wake, B = FB start, C = before the reprobe.
+// WEXAudioSnap: 3 x 24 dwords in the order of audSnapRegs, then 8 HDA dwords
+// {GCTL, STATESTS|WAKEEN<<16, PPCTL, ML LCTL0, ML LCTL1, ML LCTL2, valid, uptime s}.
+static constexpr uint32_t audSnapRegs[24] {0x46000,0x46070,0x45008,0x45038,0x45454,0x42000,0x46408,0x46430,
+ 0xC2014,0x7003C,0x7103C,0x7203C,0x45400,0x45404,0x45504,0x65900,0x65F10,0x48414,0x650C0,0x65000,0x65100,
+ 0x65010,0x65110,0x45520};
+static uint32_t audSnap[3][32];
+namespace {IOPCIDevice *wexFindHDA();}
+static void audSnapTake(unsigned slot,volatile uint8_t *base) {
+ if(slot>2 || !base || !checkKernelArgument("-wex-audio-snap"))return;
+ for(unsigned i=0;i<24;++i)audSnap[slot][i]=*reinterpret_cast<volatile uint32_t *>(base+audSnapRegs[i]);
+ if(auto pci=wexFindHDA()) {
+  const uint16_t cmd=pci->configRead16(0x04);
+  if(cmd&2) if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+   if(map->getLength()>=0x1000 && map->getVirtualAddress()) {
+    auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+    auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+    audSnap[slot][24]=r32(0x08);audSnap[slot][25]=*reinterpret_cast<volatile uint16_t *>(b+0x0E)|(static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t *>(b+0x0C))<<16);
+    uint32_t off=r32(0x14)&0xFFFF;unsigned guard=0;
+    while(off && off<0x3F00 && guard++<10) {
+     const auto hdr=r32(off);const auto id=(hdr>>16)&0xFFF;
+     if(id==3)audSnap[slot][26]=r32(off+4);
+     if(id==2) {for(unsigned l=0;l<3;++l)audSnap[slot][27+l]=r32(off+0x40+0x40*l+4);}
+     const auto next=hdr&0xFFFF;if(next==off)break;off=next;
+    }
+    audSnap[slot][30]=1;
+   }
+   map->release();
+  }
+  pci->release();
+ }
+ uint64_t t;clock_get_uptime(&t);uint64_t ns;absolutetime_to_nanoseconds(t,&ns);audSnap[slot][31]=static_cast<uint32_t>(ns/1000000000ULL);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXAudioSnap",audSnap,sizeof(audSnap));
+}
+// Shared with the -wex-hda-early-wells hold below (processKernel).
+static uint64_t hdaWellsRec[8] {1};
+static volatile uint32_t *hdaWellsCtl4;
+static void hdaWellsPublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEarlyWells",hdaWellsRec,sizeof(hdaWellsRec));}
+static mach_vm_address_t orgD13SetPG;
+static uint64_t wrapD13SetPG(void *pw,bool enable,uint32_t pg) {
+ if(auto ctl4=hdaWellsCtl4) {
+  // Drop our debug-register hold BEFORE the FB changes any well.
+  hdaWellsRec[6]=*reinterpret_cast<volatile uint32_t *>(reinterpret_cast<volatile uint8_t *>(ctl4)-8);
+  *ctl4=0;hdaWellsCtl4=nullptr;IODelay(10);
+  hdaWellsRec[7]=*reinterpret_cast<volatile uint32_t *>(reinterpret_cast<volatile uint8_t *>(ctl4)-8);
+  hdaWellsRec[1]=3;hdaWellsRec[5]=1|(static_cast<uint64_t>(enable)<<8)|(static_cast<uint64_t>(pg)<<16);hdaWellsPublish();
+ }
+ return FunctionCast(wrapD13SetPG,orgD13SetPG)(pw,enable,pg);
+}
+static bool display13EarlyWellsInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(orgD13SetPG || !checkKernelArgument("-wex-hda-early-wells"))return false;
+ KernelPatcher::RouteRequest route {"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj",wrapD13SetPG,orgD13SetPG};
+ const bool ok=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEarlyWellsReady",ok);
+ return ok;
+}
+static bool display13DPAudioInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(orgD13SetupRes || !checkKernelArgument("-wex-dp-audio"))return false;
+ d13FbGetDDC=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer13fbGetDDCBlockEjPhPyjP21AppleIntelDisplayPath",address,size);
+ patcher.clearError();
+ if(!d13FbGetDDC)return false;
+ d13SetAudioProps=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer18setAudioPropertiesEv",address,size);
+ patcher.clearError();
+ KernelPatcher::RouteRequest route {"__ZN21AppleIntelFramebuffer21setupDisplayResourcesEv",wrapD13SetupRes,orgD13SetupRes};
+ const bool ok=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDPAudioReady",ok);
+ return ok;
+}
+static bool display13AudioProbeInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ KernelPatcher::RouteRequest routes[] {
+  {"__ZN31AppleIntelFramebufferController13hwEnableAudioEP21AppleIntelFramebufferP21AppleIntelDisplayPath",wrapD13AudEnable,orgD13AudEnable},
+  {"__ZN31AppleIntelFramebufferController14hwDisableAudioEP21AppleIntelFramebufferP21AppleIntelDisplayPath",wrapD13AudDisable,orgD13AudDisable},
+  {"__ZN21AppleIntelFramebuffer23IsDisplayAudioSupportedEPh",wrapD13AudSupport,orgD13AudSupport},
+  {"__ZN21AppleIntelFramebuffer18setAudioPropertiesEv",wrapD13AudProps,orgD13AudProps},
+  {"__ZN31AppleIntelFramebufferController20hwDisableAudioBufferEv",wrapD13AudBufDisable,orgD13AudBufDisable}};
+ const bool ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioProbeReady",ready);
+ return ready;
+}
+static bool display13AudioSerialize(void *target,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[11+8+8] {1};volatile uint8_t *base=nullptr;
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ q[3]=d13AudEnableCalls;q[4]=static_cast<uint32_t>(d13AudEnableRet);q[5]=d13AudDisableCalls;q[6]=static_cast<uint32_t>(d13AudDisableRet);
+ q[7]=d13AudSupportCalls;q[8]=d13AudSupportTrue;q[9]=d13AudPropsCalls;q[10]=d13AudBufDisableCalls;
+ if(q[1]<4096 && display13TCReadable(target,base)) {
+  auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(base+r);};
+  static constexpr uint32_t regs[] {0x48414,0x650C0,0x65F10,0x65900,0x45400,0x45404,0x4540C,0x45504};
+  q[2]=1;for(unsigned i=0;i<8;++i)q[11+i]=rd(regs[i]);
+  for(unsigned t=0;t<4;++t) {q[19+t]=rd(0x65000+0x100*t);q[23+t]=rd(0x650B4+0x100*t);}
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// -wex-audio-wake (experimental, opt-in): drive the display codec-wake override
+// like i915's codec_wake_override(): HSW_AUD_CHICKENBIT 0x65F10 bit15 cleared,
+// 1 ms, set, 1 ms, so the iDisp codec answers the HDA controller's link reset.
+// The original value is restored 300 s later. Stage 4 = set early from
+// processKernel (BAR0 own mapping), 2 = set at FB start (fallback). Single register, read-modify-write.
+// WEXDisplay13AudioWake: {version, stage, before, afterSet, afterRestore, setNs, restoreNs}.
+namespace {
+volatile uint8_t *d13AudWakeBase;uint32_t d13AudWakeOrig;uint64_t d13AudWakeRec[7] {1};uint32_t d13AudFreqRec[2] {};uint32_t hdaPinBufEarly[2] {};
+thread_call_t d13AudWakeRestoreCall;
+void d13AudWakePublish(){IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioWake",d13AudWakeRec,sizeof(d13AudWakeRec));}
+void d13AudWakeRestore(thread_call_param_t,thread_call_param_t) {
+ if(!d13AudWakeBase)return;
+ auto reg=reinterpret_cast<volatile uint32_t *>(d13AudWakeBase+0x65F10);
+ *reg=(*reg&~(1U<<15))|(d13AudWakeOrig&(1U<<15));
+ d13AudWakeRec[1]=3;d13AudWakeRec[4]=*reg;uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&d13AudWakeRec[6]);
+ d13AudWakePublish();
+}
+} // namespace
+static void display13AudioWakeAt(volatile uint8_t *base,uint64_t stageSet);
+// -wex-hda-verbtest (diagnostic, opt-in): right after the early codec wake and
+// before AppleHDA owns the controller, send ONE read-only verb through the HDA
+// immediate-command interface: GET_PARAMETER(VENDOR_ID) to codec 2, NID 0.
+// Only runs if the command rings are stopped (CORB/RIRB DMA off), so it can't
+// collide with a running driver. If the controller is in reset, CRST is set
+// first (AppleHDA resets it again when it attaches).
+// WEXHDAVerbTest: {version, stage, GCTL before, STATESTS, CORBCTL|RIRBCTL<<8,
+//  ICIS before, ICIS after, response (ICII), pollIterations, ns,
+//  v2: PCICMD|PMCSR<<16 before, after D0/memory enable,
+//  v3: GCTL after the link reset cycle; STATESTS (slot 3) is now read after the reset,
+//  v4: ppOffset|PPCTL<<32 before, PPCTL after (-wex-hda-noproc)}
+static uint64_t hdaVerbRec[15] {4};
+namespace {IOPCIDevice *wexFindHDA();}
+static void wexHDAVerbTest() {
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAVerbTest",hdaVerbRec,sizeof(hdaVerbRec));};
+ if(!checkKernelArgument("-wex-hda-verbtest"))return;
+ auto pci=wexFindHDA();if(!pci) {hdaVerbRec[1]=1;publish();return;}
+ // The controller is still in D3 / memory decode off until its driver attaches
+ // (BAR reads 0xFFFFFFFF). Do what any driver does at attach: D0 + memory enable.
+ {
+  uint8_t pm=0;const auto pmOff=pci->findPCICapability(kIOPCIPowerManagementCapability,&pm);
+  const uint16_t cmd=pci->configRead16(0x04);
+  const uint16_t pmcsr=pmOff ? pci->configRead16(pmOff+4) : 0xFFFF;
+  hdaVerbRec[10]=cmd|(static_cast<uint64_t>(pmcsr)<<16);
+  if(pmOff && (pmcsr&3)) {pci->configWrite16(pmOff+4,pmcsr&~3);IOSleep(10);}
+  if(!(cmd&2))pci->setMemoryEnable(true);
+  hdaVerbRec[11]=pci->configRead16(0x04)|(static_cast<uint64_t>(pmOff ? pci->configRead16(pmOff+4) : 0xFFFF)<<16);
+ }
+ auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+ if(!map || map->getLength()<0x100 || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);pci->release();hdaVerbRec[1]=2;publish();return;}
+ auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+ auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+ auto r16=[&](uint32_t o){return static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t *>(b+o));};
+ auto w32=[&](uint32_t o,uint32_t v){*reinterpret_cast<volatile uint32_t *>(b+o)=v;};
+ auto w16=[&](uint32_t o,uint16_t v){*reinterpret_cast<volatile uint16_t *>(b+o)=v;};
+ hdaVerbRec[2]=r32(0x08);hdaVerbRec[3]=r16(0x0E);hdaVerbRec[4]=b[0x4C]|(static_cast<uint32_t>(b[0x5C])<<8);hdaVerbRec[5]=r16(0x68);
+ if((b[0x4C]&2) || (b[0x5C]&2)) {hdaVerbRec[1]=3;publish();map->release();pci->release();return;} // rings running: never interfere
+ // -wex-hda-noproc: leave DSP "processing pipe" mode before the reset, so the
+ // controller runs as a plain HDA controller (PPCTL.GPROCEN bit30 = 0), as the
+ // legacy Linux HDA path does. Walk the capability chain for PP (id 3).
+ if(checkKernelArgument("-wex-hda-noproc")) {
+  uint32_t off=r32(0x14)&0xFFFF;unsigned guard=0;
+  while(off && off<0x3F00 && guard++<10) {
+   const auto hdr=r32(off);
+   if(((hdr>>16)&0xFFF)==3) {
+    const auto pp=r32(off+4);hdaVerbRec[13]=off|(static_cast<uint64_t>(pp)<<32);
+    if(pp&(1U<<30)) {w32(off+4,pp&~(1U<<30));IODelay(100);}
+    hdaVerbRec[14]=r32(off+4);break;
+   }
+   const auto next=hdr&0xFFFF;if(next==off)break;off=next;
+  }
+ }
+ // v3: full link reset like a driver's attach, so the woken iDisp codec
+ // announces itself (STATESTS) before the verb: CRST 0 -> 1, then >= 521 us.
+ w16(0x0E,0xFFFF); // clear stale STATESTS (RW1C)
+ w32(0x08,r32(0x08)&~1U);
+ for(unsigned i=0;i<100 && (r32(0x08)&1);++i)IODelay(10);
+ IODelay(100);
+ w32(0x08,r32(0x08)|1U);
+ for(unsigned i=0;i<100 && !(r32(0x08)&1);++i)IODelay(10);
+ IODelay(1000);
+ hdaVerbRec[3]=r16(0x0E);hdaVerbRec[12]=r32(0x08);
+ if(!(hdaVerbRec[12]&1)) {hdaVerbRec[1]=4;publish();map->release();pci->release();return;}
+ // Wait for a free immediate-command slot, clear IRV (RW1C), issue the verb.
+ unsigned n=0;while((r16(0x68)&1) && n<1000) {IODelay(1);++n;}
+ if(r16(0x68)&1) {hdaVerbRec[1]=5;publish();map->release();pci->release();return;}
+ w16(0x68,2);
+ const uint32_t verb=(2U<<28)|(0U<<20)|(0xF00U<<8)|0x00U; // codec 2, NID 0, GET_PARAMETER VENDOR_ID
+ w32(0x60,verb);w16(0x68,1);
+ uint64_t t0;clock_get_uptime(&t0);
+ n=0;while(!(r16(0x68)&2) && n<2000) {IODelay(1);++n;}
+ hdaVerbRec[6]=r16(0x68);hdaVerbRec[7]=r32(0x64);hdaVerbRec[8]=n;
+ uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1-t0,&hdaVerbRec[9]);
+ hdaVerbRec[1]=(hdaVerbRec[6]&2) ? 10 : 6; // 10 = response received, 6 = timeout
+ if(hdaVerbRec[6]&2)w16(0x68,2);
+ publish();map->release();pci->release();
+}
+static IOMemoryMap *d13AudWakeEarlyMap;
+// Early variant: run from processKernel, long before the HDA controller probes
+// its link (AppleHDA via SimpleHDA attaches ~23 s into boot, the FB ~29 s).
+// -wex-hda-early-wells (opt-in): the iDisp codec only answers when the display
+// power wells are up before the codec wake + HDA link reset, but SimpleHDA loads
+// AppleHDA (~23 s) before Apple's FB raises them (~29 s). Hold the wells Apple's
+// FB ends up requesting (PW1, PW2, PW_A..C: request bits 0xA80A) through
+// PWR_WELL_CTL4 (debug request, 0x4540C), which the FB never reads or writes, so
+// its CTL2 bookkeeping is untouched. Enabled in dependency order, each state bit
+// polled (<= 2 ms). The hold is dropped on the FB's FIRST hwSetPowerWellStatePG
+// call, before the original runs: from then on only the FB requests wells, and
+// its disable path ("PGx power well hardware state update failed" panic) can
+// never be blocked by us. WEXHDAEarlyWells: {version, stage, CTL2 before,
+//  CTL4 before, state after hold, released(1)|releaseCalls<<8, CTL2 at release,
+//  state after release}; stage 1 held, 2 timeout, 3 released.
+static void hdaWellsHold(volatile uint8_t *base) {
+ auto ctl2=reinterpret_cast<volatile uint32_t *>(base+0x45404);
+ auto ctl4=reinterpret_cast<volatile uint32_t *>(base+0x4540C);
+ hdaWellsRec[2]=*ctl2;hdaWellsRec[3]=*ctl4;
+ if(hdaWellsRec[2]==UINT32_MAX)return;
+ static constexpr uint32_t order[] {0,1,5,6,7}; // PW1, PW2, PW_A, PW_B, PW_C
+ uint32_t req=0;bool ok=true;
+ for(auto idx:order) {
+  req|=1U<<(2*idx+1);*ctl4=req;
+  unsigned n=0;while(!(*ctl2&(1U<<(2*idx))) && n<2000) {IODelay(1);++n;}
+  if(!(*ctl2&(1U<<(2*idx))))ok=false;
+ }
+ hdaWellsCtl4=ctl4;
+ hdaWellsRec[1]=ok ? 1 : 2;hdaWellsRec[4]=*ctl2;hdaWellsPublish();
+}
+static void display13AudioWakeEarly(IOPCIDevice *pci) {
+ if(d13AudWakeBase || !pci || !checkKernelArgument("-wex-audio-wake"))return;
+ auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+ if(!map || map->getLength()<0x1000000 || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);d13AudWakeRec[1]=8;d13AudWakePublish();return;}
+ d13AudWakeEarlyMap=map; // retained for the restore
+ audSnapTake(0,reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress()));
+ if(checkKernelArgument("-wex-hda-early-wells"))hdaWellsHold(reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress()));
+ display13AudioWakeAt(reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress()),4);
+ wexHDAVerbTest();
+}
+// -wex-hda-late (diagnostic, opt-in, one shot): skmaiti2050's TGL-H result
+// (b00t0x/WhateverXe#124) is that the iDisp codec answers only when the display
+// power wells are up BEFORE the codec wake and the HDA controller reset. On the
+// 9720 AppleHDA (SimpleHDA) resets the link at ~23 s, before Apple's FB starts
+// (~29 s) and raises the wells. 15 s after FB start, with PW2 already up (set by
+// the FB; this never writes PWR_WELL_CTL*): set the codec-wake override, stop
+// AppleHDA's CORB/RIRB DMA, run a CRST cycle with the override held, send ONE
+// immediate GET_PARAMETER(VENDOR_ID) to codec 2, then restore the override.
+// AppleHDA's command rings stay stopped afterwards (its verbs to the silent
+// codec already time out). The 9720's HDA link carries only the iDisp codec.
+// WEXHDALateTest: {version, stage, PWR_WELL_CTL2, CHICKEN before, after set,
+//  GCTL before, CORBCTL|RIRBCTL<<8, STATESTS after reset, GCTL after, ICIS after,
+//  response, polls, ns, CHICKEN at response, CHICKEN after restore}
+// stage: 1 no HDA, 2 map, 3 PW2 not up, 4 CRST did not come up, 5 ICB busy,
+//        6 verb timeout, 10 response received.
+static uint64_t hdaLateRec[15] {1};
+static volatile uint8_t *hdaLateDisplay;
+static thread_call_t hdaLateCall;
+static void wexHDALateTest(thread_call_param_t,thread_call_param_t) {
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDALateTest",hdaLateRec,sizeof(hdaLateRec));};
+ auto d=hdaLateDisplay;if(!d)return;
+ auto chicken=reinterpret_cast<volatile uint32_t *>(d+0x65F10);
+ hdaLateRec[2]=*reinterpret_cast<volatile uint32_t *>(d+0x45404);
+ if(!(hdaLateRec[2]&(1U<<2))) {hdaLateRec[1]=3;publish();return;} // PW2 state
+ auto pci=wexFindHDA();if(!pci) {hdaLateRec[1]=1;publish();return;}
+ auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+ if(!map || map->getLength()<0x100 || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);pci->release();hdaLateRec[1]=2;publish();return;}
+ auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+ auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+ auto r16=[&](uint32_t o){return static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t *>(b+o));};
+ auto w32=[&](uint32_t o,uint32_t v){*reinterpret_cast<volatile uint32_t *>(b+o)=v;};
+ auto w16=[&](uint32_t o,uint16_t v){*reinterpret_cast<volatile uint16_t *>(b+o)=v;};
+ const uint32_t orig=*chicken;hdaLateRec[3]=orig;
+ *chicken=orig&~(1U<<15);IODelay(1000);*chicken=orig|(1U<<15);IODelay(1000);
+ hdaLateRec[4]=*chicken;hdaLateRec[5]=r32(0x08);hdaLateRec[6]=b[0x4C]|(static_cast<uint32_t>(b[0x5C])<<8);
+ // Stop AppleHDA's command rings (CORBCTL/RIRBCTL DMA run bit1), wait for idle.
+ b[0x4C]=b[0x4C]&~2;b[0x5C]=b[0x5C]&~2;
+ for(unsigned i=0;i<100 && ((b[0x4C]&2) || (b[0x5C]&2));++i)IODelay(10);
+ w16(0x0E,0xFFFF);
+ *chicken=*chicken|(1U<<15); // the FB may have cleared it meanwhile
+ w32(0x08,r32(0x08)&~1U);
+ for(unsigned i=0;i<100 && (r32(0x08)&1);++i)IODelay(10);
+ IODelay(100);
+ w32(0x08,r32(0x08)|1U);
+ for(unsigned i=0;i<100 && !(r32(0x08)&1);++i)IODelay(10);
+ IODelay(1000);
+ hdaLateRec[7]=r16(0x0E);hdaLateRec[8]=r32(0x08);
+ if(!(hdaLateRec[8]&1)) {hdaLateRec[1]=4;}
+ else {
+  unsigned n=0;while((r16(0x68)&1) && n<1000) {IODelay(1);++n;}
+  if(r16(0x68)&1) hdaLateRec[1]=5;
+  else {
+   w16(0x68,2);w32(0x60,(2U<<28)|(0xF00U<<8));w16(0x68,1);
+   uint64_t t0;clock_get_uptime(&t0);
+   n=0;while(!(r16(0x68)&2) && n<2000) {IODelay(1);++n;}
+   hdaLateRec[9]=r16(0x68);hdaLateRec[10]=r32(0x64);hdaLateRec[11]=n;hdaLateRec[13]=*chicken;
+   uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1-t0,&hdaLateRec[12]);
+   hdaLateRec[1]=(hdaLateRec[9]&2) ? 10 : 6;
+   if(hdaLateRec[9]&2)w16(0x68,2);
+  }
+ }
+ *chicken=(*chicken&~(1U<<15))|(orig&(1U<<15));hdaLateRec[14]=*chicken;
+ IOLog("WhateverXe: HDA late test stage=%llu PW_CTL2=%llx STATESTS=%llx response=%llx\n",
+  hdaLateRec[1],hdaLateRec[2],hdaLateRec[7],hdaLateRec[10]);
+ publish();map->release();pci->release();
+}
+static void display13HDALateSchedule(void *target) {
+ volatile uint8_t *base=nullptr;
+ if(hdaLateCall || !checkKernelArgument("-wex-hda-late") || !display13TCReadable(target,base))return;
+ hdaLateDisplay=base;
+ hdaLateCall=thread_call_allocate(wexHDALateTest,nullptr);
+ uint64_t deadline;clock_interval_to_deadline(15,NSEC_PER_SEC,&deadline);
+ if(hdaLateCall)thread_call_enter_delayed(hdaLateCall,deadline);
+}
+// -wex-hda-defer (opt-in): AppleHDAController::start() spawns a kernel thread
+// running handleAsynchronousStart(), which resets the HDA link and probes the
+// codecs. On the 9720 that runs ~23 s into boot, before Apple's FB raises the
+// display power wells (~29 s), so the iDisp codec enumerates but never answers.
+// With the wells up first, a wake + reset makes it answer (-wex-hda-late:
+// GET_PARAMETER(VENDOR_ID)=0x8086281C). Hold only that start thread until the
+// FB has started and PW2 is up (60 s cap, then continue unchanged), pulse the
+// codec-wake override like i915, then run Apple's own start. Never writes the
+// power wells. WEXHDADefer: {version, stage, waitMs, PWR_WELL_CTL2, CHICKEN
+//  before, after set, startNs}; stage 1 routed, 2 waiting, 3 started, 4 timed out.
+static uint64_t hdaDeferRec[7] {1};
+static volatile uint8_t *hdaDeferDisplay;
+static mach_vm_address_t orgHDAAsyncStart;
+static void hdaDeferPublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDADefer",hdaDeferRec,sizeof(hdaDeferRec));}
+static void wrapHDAAsyncStart(void *controller) {
+ hdaDeferRec[1]=2;hdaDeferPublish();
+ unsigned waited=0;
+ auto ready=[]{auto d=hdaDeferDisplay;return d && (*reinterpret_cast<volatile uint32_t *>(d+0x45404)&(1U<<2));};
+ while(!ready() && waited<60000) {IOSleep(100);waited+=100;}
+ hdaDeferRec[2]=waited;
+ if(auto d=hdaDeferDisplay) {
+  hdaDeferRec[3]=*reinterpret_cast<volatile uint32_t *>(d+0x45404);
+  auto chicken=reinterpret_cast<volatile uint32_t *>(d+0x65F10);
+  const uint32_t orig=*chicken;hdaDeferRec[4]=orig;
+  if(orig!=UINT32_MAX) {*chicken=orig&~(1U<<15);IODelay(1000);*chicken=orig|(1U<<15);IODelay(1000);}
+  hdaDeferRec[5]=*chicken;
+ }
+ hdaDeferRec[1]=ready() ? 3 : 4;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&hdaDeferRec[6]);
+ IOLog("WhateverXe: HDA deferred start after %u ms, PW_CTL2=%llx CHICKEN=%llx stage=%llu\n",
+  waited,hdaDeferRec[3],hdaDeferRec[5],hdaDeferRec[1]);
+ hdaDeferPublish();
+ FunctionCast(wrapHDAAsyncStart,orgHDAAsyncStart)(controller);
+}
+// -wex-hda-reprobe (opt-in): AppleHDA probed the iDisp codec at ~25 s, before
+// Apple's FB raised the display power wells, so the codec never answered and
+// its IOHDACodecDevice stayed unregistered (IOHDAFamily "Sound assertion" 146/552).
+// Once the FB publishes audio-codec-info (-wex-dp-audio), redo the probe through
+// AppleHDA's own functions on its own workloop, a few seconds later:
+//  1. clear STATESTS, probeAudioLink(): the codec bit is absent, so AppleHDA
+//     terminates the stale device itself;
+//  2. setPowerStateGated(0) then (2) (its PM off/on: fresh link and rings),
+//     with the i915-style codec-wake pulse in between (wells now up);
+//  3. power-on runs AppleHDA's own probeAudioLink, which creates the codec device
+//     again (its init verbs now get answers); then setCodecProperties(),
+//     registerCodecs(0), registerService().
+// WEXHDAReprobe: {version, stage, STATESTS before, AppleHDA codec mask (+0x2d0)
+//  after power-on, codec device slot bitmap, PWR_WELL_CTL2, CHICKEN after pulse}; stage 1 scheduled, 2 no
+//  controller, 3 no symbols, 4 PW2 down, 10 done.
+static uint64_t hdaReprobeRec[7] {1};
+// WEXHDAPinBuf: {AUDIO_PIN_BUF_CTL before/after at reprobe, before/after at early wake}.
+static uint32_t hdaPinBufRec[4];
+static mach_vm_address_t hdaSetPowerGated,hdaProbeLink,hdaSetCodecProps,hdaRegisterCodecs;
+static thread_call_t hdaReprobeCall;
+static void hdaReprobePublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAReprobe",hdaReprobeRec,sizeof(hdaReprobeRec));}
+static IOReturn hdaReprobeGated(OSObject *owner,void *,void *,void *,void *) {
+ auto ctl=reinterpret_cast<uint8_t *>(owner);
+ auto bar=*reinterpret_cast<volatile uint8_t **>(ctl+0x88);
+ if(!bar) {hdaReprobeRec[1]=2;return kIOReturnNotReady;}
+ auto statests=reinterpret_cast<volatile uint16_t *>(bar+0x0E);
+ using Gated=uint32_t (*)(void *,uint32_t);using Probe=uint32_t (*)(void *);using Reg=void (*)(void *,uint32_t);
+ hdaReprobeRec[2]=*statests;
+ *statests=0x7FFF; // RW1C: the stale codec bit disappears for the first probe
+ reinterpret_cast<Probe>(hdaProbeLink)(owner);
+ reinterpret_cast<Gated>(hdaSetPowerGated)(owner,0);
+ if(auto d=hdaDeferDisplay) {
+  // i915 i915_audio_component_get_power() (Gen12): enable the display audio pin
+  // buffer before the codec is probed. Apple sets it only at the first HDMI mode
+  // set (hwEnableAudio), after AppleHDA's probe: the codec announces but stays silent.
+  auto pinbuf=reinterpret_cast<volatile uint32_t *>(d+0x48414);
+  hdaPinBufRec[0]=*pinbuf;if(hdaPinBufRec[0]!=UINT32_MAX)*pinbuf=hdaPinBufRec[0]|0x80000000U;hdaPinBufRec[1]=*pinbuf;
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPinBuf",hdaPinBufRec,sizeof(hdaPinBufRec));
+  auto chicken=reinterpret_cast<volatile uint32_t *>(d+0x65F10);
+  const uint32_t orig=*chicken;
+  if(orig!=UINT32_MAX) {*chicken=orig&~(1U<<15);IODelay(1000);*chicken=orig|(1U<<15);IODelay(1000);}
+  hdaReprobeRec[6]=*chicken;
+ }
+ // Power-on (setupAudioController) resets the link, runs probeAudioLink itself
+ // and then clears STATESTS again: do NOT probe a second time (that saw 0 and
+ // terminated the device AppleHDA had just created). Read its own results.
+ reinterpret_cast<Gated>(hdaSetPowerGated)(owner,2);
+ hdaReprobeRec[3]=*reinterpret_cast<uint16_t *>(ctl+0x2D0); // AppleHDA codec mask after its probe
+ uint64_t slots=0;
+ for(unsigned i=0;i<15;++i)if(*reinterpret_cast<void **>(ctl+0x170+8*i))slots|=1ULL<<i;
+ hdaReprobeRec[4]=slots;
+ reinterpret_cast<Probe>(hdaSetCodecProps)(owner);
+ reinterpret_cast<Reg>(hdaRegisterCodecs)(owner,0);
+ return kIOReturnSuccess;
+}
+static void hdaReprobeRun(thread_call_param_t,thread_call_param_t) {
+ if(!hdaSetPowerGated || !hdaProbeLink || !hdaSetCodecProps || !hdaRegisterCodecs) {hdaReprobeRec[1]=3;hdaReprobePublish();return;}
+ audSnapTake(2,hdaDeferDisplay);
+ if(auto d=hdaDeferDisplay) {
+  hdaReprobeRec[5]=*reinterpret_cast<volatile uint32_t *>(d+0x45404);
+  if(!(hdaReprobeRec[5]&(1U<<2))) {hdaReprobeRec[1]=4;hdaReprobePublish();return;}
+ }
+ IOService *controller=nullptr;
+ if(auto match=IOService::serviceMatching("AppleHDAController")) {
+  if(auto it=IOService::getMatchingServices(match)) {
+   controller=OSDynamicCast(IOService,it->getNextObject());if(controller)controller->retain();it->release();
+  }
+  match->release();
+ }
+ auto wl=controller ? controller->getWorkLoop() : nullptr;
+ if(!wl) {OSSafeReleaseNULL(controller);hdaReprobeRec[1]=2;hdaReprobePublish();return;}
+ const auto ret=wl->runAction(hdaReprobeGated,controller);
+ if(ret==kIOReturnSuccess) {
+  controller->registerService(0);hdaReprobeRec[1]=10;
+ }
+ IOLog("WhateverXe: HDA reprobe ret=%x STATESTS %llx codecMask=%llx slots=%llx PW_CTL2=%llx CHICKEN=%llx\n",
+  ret,hdaReprobeRec[2],hdaReprobeRec[3],hdaReprobeRec[4],hdaReprobeRec[5],hdaReprobeRec[6]);
+ hdaReprobePublish();controller->release();
+}
+// -wex-hda-regfx (opt-in, one shot): AppleHDAController::gfxMatchedHandler runs at
+// boot before Lilu patches AppleHDA (runtime-loaded by SimpleHDA), sets the HDMI
+// framebuffer's audio-selector, but no framebuffer notification ever reaches it
+// and AppleHDAHDMI_DPDriver never gets handleValidEDID. ~10 s after the FB
+// publishes audio-codec-info: record the controller's IODisplay notifier (+0x1c48),
+// framebuffer-notification handle (+0x1c58) and display state; if +0x1c58 is
+// still 0, call gfxMatchedHandler(ctl, null, <IODisplay under the framebuffer
+// with audio-selector>, <stored notifier>) exactly as the IODisplay match
+// notification does, then record again. The EDID / HDMI / gate traces show the rest.
+// WEXHDARegfx: {version, stage, 1c48 lo32, 1c58 before, ea8 before, 1c58 after,
+//  ea8 after, ret, display found}; stage 1 run, 2 no controller, 3 no symbol,
+//  4 no display, 5 already registered, 10 called.
+// WEXHDAImage: {Lilu image base, size, solved framebufferEventGate, solved vtable, live vtable, live metaclass}.
+static uint64_t hdaImageRec[6];
+// WEXHDARouteBytes: {gate entry bytes 0-7, 8-15, handler entry bytes 0-7, 8-15,
+//  Lilu trampoline for the gate (orgHDAFBGate), for the handler (orgHDAFBEvent)}.
+static mach_vm_address_t orgHDAFBEvent,orgHDAFBGate;
+static mach_vm_address_t hdaHandlerAddr;
+static uint64_t hdaRouteBytes[6];
+static uint64_t hdaRegfxRec[9] {1};
+static mach_vm_address_t hdaGfxMatchedFn;
+static uint64_t hdaFBEvents[1+32*8];
+static mach_vm_address_t hdaReadyFBMsgFn;
+// WEXHDAReadyFB: {ed0 before, queue empty before, called, ed0 after, handler events before, after}.
+static uint64_t hdaReadyFBRec[6];
+static thread_call_t hdaRegfxCall;
+static IOService *hdaFindAudioDisplay() {
+ IOService *found=nullptr;
+ if(auto match=IOService::serviceMatching("IODisplay")) {
+  if(auto it=IOService::getMatchingServices(match)) {
+   while(auto o=it->getNextObject()) {
+    auto disp=OSDynamicCast(IOService,o);if(!disp)continue;
+    for(IORegistryEntry *p=disp->getParentEntry(gIOServicePlane);p;p=p->getParentEntry(gIOServicePlane)) {
+     if(p->getProperty("audio-selector")) {found=disp;break;}
+     if(p->getProperty("IOFBDependentIndex"))break; // reached a framebuffer without audio-selector
+    }
+    if(found) {found->retain();break;}
+   }
+   it->release();
+  }
+  match->release();
+ }
+ return found;
+}
+static void hdaRegfxRun(thread_call_param_t,thread_call_param_t) {
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDARegfx",hdaRegfxRec,sizeof(hdaRegfxRec));};
+ hdaRegfxRec[1]=1;
+ if(!hdaGfxMatchedFn) {hdaRegfxRec[1]=3;publish();return;}
+ IOService *controller=nullptr;
+ if(auto match=IOService::serviceMatching("AppleHDAController")) {
+  if(auto it=IOService::getMatchingServices(match)) {controller=OSDynamicCast(IOService,it->getNextObject());if(controller)controller->retain();it->release();}
+  match->release();
+ }
+ if(!controller) {hdaRegfxRec[1]=2;publish();return;}
+ auto c=reinterpret_cast<uint8_t *>(controller);
+ auto notifier=*reinterpret_cast<IONotifier **>(c+0x1C48);
+ hdaImageRec[4]=*reinterpret_cast<uintptr_t *>(c); // live vtable pointer
+ if(hdaImageRec[2]) {memcpy(&hdaRouteBytes[0],reinterpret_cast<const void *>(hdaImageRec[2]),16);}
+ if(hdaHandlerAddr) {memcpy(&hdaRouteBytes[2],reinterpret_cast<const void *>(hdaHandlerAddr),16);}
+ hdaRouteBytes[4]=orgHDAFBGate;hdaRouteBytes[5]=orgHDAFBEvent;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDARouteBytes",hdaRouteBytes,sizeof(hdaRouteBytes));
+ hdaImageRec[5]=reinterpret_cast<uintptr_t>(controller->getMetaClass());
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAImage",hdaImageRec,sizeof(hdaImageRec));
+ hdaRegfxRec[2]=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(notifier));
+ hdaRegfxRec[3]=*reinterpret_cast<uintptr_t *>(c+0x1C58);hdaRegfxRec[4]=*reinterpret_cast<uint32_t *>(c+0xEA8);
+ // (+0x1C58 is an IORecursiveLock, not the notifier handle: no skip.)
+ auto display=hdaFindAudioDisplay();
+ hdaRegfxRec[8]=display!=nullptr;
+ if(!display) {hdaRegfxRec[1]=4;publish();controller->release();return;}
+ using Matched=bool (*)(void *,void *,IOService *,IONotifier *);
+ hdaRegfxRec[7]=reinterpret_cast<Matched>(hdaGfxMatchedFn)(controller,nullptr,display,notifier);
+ hdaRegfxRec[5]=*reinterpret_cast<uintptr_t *>(c+0x1C58);hdaRegfxRec[6]=*reinterpret_cast<uint32_t *>(c+0xEA8);
+ hdaRegfxRec[1]=10;
+ // AppleHDAController queues every framebuffer event while +0xed0 is clear; only
+ // readyToSendFBMsg() (normally reached from AppleHDACodecGeneric::
+ // notifyControllerPresent) sets it and drains the queue through
+ // framebufferEventHandler. That call never happens on this machine.
+ // DANGER: on 2026-11-15 this drained events into an AppleHDAHDMI_DPDriver whose
+ // codec link (+0x158) is NULL -> page fault in handleValidEDIDAction+0x40.
+ // Only with the separate opt-in -wex-hda-readyfb.
+ if(hdaReadyFBMsgFn && checkKernelArgument("-wex-hda-readyfb")) {
+  hdaReadyFBRec[0]=c[0xED0];hdaReadyFBRec[1]=*reinterpret_cast<uintptr_t *>(c+0xEB8)==reinterpret_cast<uintptr_t>(c+0xEB8);
+  hdaReadyFBRec[4]=hdaFBEvents[0];
+  if(!(c[0xED0]&1) && *reinterpret_cast<void **>(c+0xEC8)) {
+   using Ready=void (*)(void *);
+   reinterpret_cast<Ready>(hdaReadyFBMsgFn)(controller);hdaReadyFBRec[2]=1;
+  }
+  hdaReadyFBRec[3]=c[0xED0];hdaReadyFBRec[5]=hdaFBEvents[0];
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAReadyFB",hdaReadyFBRec,sizeof(hdaReadyFBRec));
+  IOLog("WhateverXe: HDA readyToSendFBMsg ed0 %llu->%llu, handler events %llu->%llu\n",hdaReadyFBRec[0],hdaReadyFBRec[3],hdaReadyFBRec[4],hdaReadyFBRec[5]);
+ }
+ IOLog("WhateverXe: HDA regfx gfxMatchedHandler ret=%llu fbNotify %llx->%llx attached %llu->%llu\n",
+  hdaRegfxRec[7],hdaRegfxRec[3],hdaRegfxRec[5],hdaRegfxRec[4],hdaRegfxRec[6]);
+ publish();display->release();controller->release();
+}
+static void hdaRegfxSchedule() {
+ if(hdaRegfxCall || !checkKernelArgument("-wex-hda-regfx"))return;
+ hdaRegfxCall=thread_call_allocate(hdaRegfxRun,nullptr);
+ if(!hdaRegfxCall)return;
+ uint64_t deadline;clock_interval_to_deadline(10,NSEC_PER_SEC,&deadline);
+ thread_call_enter_delayed(hdaRegfxCall,deadline);
+}
+void hdaReprobeSchedule() {
+ hdaRegfxSchedule();
+ if(hdaReprobeCall || !checkKernelArgument("-wex-hda-reprobe"))return;
+ hdaReprobeCall=thread_call_allocate(hdaReprobeRun,nullptr);
+ if(!hdaReprobeCall)return;
+ hdaReprobeRec[1]=1;hdaReprobePublish();
+ uint64_t deadline;clock_interval_to_deadline(5,NSEC_PER_SEC,&deadline);
+ thread_call_enter_delayed(hdaReprobeCall,deadline);
+}
+// -wex-hda-trace (read-only diagnostic): record AppleHDAController's IOFramebuffer
+// notifications (framebufferEventHandler(ref, fb, event, info)) and its display
+// state after each, to see why AppleHDAHDMI_DPDriver stays unregistered.
+// WEXHDAFBEvents: {count, then 32 records of 8 words: uptimeMs, fbIOFBIndex|event<<32,
+//  info word0, ret, state 0xea0, 0xea8, bytes 0xee9|0x2c0<<8|0x2c2<<16, fb ptr low 32}.
+// WEXHDAChain (read-only): {gfxMatched calls, last ret, ea8 after,
+//  edidValid calls, last len, last int arg, last ret, validEDID calls, invalidEDID calls}.
+static uint64_t hdaChain[9];
+static mach_vm_address_t orgHDAGfxMatched,orgHDAEdidValid,orgHDAValidEDID,orgHDAInvalidEDID;
+static void hdaChainPublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAChain",hdaChain,sizeof(hdaChain));}
+static bool wrapHDAGfxMatched(void *self,void *ref,IOService *svc,IONotifier *n) {
+ const bool r=FunctionCast(wrapHDAGfxMatched,orgHDAGfxMatched)(self,ref,svc,n);
+ hdaChain[0]++;hdaChain[1]=r;hdaChain[2]=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(self)+0xEA8);
+ hdaChainPublish();return r;
+}
+// -wex-hda-eld (opt-in): Apple's framebuffer enables audio output for the external
+// display's transcoder (AUD_PIN_ELD_CP_VLD output-enable) but never writes an ELD or
+// sets ELD-valid on this platform (9720: transcoder B nibble 0x4), so the codec pin
+// reports presence=1 ELDV=0 and AppleHDA creates no output. Do what Linux
+// hsw_audio_codec_enable does: build an ELD v2 from the EDID AppleHDA validated
+// (drm_edid_to_eld layout), reset the ELD write address, write up to 84 bytes to
+// AUD_EDID_DATA, then set ELD-valid -- only for transcoders with output enabled and
+// ELD-valid clear.
+// WEXHDAEld: {writes, last transcoder, ELD length, CP_VLD before, CP_VLD after, SAD count, conn type, edid len}.
+static uint8_t hdaEdidCopy[256];
+static uint32_t hdaEdidLen;
+static uint32_t hdaEldRec[8];
+static uint32_t hdaBuildEld(uint8_t *eld,uint32_t cap,uint32_t &sads) {
+ sads=0;
+ if(hdaEdidLen<256 || cap<84)return 0;
+ const uint8_t *e=hdaEdidCopy,*cea=hdaEdidCopy+128;
+ if(cea[0]!=0x02)return 0;
+ memset(eld,0,cap);
+ // monitor name from base block descriptors (tag 0xFC), up to 16 chars
+ char name[16];uint32_t mnl=0;
+ for(int d=0;d<4;d++) {
+  const uint8_t *desc=e+54+d*18;
+  if(desc[0]==0 && desc[1]==0 && desc[3]==0xFC) {
+   for(int i=0;i<13 && mnl<16;i++){char ch=static_cast<char>(desc[5+i]);if(ch=='\n')break;name[mnl++]=ch;}
+   while(mnl && name[mnl-1]==' ')mnl--;
+   break;
+  }
+ }
+ uint8_t sadBuf[30];uint8_t spk=0;
+ const uint32_t dtd=cea[2];
+ for(uint32_t i=4;dtd>4 && i<dtd && i<127;) {
+  const uint8_t tag=cea[i]>>5,len=cea[i]&0x1F;
+  if(i+1+len>127)break;
+  if(tag==1)for(uint32_t k=0;k+2<len && sads<10;k+=3){memcpy(sadBuf+sads*3,cea+i+1+k,3);sads++;}
+  if(tag==4 && len>=1)spk=cea[i+1];
+  i+=1+len;
+ }
+ if(!sads)return 0;
+ eld[0]=2<<3;                       // ELD version 2
+ eld[4]=static_cast<uint8_t>((cea[1]<<5)|mnl); // CEA EDID version, monitor name length
+ eld[5]=static_cast<uint8_t>((sads<<4)|(1<<2)); // SAD count, connection type DisplayPort
+ eld[7]=spk;                        // speaker allocation
+ eld[16]=e[8];eld[17]=e[9];eld[18]=e[10];eld[19]=e[11]; // manufacturer, product code
+ memcpy(eld+20,name,mnl);
+ uint32_t len=20+mnl;
+ if(len+sads*3>cap)sads=(cap-len)/3;
+ memcpy(eld+len,sadBuf,sads*3);len+=sads*3;
+ eld[2]=static_cast<uint8_t>((len-4+3)/4); // baseline ELD length in dwords
+ return (len+3)&~3U;
+}
+static void hdaWriteEld(IOService *fb) {
+ if(!fb || (!checkKernelArgument("-wex-hda-eld") && !hdaHdmiAudio()))return;
+ uint8_t eld[84];uint32_t sads=0;
+ const uint32_t len=hdaBuildEld(eld,sizeof(eld),sads);
+ hdaEldRec[2]=len;hdaEldRec[5]=sads;hdaEldRec[6]=1;hdaEldRec[7]=hdaEdidLen;
+ if(!len) {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEld",hdaEldRec,sizeof(hdaEldRec));return;}
+ IOPCIDevice *pci=nullptr;
+ for(IOService *p=fb;p && !pci;p=p->getProvider())pci=OSDynamicCast(IOPCIDevice,p);
+ if(!pci)return;
+ if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+  if(map->getLength()>=0x70000 && map->getVirtualAddress()) {
+   auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+   auto reg=[&](uint32_t o)->volatile uint32_t &{return *reinterpret_cast<volatile uint32_t *>(b+o);};
+   const uint32_t vld=reg(0x650C0);hdaEldRec[3]=vld;
+   for(uint32_t t=0;t<4;t++) {
+    const uint32_t outEnable=1U<<(4*t+2),eldValid=1U<<(4*t);
+    if(!(vld&outEnable) || (vld&eldValid))continue;
+    reg(0x650B4+0x100*t)=reg(0x650B4+0x100*t)&~(0x1FU<<5);    // reset ELD write address
+    for(uint32_t i=0;i<len/4;i++){uint32_t d;memcpy(&d,eld+i*4,4);reg(0x65050+0x100*t)=d;}
+    reg(0x650C0)=reg(0x650C0)|eldValid;
+    hdaEldRec[0]++;hdaEldRec[1]=t;
+   }
+   hdaEldRec[4]=reg(0x650C0);
+  }
+  map->release();
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEld",hdaEldRec,sizeof(hdaEldRec));
+}
+static bool wrapHDAEdidValid(void *self,OSData *edid,int arg) {
+ const bool r=FunctionCast(wrapHDAEdidValid,orgHDAEdidValid)(self,edid,arg);
+ if(r && edid && edid->getLength()>=256) {memcpy(hdaEdidCopy,edid->getBytesNoCopy(),256);hdaEdidLen=256;}
+ hdaChain[3]++;hdaChain[4]=edid ? edid->getLength() : UINT64_MAX;hdaChain[5]=static_cast<uint32_t>(arg);hdaChain[6]=r;
+ hdaChainPublish();return r;
+}
+static uint64_t wrapHDAValidEDID(void *self,void *head) {
+ const bool trace=checkKernelArgument("-wex-hda-trace");
+ if(trace) {hdaChain[7]++;hdaChainPublish();hdaRecordValidEDIDEntry(head);}
+ const auto r=FunctionCast(wrapHDAValidEDID,orgHDAValidEDID)(self,head);
+ if(trace)hdaHotplugRecord(self,1,r);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAValidEDIDRet",static_cast<unsigned long long>(static_cast<uint32_t>(r)),32);
+ return r;
+}
+static uint64_t wrapHDAInvalidEDID(void *self,void *head) {
+ const bool trace=checkKernelArgument("-wex-hda-trace");
+ if(trace) {hdaChain[8]++;hdaChainPublish();}
+ const auto r=FunctionCast(wrapHDAInvalidEDID,orgHDAInvalidEDID)(self,head);
+ if(trace)hdaHotplugRecord(self,2,r);
+ return r;
+}
+
+// WEXHDAFBGate: {count, then 32 records of 4 words: uptimeMs, event|fbIndex<<32,
+//  ctl+0xec8 (gate ptr low32) | ctl+0xed0 byte<<32 | ctl+0xea8<<40, ret}.
+static uint64_t hdaFBGate[1+32*4];
+static IOReturn wrapHDAFBGate(void *self,void *ref,IOService *fb,int event,void *info) {
+ auto c=static_cast<uint8_t *>(self);
+ const uint64_t pre=static_cast<uint32_t>(*reinterpret_cast<uintptr_t *>(c+0xEC8))|(static_cast<uint64_t>(c[0xED0])<<32)|(static_cast<uint64_t>(*reinterpret_cast<uint16_t *>(c+0xEA8))<<40);
+ const auto ret=FunctionCast(wrapHDAFBGate,orgHDAFBGate)(self,ref,fb,event,info);
+ const auto n=hdaFBGate[0]++;auto r=hdaFBGate+1+(n%32)*4;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&r[0]);r[0]/=1000000;
+ uint32_t fbIndex=UINT32_MAX;
+ if(fb)if(auto num=OSDynamicCast(OSNumber,fb->getProperty("IOFBDependentIndex")))fbIndex=num->unsigned32BitValue();
+ r[1]=static_cast<uint32_t>(event)|(static_cast<uint64_t>(fbIndex)<<32);r[2]=pre;r[3]=static_cast<uint32_t>(ret);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAFBGate",hdaFBGate,sizeof(hdaFBGate));
+ return ret;
+}
+
+static IOReturn wrapHDAFBEvent(void *self,void *ref,IOService *fb,int event,void *info) {
+ if(hdaHdmiAudio()) {if(event==2)hdaAssertAllPins();hdaFixAudioCodecInfo(fb);}
+ if(event==2)hdaWriteEld(fb); // before AppleHDA evaluates the head (pin sense / ELD)
+ const auto ret=FunctionCast(wrapHDAFBEvent,orgHDAFBEvent)(self,ref,fb,event,info);
+ if(event==2)hdaWriteEld(fb); // output enable may only be set during the handler; no-op once ELD-valid
+ if(!checkKernelArgument("-wex-hda-trace"))return ret;
+ auto c=static_cast<uint8_t *>(self);
+ const auto n=hdaFBEvents[0]++;auto r=hdaFBEvents+1+(n%32)*8;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&r[0]);r[0]/=1000000;
+ uint32_t fbIndex=UINT32_MAX;
+ if(fb)if(auto num=OSDynamicCast(OSNumber,fb->getProperty("IOFBDependentIndex")))fbIndex=num->unsigned32BitValue();
+ r[1]=fbIndex|(static_cast<uint64_t>(static_cast<uint32_t>(event))<<32);
+ // info is event-specific and is not always a pointer (a display-mode change
+ // passes small integers such as 1), so record the raw value, never dereference it.
+ r[2]=reinterpret_cast<uintptr_t>(info);
+ r[3]=static_cast<uint32_t>(ret);
+ r[4]=*reinterpret_cast<uint32_t *>(c+0xEA0);r[5]=*reinterpret_cast<uint32_t *>(c+0xEA8);
+ r[6]=c[0xEE9]|(static_cast<uint64_t>(c[0x2C0])<<8)|(static_cast<uint64_t>(c[0x2C2])<<16);
+ r[7]=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(fb))|(static_cast<uint64_t>(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ref)))<<32);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAFBEvents",hdaFBEvents,sizeof(hdaFBEvents));
+ // active probes (codec verbs, BAR reads) only with -wex-hda-probe: with them on, a display
+ // replug hung the machine, so -wex-hda-trace stays passive.
+ if(event==2 && checkKernelArgument("-wex-hda-probe")) {hdaProbePinSense();hdaProbeDisplayAudio(fb);}
+ // WEXHDAHeads (read-only): AppleHDAController head-association table, 8 slots of 0x1A8
+ // at ctl+0xF08 (framebufferEventHandler only acts when slot[0]==fb && slot+0x28==ref).
+ // {ctl+0x1E74 byte | ctl+0x298 u16<<8, then per slot: fb lo32 | index(+0x28)<<32,
+ //  flags(+0x38) | +0x12C<<8 (u16 lo), +0x130 | +0x134<<32, +0x138 | +0x150<<32}.
+ {
+  static uint64_t heads[1+8*4];
+  heads[0]=c[0x1E74]|(static_cast<uint64_t>(*reinterpret_cast<uint16_t *>(c+0x298))<<8);
+  for(int i=0;i<8;i++) {
+   auto e=c+0xF08+i*0x1A8;auto h=heads+1+i*4;
+   h[0]=static_cast<uint32_t>(*reinterpret_cast<uintptr_t *>(e))|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(e+0x28))<<32);
+   h[1]=e[0x38]|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(e+0x12C))<<8);
+   h[2]=*reinterpret_cast<uint32_t *>(e+0x130)|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(e+0x134))<<32);
+   h[3]=*reinterpret_cast<uint32_t *>(e+0x138)|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(e+0x150))<<32);
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAHeads",heads,sizeof(heads));
+ }
+ return ret;
+}
+// -wex-hda-trace, IOGraphicsFamily side (read-only): who registers framebuffer
+// notifications on which framebuffer, and which events each framebuffer delivers.
+// IOGraphicsFamily is patched early, before SimpleHDA loads AppleHDA at runtime.
+// WEXFBNotifyAdd: {count, 16 x 4: class name bytes 0-7, 8-15, fbIndex|handler lo32<<32, notifier lo32}.
+// WEXFBNotifyDeliver: {count, per-fb counts[4], last 32 x 2: ms<<32|fbIndex<<16|event&0xffff, ret}.
+static uint64_t fbNotifyAdd[1+16*4],fbNotifyDeliver[1+4+32*2];
+static mach_vm_address_t orgFBNotifyAdd,orgFBNotifyDeliver;
+static uint32_t fbIndexOf(void *fb) {
+ auto svc=static_cast<IOService *>(fb);
+ if(auto n=OSDynamicCast(OSNumber,svc->getProperty("IOFBDependentIndex")))return n->unsigned32BitValue();
+ return 0xFFFF;
+}
+static void *wrapFBNotifyAdd(void *fb,void *handler,OSObject *target,void *ref) {
+ auto r=FunctionCast(wrapFBNotifyAdd,orgFBNotifyAdd)(fb,handler,target,ref);
+ const auto n=fbNotifyAdd[0]++;
+ if(n<16) {
+  auto e=fbNotifyAdd+1+n*4;char name[16] {};
+  if(target)if(auto mc=target->getMetaClass())strlcpy(name,mc->getClassName(),sizeof(name));
+  memcpy(&e[0],name,8);memcpy(&e[1],name+8,8);
+  e[2]=fbIndexOf(fb)|(static_cast<uint64_t>(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(handler)))<<32);
+  e[3]=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(r));
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXFBNotifyAdd",fbNotifyAdd,sizeof(fbNotifyAdd));
+ return r;
+}
+static IOReturn wrapFBNotifyDeliver(void *fb,int event,void *info) {
+ const auto ret=FunctionCast(wrapFBNotifyDeliver,orgFBNotifyDeliver)(fb,event,info);
+ const auto idx=fbIndexOf(fb);const auto n=fbNotifyDeliver[0]++;
+ if(idx<4)fbNotifyDeliver[1+idx]++;
+ uint64_t t;clock_get_uptime(&t);uint64_t ns;absolutetime_to_nanoseconds(t,&ns);
+ auto e=fbNotifyDeliver+5+(n%32)*2;
+ e[0]=((ns/1000000)<<32)|((static_cast<uint64_t>(idx)&0xFFFF)<<16)|(static_cast<uint32_t>(event)&0xFFFF);e[1]=static_cast<uint32_t>(ret);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXFBNotifyDeliver",fbNotifyDeliver,sizeof(fbNotifyDeliver));
+ return ret;
+}
+} // namespace (reopened below): kern_host.cpp calls this, so it needs external linkage
+bool wexFBNotifyTraceProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(orgFBNotifyAdd || !checkKernelArgument("-wex-hda-trace"))return false;
+ KernelPatcher::RouteRequest r[] {
+  {"__ZN13IOFramebuffer26addFramebufferNotificationEPFiP8OSObjectPvPS_iS2_ES1_S2_",wrapFBNotifyAdd,orgFBNotifyAdd},
+  {"__ZN13IOFramebuffer30deliverFramebufferNotificationEiPv",wrapFBNotifyDeliver,orgFBNotifyDeliver}};
+ const bool ok=patcher.routeMultiple(index,r,arrsize(r),address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXFBNotifyTraceReady",ok);
+ return ok;
+}
+// AppleHDA kexts are linked at runtime by SimpleHDA: Lilu resolves their symbols
+// correctly, but routeMultiple(index,...) leaves the live code unpatched (entry
+// bytes stay the original prologue, trampolines 0). Route by resolved address.
+// AppleHDA kexts are linked at runtime by SimpleHDA. Lilu resolves their symbols
+// but cannot route them: routeMultiple(index) is a silent no-op and routeFunction
+// returns DisasmFailure for every function. Hook by hand instead: each target's
+// prologue is a fixed, RIP-independent push/mov/sub sequence (checked byte for
+// byte against the live code before anything is written). A naked stub in this
+// kext re-executes that prologue and jumps to target+len; the target's first 14
+// bytes become an absolute jmp to the wrapper (MachInfo::setKernelWriting, as
+// kern_dvmt.cpp does). Mismatch => no write, hook reported as failed.
+#define WEX_HDA_STUB(name,...) \
+ extern "C" uint64_t wexHdaRet_##name; uint64_t wexHdaRet_##name; \
+ extern "C" void wexHdaStub_##name(); \
+ __asm__(".text\n.globl _wexHdaStub_" #name "\n_wexHdaStub_" #name ":\n.byte " #__VA_ARGS__ "\njmpq *_wexHdaRet_" #name "(%rip)\n");
+WEX_HDA_STUB(gate,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18)
+WEX_HDA_STUB(handler,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x18,0x03,0x00,0x00)
+WEX_HDA_STUB(gfxm,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x68)
+WEX_HDA_STUB(edid,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38)
+WEX_HDA_STUB(valid,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38)
+WEX_HDA_STUB(invalid,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50)
+WEX_HDA_STUB(dstart,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x50)
+WEX_HDA_STUB(dinithw,0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0x89,0xf3,0x49,0x89,0xfe,0x48,0x8b,0x07)
+WEX_HDA_STUB(dinitact,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18)
+WEX_HDA_STUB(dcomplete,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x58,0x01,0x00,0x00)
+WEX_HDA_STUB(dcreate,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x48)
+WEX_HDA_STUB(dactivate,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50)
+WEX_HDA_STUB(cgstart,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28)
+WEX_HDA_STUB(cgmsg,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xcb,0x49,0x89,0xff)
+WEX_HDA_STUB(dpmsg,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x10)
+WEX_HDA_STUB(dpcreate,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50)
+WEX_HDA_STUB(engstart,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xd3,0x49,0x89,0xf6)
+WEX_HDA_STUB(enginit,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28)
+WEX_HDA_STUB(outinit,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x89,0xfb)
+WEX_HDA_STUB(outstream,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30)
+WEX_HDA_STUB(dpstream,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30)
+WEX_HDA_STUB(dpformats,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x18,0x01,0x00,0x00)
+WEX_HDA_STUB(psenable,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28)
+WEX_HDA_STUB(pssupported,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x89,0xcb,0x41,0x89,0xd6)
+WEX_HDA_STUB(dpvedid,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38)
+WEX_HDA_STUB(dpvrate,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50)
+WEX_HDA_STUB(engpstart,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x58)
+WEX_HDA_STUB(dpaddsrc,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x49,0x89,0xfe)
+struct HDAHookSpec {const char *symbol;const uint8_t *prologue;size_t len;void (*stub)();uint64_t *ret;};
+static const uint8_t hdaPro17_18[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+static const uint8_t hdaPro20[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x18,0x03,0x00,0x00};
+static const uint8_t hdaPro17_68[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x68};
+static const uint8_t hdaPro17_38[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38};
+static const uint8_t hdaPro14[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+static const uint8_t hdaProDStart[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x50};
+static const uint8_t hdaProDInitHw[] {0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0x89,0xf3,0x49,0x89,0xfe,0x48,0x8b,0x07};
+static const uint8_t hdaPro17_48[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x48};
+static const uint8_t hdaPro17_28[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28};
+static const uint8_t hdaPro17_58[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x58};
+static const uint8_t hdaProDPAddSrc[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x49,0x89,0xfe};
+static const uint8_t hdaProCGMsg[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xcb,0x49,0x89,0xff};
+static const uint8_t hdaProDPMsg[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x10};
+static const uint8_t hdaProEngStart[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xd3,0x49,0x89,0xf6};
+static const uint8_t hdaProOutInit[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x89,0xfb};
+static const uint8_t hdaProOutStream[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30};
+static const uint8_t hdaProDPFormats[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x18,0x01,0x00,0x00};
+static const uint8_t hdaProPSSupported[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x89,0xcb,0x41,0x89,0xd6};
+static const uint8_t hdaProDComplete[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x58,0x01,0x00,0x00};
+static const HDAHookSpec hdaHookSpecs[] {
+ {"__ZN18AppleHDAController20framebufferEventGateEPvP13IOFramebufferiS0_",hdaPro17_18,sizeof(hdaPro17_18),wexHdaStub_gate,&wexHdaRet_gate},
+ {"__ZN18AppleHDAController23framebufferEventHandlerEPvP13IOFramebufferiS0_",hdaPro20,sizeof(hdaPro20),wexHdaStub_handler,&wexHdaRet_handler},
+ {"__ZN18AppleHDAController17gfxMatchedHandlerEPvP9IOServiceP10IONotifier",hdaPro17_68,sizeof(hdaPro17_68),wexHdaStub_gfxm,&wexHdaRet_gfxm},
+ {"__ZN18AppleHDAController19edidIsValidForAudioEP6OSDatai",hdaPro17_38,sizeof(hdaPro17_38),wexHdaStub_edid,&wexHdaRet_edid},
+ {"__ZN21AppleHDAHDMI_DPDriver15handleValidEDIDEP27HDAGFXHeadAssociationStruct",hdaPro17_38,sizeof(hdaPro17_38),wexHdaStub_valid,&wexHdaRet_valid},
+ {"__ZN21AppleHDAHDMI_DPDriver17handleInvalidEDIDEP27HDAGFXHeadAssociationStruct",hdaPro14,sizeof(hdaPro14),wexHdaStub_invalid,&wexHdaRet_invalid},
+ {"__ZN14AppleHDADriver5startEP9IOService",hdaProDStart,sizeof(hdaProDStart),wexHdaStub_dstart,&wexHdaRet_dstart},
+ {"__ZN14AppleHDADriver12initHardwareEP9IOService",hdaProDInitHw,sizeof(hdaProDInitHw),wexHdaStub_dinithw,&wexHdaRet_dinithw},
+ {"__ZN14AppleHDADriver18initHardwareActionEP9IOService",hdaPro17_18,sizeof(hdaPro17_18),wexHdaStub_dinitact,&wexHdaRet_dinitact},
+ {"__ZN14AppleHDADriver13completeStartEv",hdaProDComplete,sizeof(hdaProDComplete),wexHdaStub_dcomplete,&wexHdaRet_dcomplete},
+ {"__ZN14AppleHDADriver18createAudioEnginesEP7OSArray",hdaPro17_48,sizeof(hdaPro17_48),wexHdaStub_dcreate,&wexHdaRet_dcreate},
+ {"__ZN14AppleHDADriver20activateAudioEnginesEv",hdaPro14,sizeof(hdaPro14),wexHdaStub_dactivate,&wexHdaRet_dactivate},
+ {"__ZN20AppleHDACodecGeneric5startEP9IOService",hdaPro17_28,sizeof(hdaPro17_28),wexHdaStub_cgstart,&wexHdaRet_cgstart},
+ {"__ZN20AppleHDACodecGeneric7messageEjP9IOServicePv",hdaProCGMsg,sizeof(hdaProCGMsg),wexHdaStub_cgmsg,&wexHdaRet_cgmsg},
+ {"__ZN21AppleHDAHDMI_DPDriver7messageEjP9IOServicePv",hdaProDPMsg,sizeof(hdaProDPMsg),wexHdaStub_dpmsg,&wexHdaRet_dpmsg},
+ {"__ZN21AppleHDAHDMI_DPDriver25createAudioOutputEngineDPEP7OSArrayiP27HDAGFXHeadAssociationStruct",hdaPro14,sizeof(hdaPro14),wexHdaStub_dpcreate,&wexHdaRet_dpcreate},
+ {"__ZN14AppleHDAEngine5startEP9IOServiceP13IOAudioDevice",hdaProEngStart,sizeof(hdaProEngStart),wexHdaStub_engstart,&wexHdaRet_engstart},
+ {"__ZN14AppleHDAEngine12initHardwareEP9IOService",hdaPro17_28,sizeof(hdaPro17_28),wexHdaStub_enginit,&wexHdaRet_enginit},
+ {"__ZN20AppleHDAEngineOutput12initHardwareEP9IOService",hdaProOutInit,sizeof(hdaProOutInit),wexHdaStub_outinit,&wexHdaRet_outinit},
+ {"__ZN20AppleHDAEngineOutput15initAudioStreamEv",hdaProOutStream,sizeof(hdaProOutStream),wexHdaStub_outstream,&wexHdaRet_outstream},
+ {"__ZN22AppleHDAEngineOutputDP15initAudioStreamEv",hdaProOutStream,sizeof(hdaProOutStream),wexHdaStub_dpstream,&wexHdaRet_dpstream},
+ {"__ZN22AppleHDAEngineOutputDP23publishAvailableFormatsEP13IOAudioStreamP20_IOAudioStreamFormatP18_IOAudioSampleRatejPb",hdaProDPFormats,sizeof(hdaProDPFormats),wexHdaStub_dpformats,&wexHdaRet_dpformats},
+ {"__ZN15AppleHDAPathSet6enableEP11IOHDAStreamjj",hdaPro17_28,sizeof(hdaPro17_28),wexHdaStub_psenable,&wexHdaRet_psenable},
+ {"__ZN15AppleHDAPathSet22isAudioStreamSupportedEjjj",hdaProPSSupported,sizeof(hdaProPSSupported),wexHdaStub_pssupported,&wexHdaRet_pssupported},
+ {"__ZN22AppleHDAEngineOutputDP18validateEdidFormatEjjjjj",hdaPro17_38,sizeof(hdaPro17_38),wexHdaStub_dpvedid,&wexHdaRet_dpvedid},
+ {"__ZN22AppleHDAEngineOutputDP30validateSampleRateForVideoModeEjjjj",hdaPro14,sizeof(hdaPro14),wexHdaStub_dpvrate,&wexHdaRet_dpvrate},
+ {"__ZN14AppleHDAEngine23performAudioEngineStartEv",hdaPro17_58,sizeof(hdaPro17_58),wexHdaStub_engpstart,&wexHdaRet_engpstart},
+ {"__ZN21AppleHDAHDMI_DPDriver26addAdditionalDPAudioSourceEP27HDAGFXHeadAssociationStruct",hdaProDPAddSrc,sizeof(hdaProDPAddSrc),wexHdaStub_dpaddsrc,&wexHdaRet_dpaddsrc},
+};
+// WEXHDARouteErr: {attempts, then per attempt: 1 hooked | 2 symbol missing | 3 prologue mismatch | 4 write failed}.
+static uint64_t hdaRouteErr[31];
+static bool hdaRouteAddr(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,
+ const char *symbol,void *wrapper,mach_vm_address_t &org) {
+ const auto n=hdaRouteErr[0]<30 ? ++hdaRouteErr[0] : 30;auto &rec=hdaRouteErr[n];
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDARouteErr",hdaRouteErr,sizeof(hdaRouteErr));};
+ const HDAHookSpec *spec=nullptr;
+ for(auto &h:hdaHookSpecs)if(!strcmp(h.symbol,symbol))spec=&h;
+ const auto from=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ if(!spec || !from) {rec=2;publish();return false;}
+ if(memcmp(reinterpret_cast<const void *>(from),spec->prologue,spec->len)) {rec=3;publish();return false;}
+ *spec->ret=from+spec->len;
+ uint8_t jump[14] {0xFF,0x25,0,0,0,0};
+ const auto target=reinterpret_cast<uint64_t>(wrapper);memcpy(jump+6,&target,sizeof(target));
+ if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS) {rec=4;publish();return false;}
+ lilu_os_memcpy(reinterpret_cast<void *>(from),jump,sizeof(jump));
+ MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+ if(memcmp(reinterpret_cast<const void *>(from),jump,sizeof(jump))) {rec=4;publish();return false;}
+ org=reinterpret_cast<mach_vm_address_t>(spec->stub);rec=1;publish();return true;
+}
+// WEXHDADrvStart (read-only): AppleHDADriver start path for each driver object.
+// {count, then 16 x 4: class name 0-7, 8-15, fn(1 start,2 initHardware,3 initHardwareAction,4 completeStart)|ret lo32<<8, this+0x158 after}.
+static uint64_t hdaDrvStart[1+16*4];
+static mach_vm_address_t orgDStart,orgDInitHw,orgDInitAct,orgDComplete,orgDCreate,orgDActivate;
+// WEXHDAEngines: {createAudioEngines calls, last ret, last paths ptr lo32, last paths count, activateAudioEngines calls, last ret}.
+static uint64_t hdaEngines[6];
+static void hdaDrvRecord(void *self,unsigned fn,uint64_t ret) {
+ const auto n=hdaDrvStart[0]++;
+ if(n<16) {
+  auto e=hdaDrvStart+1+n*4;char name[16] {};
+  if(auto mc=static_cast<OSObject *>(self)->getMetaClass())strlcpy(name,mc->getClassName(),sizeof(name));
+  memcpy(&e[0],name,8);memcpy(&e[1],name+8,8);
+  e[2]=fn|(static_cast<uint64_t>(static_cast<uint32_t>(ret))<<8);
+  e[3]=*reinterpret_cast<uintptr_t *>(static_cast<uint8_t *>(self)+0x158);
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDADrvStart",hdaDrvStart,sizeof(hdaDrvStart));
+}
+static uint64_t wrapDStart(void *self,IOService *provider) {
+ const auto r=FunctionCast(wrapDStart,orgDStart)(self,provider);hdaDrvRecord(self,1,r&0xFF);return r;
+}
+static uint64_t wrapDInitHw(void *self,IOService *provider) {
+ const auto r=FunctionCast(wrapDInitHw,orgDInitHw)(self,provider);hdaDrvRecord(self,2,r&0xFF);return r;
+}
+static uint64_t wrapDInitAct(void *self,IOService *provider) {
+ const auto r=FunctionCast(wrapDInitAct,orgDInitAct)(self,provider);hdaDrvRecord(self,3,r);return r;
+}
+static uint64_t wrapDCreate(void *self,OSArray *paths) {
+ const auto r=FunctionCast(wrapDCreate,orgDCreate)(self,paths);
+ hdaEngines[0]++;hdaEngines[1]=static_cast<uint32_t>(r);hdaEngines[2]=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(paths));
+ hdaEngines[3]=paths ? paths->getCount() : UINT64_MAX;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEngines",hdaEngines,sizeof(hdaEngines));
+ hdaDrvRecord(self,5,r);return r;
+}
+static uint64_t wrapDActivate(void *self) {
+ const auto r=FunctionCast(wrapDActivate,orgDActivate)(self);
+ hdaEngines[4]++;hdaEngines[5]=r&0xFF;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEngines",hdaEngines,sizeof(hdaEngines));
+ hdaDrvRecord(self,6,r&0xFF);return r;
+}
+static uint64_t wrapDComplete(void *self) {
+ const auto r=FunctionCast(wrapDComplete,orgDComplete)(self);hdaDrvRecord(self,4,r);return r;
+}
+// -wex-hda-discover (opt-in): AppleHDAFunctionGroupFactory only maps Intel display
+// codecs 0x80862805-0x8086280B to the Intel function-group classes. Newer codecs
+// (ADL-P 0x8086281C) get the base AppleHDAFunctionGroup, whose
+// pathMapCanBeConstructedByDiscovery() is a stub returning false, so
+// AppleHDADriver::completeStart builds no path map and createAudioEngines fails
+// with kIOReturnBadArgument. The base class already has a generic
+// constructPathMapByDiscovery (ATI_RS780 uses it), so patch the base vtable slot
+// (only base-class instances use it) to allow discovery for Intel vendor codecs.
+// WEXHDADiscover: {state (1 patched | 2 symbol missing | 3 slot mismatch | 4 write failed),
+//  can calls, last vendor, last can ret, construct calls, last construct ret, last path count, intel can-true count}.
+static uint64_t hdaDiscover[8];
+static mach_vm_address_t hdaOrgCanDiscover,hdaOrgConstructDiscover;
+static constexpr size_t hdaFgSlotVendor=0x158,hdaFgSlotCan=0x230,hdaFgSlotConstruct=0x238;
+static void hdaDiscoverPublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDADiscover",hdaDiscover,sizeof(hdaDiscover));}
+static uint32_t hdaFgVendor(void *fg) {
+ auto vt=*reinterpret_cast<uintptr_t **>(fg);
+ return reinterpret_cast<uint32_t (*)(void *)>(vt[hdaFgSlotVendor/8])(fg);
+}
+// WEXHDACodecProbe (read-only, -wex-hda-discover): GET verbs only, sent through
+// AppleHDAController::executeCodecCommand (AppleHDA's own gated CORB path) when an
+// Intel display codec reaches discovery. Layout (uint32):
+// [0] status (1 done | 2 no exec fn | 3 no controller | 4 no codec device)
+// [1] codec address [2] root subordinate (nid0 param 4) [3] AFG subordinate (nid1 param 4)
+// [4] Intel vendor reg (nid 0x02 verb 0xF81) [5] its exec status
+// then per node from the AFG start (max 24): {nid, widget caps (param 9), pin config (F1C) or 0, pin caps (param 0xC) or 0}.
+static mach_vm_address_t hdaExecCmdFn;
+static uint32_t hdaCodecProbe[6+24*4];
+static bool hdaCodecProbed;
+static IOService *hdaFindChildByClass(IOService *parent,const char *cls) {
+ IOService *found=nullptr;
+ if(auto it=parent->getChildIterator(gIOServicePlane)) {
+  while(auto o=it->getNextObject()) {
+   auto svc=OSDynamicCast(IOService,o);
+   if(svc && svc->getMetaClass() && !strcmp(svc->getMetaClass()->getClassName(),cls)) {found=svc;break;}
+  }
+  it->release();
+ }
+ return found;
+}
+static void hdaProbeCodec() {
+ if(hdaCodecProbed)return;hdaCodecProbed=true;
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDACodecProbe",hdaCodecProbe,sizeof(hdaCodecProbe));};
+ if(!hdaExecCmdFn) {hdaCodecProbe[0]=2;publish();return;}
+ IOService *controller=nullptr;
+ if(auto match=IOService::serviceMatching("AppleHDAController")) {
+  if(auto it=IOService::getMatchingServices(match)) {controller=OSDynamicCast(IOService,it->getNextObject());if(controller)controller->retain();it->release();}
+  match->release();
+ }
+ if(!controller) {hdaCodecProbe[0]=3;publish();return;}
+ auto device=hdaFindChildByClass(controller,"IOHDACodecDevice");
+ if(!device) {controller->release();hdaCodecProbe[0]=4;publish();return;}
+ uint32_t cad=2;
+ if(auto n=OSDynamicCast(OSNumber,device->getProperty("IOHDACodecAddress")))cad=n->unsigned32BitValue()&0xF;
+ hdaCodecProbe[1]=cad;
+ using Exec=IOReturn (*)(IOService *,IOService *,uint32_t,uint32_t *);
+ auto get=[&](uint32_t nid,uint32_t verb,uint32_t payload,IOReturn *st=nullptr)->uint32_t {
+  uint32_t resp=0xFFFFFFFF;
+  // GET verbs only (verb 0xF00 parameters, 0xF1C config default, 0xF81 vendor read).
+  const IOReturn r=reinterpret_cast<Exec>(hdaExecCmdFn)(controller,device,(cad<<28)|((nid&0xFF)<<20)|((verb&0xFFF)<<8)|(payload&0xFF),&resp);
+  if(st)*st=r;
+  return r==kIOReturnSuccess ? resp : 0xFFFFFFFF;
+ };
+ hdaCodecProbe[2]=get(0,0xF00,0x04);
+ hdaCodecProbe[3]=get(1,0xF00,0x04);
+ IOReturn vst=kIOReturnSuccess;
+ hdaCodecProbe[4]=get(2,0xF81,0);hdaCodecProbe[5]=0;
+ get(2,0xF81,0,&vst);hdaCodecProbe[5]=static_cast<uint32_t>(vst);
+ const uint32_t start=(hdaCodecProbe[3]>>16)&0xFF,count=hdaCodecProbe[3]&0xFF;
+ if(hdaCodecProbe[3]!=0xFFFFFFFF)
+  for(uint32_t i=0;i<count && i<24;i++) {
+   const uint32_t nid=start+i;auto e=hdaCodecProbe+6+i*4;
+   e[0]=nid;e[1]=get(nid,0xF00,0x09);
+   if(((e[1]>>20)&0xF)==4) {e[2]=get(nid,0xF1C,0);e[3]=get(nid,0xF00,0x0C);}
+  }
+ hdaCodecProbe[0]=1;
+ controller->release();
+ publish();
+}
+// Read-only codec GET helper through AppleHDAController::executeCodecCommand.
+static uint32_t hdaCodecLastRet; // IOReturn of the last hdaCodecGet
+static bool hdaCodecGet(uint32_t nid,uint32_t verb,uint32_t payload,uint32_t &resp) {
+ resp=0xFFFFFFFF;
+ if(!hdaExecCmdFn)return false;
+ IOService *controller=nullptr;
+ if(auto match=IOService::serviceMatching("AppleHDAController")) {
+  if(auto it=IOService::getMatchingServices(match)) {controller=OSDynamicCast(IOService,it->getNextObject());if(controller)controller->retain();it->release();}
+  match->release();
+ }
+ if(!controller)return false;
+ bool ok=false;
+ if(auto device=hdaFindChildByClass(controller,"IOHDACodecDevice")) {
+  uint32_t cad=2;
+  if(auto n=OSDynamicCast(OSNumber,device->getProperty("IOHDACodecAddress")))cad=n->unsigned32BitValue()&0xF;
+  using Exec=IOReturn (*)(IOService *,IOService *,uint32_t,uint32_t *);
+  // GET verbs only: 0xF00 parameter, 0xF01 conn select, 0xF02 conn list, 0xF05 power, 0xF06 stream, 0xF07 pin ctl,
+  // 0xF09 pin sense, 0xF0D digital ctl, 0xF16 device list, 0xF35 device select, 0xA00 converter format,
+  // 0xBA0 amp gain/mute (output left), 0xF2D converter channel count, 0xF32 DIP transmit.
+  const IOReturn r=reinterpret_cast<Exec>(hdaExecCmdFn)(controller,device,(cad<<28)|((nid&0xFF)<<20)|((verb&0xFFF)<<8)|(payload&0xFF),&resp);
+  hdaCodecLastRet=static_cast<uint32_t>(r);ok=r==kIOReturnSuccess;
+ }
+ controller->release();
+ return ok;
+}
+// WEXHDAPinSense (read-only): after display-mode-did-change events, for Type-C pins 0x0A-0x0D:
+// {probes, then per pin 4 x u32: F09 pin sense (bit31 presence, bit30 ELD valid), F35 device select,
+//  param 0x15 device-list length, F16 device-list entries 0-3 (bit0 present, bit1 ELDV per byte)}.
+static uint32_t hdaPinSense[1+4*4];
+// WEXHDACvtCaps (read-only): converters 0x03/05/07/09 after display-mode changes:
+// {probes, then per converter: param 0x0A (PCM sizes/rates), param 0x0B (stream formats),
+//  F05 power state, param 0x09 widget caps; then AFG (nid 1) param 0x0A, 0x0B}.
+static uint32_t hdaCvtCaps[1+4*4+2];
+// WEXHDADisplayAudio (read-only): gen12 display audio registers after display-mode changes.
+// {probes, AUD_PIN_ELD_CP_VLD 0x650C0, AUDIO_PIN_BUF_CTL 0x48414,
+//  then per transcoder A-D: AUD_CONFIG 0x65000+0x100*t, AUD_DIP_ELD_CTRL_ST 0x650B4+0x100*t}.
+// AUD_EDID_DATA is not read: reads advance the hardware ELD pointer.
+static uint32_t hdaDisplayAudio[3+4*2];
+static void hdaProbeDisplayAudio(IOService *fb) {
+ if(!fb || hdaDisplayAudio[0]>=8)return;
+ IOPCIDevice *pci=nullptr;
+ for(IOService *p=fb;p && !pci;p=p->getProvider())pci=OSDynamicCast(IOPCIDevice,p);
+ if(!pci)return;
+ if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+  if(map->getLength()>=0x70000 && map->getVirtualAddress()) {
+   auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+   auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+   hdaDisplayAudio[0]++;
+   hdaDisplayAudio[1]=r32(0x650C0);hdaDisplayAudio[2]=r32(0x48414);
+   for(uint32_t t=0;t<4;t++) {hdaDisplayAudio[3+t*2]=r32(0x65000+0x100*t);hdaDisplayAudio[4+t*2]=r32(0x650B4+0x100*t);}
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXHDADisplayAudio",hdaDisplayAudio,sizeof(hdaDisplayAudio));
+  }
+  map->release();
+ }
+}
+static void hdaProbePinSense() {
+ if(hdaPinSense[0]>=8)return;
+ hdaPinSense[0]++;
+ for(uint32_t i=0;i<4;i++) {
+  const uint32_t pin=0x0A+i;auto e=hdaPinSense+1+i*4;
+  hdaCodecGet(pin,0xF09,0,e[0]);hdaCodecGet(pin,0xF35,0,e[1]);hdaCodecGet(pin,0xF00,0x15,e[2]);hdaCodecGet(pin,0xF16,0,e[3]);
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPinSense",hdaPinSense,sizeof(hdaPinSense));
+ hdaCvtCaps[0]++;
+ static constexpr uint32_t cvts[4] {0x03,0x05,0x07,0x09};
+ for(uint32_t i=0;i<4;i++) {
+  auto e=hdaCvtCaps+1+i*4;
+  hdaCodecGet(cvts[i],0xF00,0x0A,e[0]);hdaCodecGet(cvts[i],0xF00,0x0B,e[1]);hdaCodecGet(cvts[i],0xF05,0,e[2]);hdaCodecGet(cvts[i],0xF00,0x09,e[3]);
+ }
+ hdaCodecGet(1,0xF00,0x0A,hdaCvtCaps[17]);hdaCodecGet(1,0xF00,0x0B,hdaCvtCaps[18]);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDACvtCaps",hdaCvtCaps,sizeof(hdaCvtCaps));
+}
+// -wex-hda-allpins (opt-in): Intel display codecs from Haswell on hide most pins and
+// converters until vendor bit 0 ("enable all pins/converters") is set; ADL-P 0x8086281C
+// powers up exposing only cvt 0x03 + pin 0x04 (WEXHDACodecProbe AFG start 3 count 2,
+// F81 = 0), while the framebuffer advertises pin 0x0B. Linux (intel_haswell_enable_all_pins,
+// vendor nid 0x02 for TGL and newer) sets it before enumerating widgets; do the same
+// before AppleHDACodecGeneric::start builds the function group.
+// WEXHDAAllPins: {calls, status (1 set | 2 already set | 3 no exec fn | 4 not Intel/no provider | 5 read failed),
+//  F81 before, set status, F81 after, AFG subordinate (nid1 param 4) after}.
+static uint32_t hdaAllPins[6];
+static mach_vm_address_t orgCGStart;
+static bool wrapCGStart(void *self,IOService *provider) {
+ hdaAllPins[0]++;
+ auto publish=[]{IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAAllPins",hdaAllPins,sizeof(hdaAllPins));};
+ if(!hdaExecCmdFn)hdaAllPins[1]=3;
+ else {
+  // provider is IOHDACodecFunction; the codec nub is IOHDACodecFunction -> IOHDACodecDriver
+  // -> IOHDACodecDevice, whose provider is AppleHDAController.
+  IOService *device=provider;
+  for(int depth=0;device && depth<4;depth++,device=device->getProvider())
+   if(device->getMetaClass() && !strcmp(device->getMetaClass()->getClassName(),"IOHDACodecDevice"))break;
+  IOService *controller=device ? device->getProvider() : nullptr;
+  uint32_t cad=0xF,vendor=0;
+  if(device) {
+   if(auto n=OSDynamicCast(OSNumber,device->getProperty("IOHDACodecAddress")))cad=n->unsigned32BitValue()&0xF;
+   if(auto n=OSDynamicCast(OSNumber,device->getProperty("IOHDACodecVendorID")))vendor=n->unsigned32BitValue();
+  }
+  if(!controller || cad>0xE || (vendor>>16)!=0x8086)hdaAllPins[1]=4;
+  else {
+   using Exec=IOReturn (*)(IOService *,IOService *,uint32_t,uint32_t *);
+   auto exec=reinterpret_cast<Exec>(hdaExecCmdFn);
+   auto cmd=[&](uint32_t nid,uint32_t verb,uint32_t payload,uint32_t *resp)->IOReturn {
+    return exec(controller,device,(cad<<28)|((nid&0xFF)<<20)|((verb&0xFFF)<<8)|(payload&0xFF),resp);
+   };
+   uint32_t before=0xFFFFFFFF;
+   if(cmd(0x02,0xF81,0,&before)!=kIOReturnSuccess || before==0xFFFFFFFF)hdaAllPins[1]=5;
+   else {
+    hdaAllPins[2]=before;
+    if(before&1)hdaAllPins[1]=2;
+    else {
+     uint32_t ignored=0;
+     hdaAllPins[3]=static_cast<uint32_t>(cmd(0x02,0x781,(before|1)&0xFF,&ignored));
+     hdaAllPins[1]=1;
+    }
+    uint32_t after=0xFFFFFFFF,sub=0xFFFFFFFF;
+    cmd(0x02,0xF81,0,&after);cmd(0x01,0xF00,0x04,&sub);
+    hdaAllPins[4]=after;hdaAllPins[5]=sub;
+   }
+  }
+ }
+ publish();
+ return FunctionCast(wrapCGStart,orgCGStart)(self,provider);
+}
+// WEXHDAMsgCodec / WEXHDAMsgHDMI (read-only, -wex-hda-trace): messages reaching
+// AppleHDACodecGeneric::message and AppleHDAHDMI_DPDriver::message.
+// {count, then 16 x 2: ms<<32 | type, ret lo32 | for 0xE03F80xx with an argument:
+//  head-association bytes codec(+0x149)<<32 | index(+0x148)<<40 | pin(+0x147)<<48 | flags(+0x38)<<56}.
+static uint64_t hdaMsgCodec[1+16*2],hdaMsgHDMI[1+16*2];
+static mach_vm_address_t orgCGMsg,orgDPMsg;
+static void hdaMsgRecord(uint64_t *rec,const char *key,uint32_t type,void *arg,IOReturn ret) {
+ const auto n=rec[0]++;auto r=rec+1+(n%16)*2;
+ uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&t);
+ r[0]=((t/1000000)<<32)|type;
+ r[1]=static_cast<uint32_t>(ret);
+ // Only head-association messages (0xE03F8004-0xE03F8008) carry an HDAGFXHeadAssociationStruct;
+ // others pass small integers (0xE03F8000 passed 1 and faulted at 0x14A), so require a kernel pointer too.
+ if(arg && type>=0xE03F8004 && type<=0xE03F8008 && reinterpret_cast<uintptr_t>(arg)>=0xFFFFFF8000000000ULL) {
+  auto a=static_cast<const uint8_t *>(arg);
+  r[1]|=(static_cast<uint64_t>(a[0x149])<<32)|(static_cast<uint64_t>(a[0x148])<<40)|(static_cast<uint64_t>(a[0x147])<<48)|(static_cast<uint64_t>(a[0x38])<<56);
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty(key,rec,static_cast<unsigned>((1+16*2)*sizeof(uint64_t)));
+}
+static IOReturn wrapCGMsg(void *self,uint32_t type,IOService *provider,void *arg) {
+ const auto r=FunctionCast(wrapCGMsg,orgCGMsg)(self,type,provider,arg);hdaMsgRecord(hdaMsgCodec,"WEXHDAMsgCodec",type,arg,r);return r;
+}
+static IOReturn wrapDPMsg(void *self,uint32_t type,IOService *provider,void *arg) {
+ const auto r=FunctionCast(wrapDPMsg,orgDPMsg)(self,type,provider,arg);hdaMsgRecord(hdaMsgHDMI,"WEXHDAMsgHDMI",type,arg,r);return r;
+}
+// WEXHDADPCreate (read-only): AppleHDAHDMI_DPDriver::createAudioOutputEngineDP.
+// {calls, last ret, last index, head pin(+0x147)|codec(+0x149)<<8, fg hdmiCapable, fg displayPortCapable, engines(+0x168) count}.
+static uint64_t hdaDPCreate[7];
+static mach_vm_address_t orgDPCreate;
+static uint32_t wrapDPCreate(void *self,OSArray *paths,int index,void *head) {
+ const auto r=FunctionCast(wrapDPCreate,orgDPCreate)(self,paths,index,head);
+ hdaHotplugRecord(self,3,r);
+ hdaDPCreate[0]++;hdaDPCreate[1]=r;hdaDPCreate[2]=static_cast<uint32_t>(index);
+ if(head && reinterpret_cast<uintptr_t>(head)>=0xFFFFFF8000000000ULL) {auto h=static_cast<const uint8_t *>(head);hdaDPCreate[3]=h[0x147]|(h[0x149]<<8);}
+ auto d=static_cast<uint8_t *>(self);
+ if(auto fg=*reinterpret_cast<void **>(d+0x160)) {
+  auto vt=*reinterpret_cast<uintptr_t **>(fg);
+  hdaDPCreate[4]=reinterpret_cast<bool (*)(void *)>(vt[0x1b0/8])(fg);
+  hdaDPCreate[5]=reinterpret_cast<bool (*)(void *)>(vt[0x1b8/8])(fg);
+ }
+ if(auto engines=OSDynamicCast(OSArray,*reinterpret_cast<OSObject **>(d+0x168)))hdaDPCreate[6]=engines->getCount();
+ else hdaDPCreate[6]=UINT64_MAX;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDADPCreate",hdaDPCreate,sizeof(hdaDPCreate));
+ return r;
+}
+// WEXHDAEngineStart (read-only): engine start chain for every AppleHDA engine.
+// fn 5 AppleHDAEngineOutputDP::initAudioStream (ret bool), 6 publishAvailableFormats
+// (ret byte: 0x80 error | count<<1 | flag), 7 AppleHDAPathSet::enable (1 = success).
+// {count, then 16 x 3: class name bytes 0-7, class name bytes 8-15,
+//  fn (1 AppleHDAEngine::start, 2 AppleHDAEngine::initHardware, 3 AppleHDAEngineOutput::initHardware,
+//  4 AppleHDAEngineOutput::initAudioStream) | ret<<8}.
+static uint64_t hdaEngStart[1+16*3];
+static mach_vm_address_t orgEngStart,orgEngInit,orgOutInit,orgOutStream;
+static void hdaEngRecord(void *self,unsigned fn,uint64_t ret) {
+ const auto n=hdaEngStart[0]++;
+ if(n<16) {
+  char name[17] {};
+  if(auto mc=static_cast<OSObject *>(self)->getMetaClass())strlcpy(name,mc->getClassName(),sizeof(name));
+  auto e=hdaEngStart+1+n*3;memcpy(&e[0],name,8);memcpy(&e[1],name+8,8);
+  e[2]=fn|((ret&0xFF)<<8);
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAEngineStart",hdaEngStart,sizeof(hdaEngStart));
+}
+static mach_vm_address_t orgDPStream,orgDPFormats,orgPSEnable;
+static bool wrapDPStream(void *self) {
+ const bool r=FunctionCast(wrapDPStream,orgDPStream)(self);hdaEngRecord(self,5,r);return r;
+}
+static uint32_t wrapDPFormats(void *self,void *stream,void *format,void *rate,uint32_t count,bool *flag) {
+ const auto r=FunctionCast(wrapDPFormats,orgDPFormats)(self,stream,format,rate,count,flag);
+ hdaEngRecord(self,6,(r!=0 ? 0x80 : 0)|(flag && *flag ? 1 : 0)|((count&0x3F)<<1));return r;
+}
+static uint32_t wrapPSEnable(void *self,void *stream,uint32_t a,uint32_t b) {
+ const auto r=FunctionCast(wrapPSEnable,orgPSEnable)(self,stream,a,b);hdaEngRecord(self,7,r==0 ? 1 : 0);return r;
+}
+// WEXHDAFormatChecks (read-only): per-format checks inside publishAvailableFormats.
+// {isAudioStreamSupported true, false, last false args a|b<<16|c<<32,
+//  validateEdidFormat true, false, last false args a|b<<12|c<<24|d<<36|e<<48,
+//  validateSampleRateForVideoMode true, false, last false args a|b<<16|c<<32|d<<48}.
+static uint64_t hdaFmtChecks[9];
+static mach_vm_address_t orgPSSupported,orgDPVEdid,orgDPVRate;
+static void hdaFmtPublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAFormatChecks",hdaFmtChecks,sizeof(hdaFmtChecks));}
+// WEXHDAPathLimits (read-only): primary path behind the failing isAudioStreamSupported calls.
+// {resolved getPrimaryPath, path lo32, max rate(+0x90), max bits(+0x94), min rate(+0x98), min bits(+0x9C),
+//  widget(+0x38) lo32, first false args rate, bits, format, first false with bits<=24 && rate<=48000: rate, bits, format,
+//  widget type(+0x20) | rateOk<<32 | bitsOk<<40 | fmtOk<<48 (48 kHz/16/lpcm), widget +0x18 | +0x1C<<32}.
+static uint64_t hdaPathLimits[15];
+static mach_vm_address_t hdaGetPrimaryPathFn;
+static bool wrapPSSupported(void *self,uint32_t a,uint32_t b,uint32_t c) {
+ const bool r=FunctionCast(wrapPSSupported,orgPSSupported)(self,a,b,c);
+ if(r)hdaFmtChecks[0]++;else {hdaFmtChecks[1]++;hdaFmtChecks[2]=(a&0xFFFF)|(static_cast<uint64_t>(b&0xFFFF)<<16)|(static_cast<uint64_t>(c)<<32);}
+ if(!r && hdaGetPrimaryPathFn) {
+  hdaPathLimits[0]=1;
+  auto path=reinterpret_cast<uint8_t *(*)(void *)>(hdaGetPrimaryPathFn)(self);
+  hdaPathLimits[1]=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(path));
+  if(path) {
+   hdaPathLimits[2]=*reinterpret_cast<uint32_t *>(path+0x90);hdaPathLimits[3]=*reinterpret_cast<uint32_t *>(path+0x94);
+   hdaPathLimits[4]=*reinterpret_cast<uint32_t *>(path+0x98);hdaPathLimits[5]=*reinterpret_cast<uint32_t *>(path+0x9C);
+   hdaPathLimits[6]=static_cast<uint32_t>(*reinterpret_cast<uintptr_t *>(path+0x38));
+   if(auto w=*reinterpret_cast<uint8_t **>(path+0x38)) {
+    // AppleHDANode: +0x20 node type (AppleHDANode::isAudioStreamSupported accepts 0, 1, 16 only),
+    // then rate (0x1E0), bit depth (0x1E8), format (0x1F0) answers for 48 kHz / 16-bit / 'lpcm'.
+    auto vt=*reinterpret_cast<uintptr_t **>(w);
+    const uint32_t type=*reinterpret_cast<uint32_t *>(w+0x20);
+    uint64_t rateOk=reinterpret_cast<bool (*)(void *,uint32_t,uint32_t,uint32_t)>(vt[0x1E0/8])(w,48000,16,0x6C70636D);
+    uint64_t bitsOk=reinterpret_cast<bool (*)(void *,uint32_t)>(vt[0x1E8/8])(w,16);
+    uint64_t fmtOk=reinterpret_cast<bool (*)(void *,uint32_t,uint32_t,uint32_t)>(vt[0x1F0/8])(w,0x6C70636D,16,48000);
+    hdaPathLimits[13]=type|(rateOk<<32)|(bitsOk<<40)|(fmtOk<<48);
+    hdaPathLimits[14]=*reinterpret_cast<uint32_t *>(w+0x18)|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(w+0x1C))<<32);
+   }
+  }
+  if(!hdaPathLimits[7]) {hdaPathLimits[7]=a;hdaPathLimits[8]=b;hdaPathLimits[9]=c;}
+  if(!hdaPathLimits[10] && b<=24 && a<=48000) {hdaPathLimits[10]=a;hdaPathLimits[11]=b;hdaPathLimits[12]=c;}
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPathLimits",hdaPathLimits,sizeof(hdaPathLimits));
+ }
+ hdaFmtPublish();return r;
+}
+static bool wrapDPVEdid(void *self,uint32_t a,uint32_t b,uint32_t c,uint32_t d,uint32_t e) {
+ const bool r=FunctionCast(wrapDPVEdid,orgDPVEdid)(self,a,b,c,d,e);
+ if(r)hdaFmtChecks[3]++;else {hdaFmtChecks[4]++;hdaFmtChecks[5]=(a&0xFFF)|(static_cast<uint64_t>(b&0xFFF)<<12)|(static_cast<uint64_t>(c&0xFFF)<<24)|(static_cast<uint64_t>(d&0xFFF)<<36)|(static_cast<uint64_t>(e&0xFFFF)<<48);}
+ hdaFmtPublish();return r;
+}
+static bool wrapDPVRate(void *self,uint32_t a,uint32_t b,uint32_t c,uint32_t d) {
+ const bool r=FunctionCast(wrapDPVRate,orgDPVRate)(self,a,b,c,d);
+ if(r)hdaFmtChecks[6]++;else {hdaFmtChecks[7]++;hdaFmtChecks[8]=(a&0xFFFF)|(static_cast<uint64_t>(b&0xFFFF)<<16)|(static_cast<uint64_t>(c&0xFFFF)<<32)|(static_cast<uint64_t>(d&0xFFFF)<<48);}
+ hdaFmtPublish();return r;
+}
+static mach_vm_address_t orgEngPStart;
+static void hdaPlaySnapshot(uint32_t ret);
+static void hdaBindStreamingPin();
+static uint32_t wrapEngPStart(void *self) {
+ const auto r=FunctionCast(wrapEngPStart,orgEngPStart)(self);
+ if(!r) {hdaAssertAllPins();hdaBindStreamingPin();}
+ if(checkKernelArgument("-wex-hda-probe"))hdaPlaySnapshot(r);
+ return r;
+}
+static mach_vm_address_t orgDPAddSrc;
+static uint32_t wrapDPAddSrc(void *self,void *head) {
+ const auto r=FunctionCast(wrapDPAddSrc,orgDPAddSrc)(self,head);
+ hdaHotplugRecord(self,4,r);
+ return r;
+}
+static bool wrapEngStart(void *self,IOService *provider,void *device) {
+ const bool r=FunctionCast(wrapEngStart,orgEngStart)(self,provider,device);hdaEngRecord(self,1,r);return r;
+}
+static bool wrapEngInit(void *self,IOService *provider) {
+ const bool r=FunctionCast(wrapEngInit,orgEngInit)(self,provider);hdaEngRecord(self,2,r);return r;
+}
+static bool wrapOutInit(void *self,IOService *provider) {
+ const bool r=FunctionCast(wrapOutInit,orgOutInit)(self,provider);hdaEngRecord(self,3,r);return r;
+}
+static bool wrapOutStream(void *self) {
+ const bool r=FunctionCast(wrapOutStream,orgOutStream)(self);hdaEngRecord(self,4,r);return r;
+}
+// WEXHDAPlay (read-only): playback-path snapshot right after AppleHDAEngine::performAudioEngineStart.
+// u32 layout: [0] snapshots, [1] engine start ret,
+//  [2..17] converters 3/5/7/9 x {F06 stream/chan, A00 format, F0D digital ctl, F05 power},
+//  [18..29] pins 0x0D, 0x0B x {F01 conn sel, F07 pin ctl, F05 power, F09 sense, param 0x0E conn len, F02 list[0..3]},
+//  [30] AUD_PIN_ELD_CP_VLD, [31] AUD_CONFIG_B, [32] AUD_M_CTS_ENABLE_B, [33] AUD_DIP_ELD_CTRL_ST_B,
+//  [34] TRANS_DDI_FUNC_CTL_B, [35] AUDIO_PIN_BUF_CTL,
+//  [36] HDA GCAP, then 4 output streams x {CTL|STS dword, LPIB t0, LPIB t0+50ms, CBL, FMT}.
+// -wex-hda-allpins: AppleHDA starts the stream on the path's converter (9720: cvt 0x09 stream 1,
+// DIGEN, D0) but never programs the pin side of the generic path: pin 0x0D stays on connection
+// index 0 (cvt 0x03) with pin control 0 (output disabled), so nothing reaches the display.
+// After the engine starts, bind the streaming converter to the Type-C pin that has presence + ELD
+// valid, as Linux does: SET_CONNECT_SEL (0x701) to the converter's index in the pin's connection
+// list, SET_PIN_WIDGET_CONTROL (0x707) with OUT_EN (0x40).
+// WEXHDAPinRoute: {calls, pin, converter, conn index, pin ctl before, pin ctl after, conn sel after, status
+//  (1 bound | 2 no streaming converter | 3 no present pin | 4 converter not in pin list),
+//  pin out amp before, after (GET 0xBA0), converter channel count (F2D), DIP transmit (F32), channels}.
+static uint32_t hdaPinRoute[13];
+static bool hdaCodecSet(uint32_t nid,uint32_t verb,uint32_t payload) {
+ uint32_t resp=0;
+ // SET verbs used only by the stream binding below (Linux hdmi_init_pin / hdmi_setup_audio_infoframe):
+ // 0x701 connection select, 0x707 pin widget control, 0x3B0 amp gain/mute (verb 3, payload 0xB0xx),
+ // 0x72D converter channel count, 0x734 ASP channel map, 0x730/0x731/0x732 DIP index/data/transmit,
+ // 0x781 Intel vendor enable-all-pins (re-assert after codec power loss).
+ switch(verb){case 0x701:case 0x707:case 0x3B0:case 0x72D:case 0x734:case 0x730:case 0x731:case 0x732:case 0x781:break;default:return false;}
+ if(!hdaExecCmdFn)return false;
+ IOService *controller=nullptr;
+ if(auto match=IOService::serviceMatching("AppleHDAController")) {
+  if(auto it=IOService::getMatchingServices(match)) {controller=OSDynamicCast(IOService,it->getNextObject());if(controller)controller->retain();it->release();}
+  match->release();
+ }
+ if(!controller)return false;
+ bool ok=false;
+ if(auto device=hdaFindChildByClass(controller,"IOHDACodecDevice")) {
+  uint32_t cad=2;
+  if(auto n=OSDynamicCast(OSNumber,device->getProperty("IOHDACodecAddress")))cad=n->unsigned32BitValue()&0xF;
+  using Exec=IOReturn (*)(IOService *,IOService *,uint32_t,uint32_t *);
+  ok=reinterpret_cast<Exec>(hdaExecCmdFn)(controller,device,(cad<<28)|((nid&0xFF)<<20)|((verb&0xFFF)<<8)|(payload&0xFF),&resp)==kIOReturnSuccess;
+ }
+ controller->release();
+ return ok;
+}
+static void hdaBindStreamingPin() {
+ if(!hdaHdmiAudio())return;
+ hdaPinRoute[0]++;
+ struct Publish {~Publish(){IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPinRoute",hdaPinRoute,sizeof(hdaPinRoute));}} publish;
+ static constexpr uint32_t cvts[4] {0x03,0x05,0x07,0x09};
+ uint32_t cvt=0;
+ for(auto c:cvts) {uint32_t sc=0;if(hdaCodecGet(c,0xF06,0,sc) && (sc>>4)&0xF){cvt=c;break;}}
+ if(!cvt) {hdaPinRoute[7]=2;return;}
+ uint32_t pin=0;
+ for(uint32_t p=0x0A;p<=0x0D;p++) {uint32_t sense=0;if(hdaCodecGet(p,0xF09,0,sense) && (sense>>31) && ((sense>>30)&1)){pin=p;break;}}
+ if(!pin) {hdaPinRoute[1]=0;hdaPinRoute[2]=cvt;hdaPinRoute[7]=3;return;}
+ uint32_t len=0,list=0,index=0xFF;
+ hdaCodecGet(pin,0xF00,0x0E,len);hdaCodecGet(pin,0xF02,0,list);
+ for(uint32_t i=0;i<4 && i<(len&0x7F);i++)if(((list>>(8*i))&0xFF)==cvt)index=i;
+ hdaPinRoute[1]=pin;hdaPinRoute[2]=cvt;hdaPinRoute[3]=index;
+ if(index==0xFF) {hdaPinRoute[7]=4;return;}
+ uint32_t ctl=0;hdaCodecGet(pin,0xF07,0,ctl);hdaPinRoute[4]=ctl;
+ hdaCodecSet(pin,0x701,index);
+ hdaCodecSet(pin,0x707,(ctl|0x40)&0xFF);
+ hdaCodecGet(pin,0xF07,0,hdaPinRoute[5]);hdaCodecGet(pin,0xF01,0,hdaPinRoute[6]);
+ // stereo stream: channel count from the converter's stream format (A00 bits 3:0 = channels-1)
+ uint32_t fmt=0;hdaCodecGet(cvt,0xA00,0,fmt);const uint32_t chans=(fmt&0xF)+1;
+ hdaCodecGet(pin,0xBA0,0x00,hdaPinRoute[8]);   // pin output amp, left (bit7 = mute) before
+ hdaCodecSet(pin,0x3B0,0x00);                   // AMP_OUT_UNMUTE (0xB000): output, both channels, unmute, gain 0
+ hdaCodecGet(pin,0xBA0,0x00,hdaPinRoute[9]);
+ hdaCodecSet(cvt,0x72D,(chans-1)&0xFF);         // converter channel count
+ hdaCodecGet(cvt,0xF2D,0,hdaPinRoute[10]);
+ for(uint32_t ch=0;ch<chans && ch<8;ch++)hdaCodecSet(pin,0x734,(ch<<4)|ch); // ASP slot ch <- channel ch
+ // DP Audio InfoFrame (Linux hdmi_pin_setup_infoframe, DisplayPort layout): type 0x84, len 0x1B,
+ // ver 0x11<<2, CC = channels-1, CA 0 (FL/FR); stop transmission, rewrite packet 0, transmit best effort.
+ const uint8_t ai[11] {0x84,0x1B,0x44,static_cast<uint8_t>(chans-1),0,0,0,0,0,0,0};
+ hdaCodecSet(pin,0x730,0x00);hdaCodecSet(pin,0x732,0x00);
+ hdaCodecSet(pin,0x730,0x00);
+ for(auto byte:ai)hdaCodecSet(pin,0x731,byte);
+ hdaCodecSet(pin,0x730,0x00);hdaCodecSet(pin,0x732,0xC0);
+ hdaCodecGet(pin,0xF32,0,hdaPinRoute[11]);
+ hdaPinRoute[12]=chans;
+ hdaPinRoute[7]=1;
+}
+// -wex-hdmi-audio: the codec can lose the enable-all-pins bit when it is reset (system wake,
+// link power-down); Linux re-applies it on resume. Re-assert it before framebuffer events and
+// playback start. Only after the start hook enabled it on an Intel display codec (hdaAllPins[1]).
+// WEXHDAAllPinsReassert: {checks, re-asserts, last F81}.
+static uint32_t hdaAllPinsReassert[3];
+static void hdaAssertAllPins() {
+ if(hdaAllPins[1]!=1 && hdaAllPins[1]!=2)return;
+ uint32_t v=0;
+ if(!hdaCodecGet(0x02,0xF81,0,v) || v==0xFFFFFFFF)return;
+ hdaAllPinsReassert[0]++;hdaAllPinsReassert[2]=v;
+ if(!(v&1)) {hdaCodecSet(0x02,0x781,(v|1)&0xFF);hdaAllPinsReassert[1]++;}
+ if(!(v&1) || hdaAllPinsReassert[0]<=1)IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAAllPinsReassert",hdaAllPinsReassert,sizeof(hdaAllPinsReassert));
+}
+// -wex-hdmi-audio: Apple's framebuffer numbers the audio pin from its own port table
+// (9720: FB@1 -> pin 0x0B) but ADL-P routes each DDI to a fixed codec pin (Linux tgl map:
+// A 0x04, B 0x06, C 0x08, TC1-TC4 0x0A-0x0D, 0x0E, 0x0F). Before AppleHDA reads the
+// framebuffer's audio-codec-info, take the DDI port from TRANS_DDI_FUNC_CTL of the
+// framebuffer's pipe (AAPL,DisplayPipe) and correct byte 2 (pin). Replaces the
+// audio-codec-info boot-arg. Only for an Intel display codec with all pins enabled.
+// WEXHDAPinFix: {calls, corrections, last pipe, last TRANS_DDI_FUNC_CTL, last port, last pin, last advertised pin}.
+static uint32_t hdaPinFix[7];
+static void hdaFixAudioCodecInfo(IOService *fb) {
+ if(!fb || (hdaAllPins[1]!=1 && hdaAllPins[1]!=2))return;
+ auto info=OSDynamicCast(OSData,fb->getProperty("audio-codec-info"));
+ auto pipeData=OSDynamicCast(OSData,fb->getProperty("AAPL,DisplayPipe"));
+ if(!info || info->getLength()<4 || !pipeData || pipeData->getLength()<4)return;
+ uint8_t aci[4];memcpy(aci,info->getBytesNoCopy(),4);
+ uint32_t pipe=0;memcpy(&pipe,pipeData->getBytesNoCopy(),4);
+ if(!aci[0] || pipe>3)return; // no audio codec advertised for this framebuffer
+ IOPCIDevice *pci=nullptr;
+ for(IOService *p=fb;p && !pci;p=p->getProvider())pci=OSDynamicCast(IOPCIDevice,p);
+ if(!pci)return;
+ uint32_t ddi=0;
+ if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+  if(map->getLength()>=0x70000 && map->getVirtualAddress())
+   ddi=*reinterpret_cast<volatile uint32_t *>(reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress())+0x60400+0x1000*pipe);
+  map->release();
+ }
+ hdaPinFix[0]++;hdaPinFix[2]=pipe;hdaPinFix[3]=ddi;
+ const uint32_t select=(ddi>>27)&0xF; // TGL+ TRANS_DDI_PORT_SELECT = port + 1
+ if(!(ddi>>31) || !select || select>9) {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPinFix",hdaPinFix,sizeof(hdaPinFix));return;}
+ static constexpr uint8_t portPin[9] {0x04,0x06,0x08,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
+ const uint8_t pin=portPin[select-1];
+ hdaPinFix[4]=select-1;hdaPinFix[5]=pin;hdaPinFix[6]=aci[2];
+ if(aci[2]!=pin) {aci[2]=pin;fb->setProperty("audio-codec-info",aci,4);hdaPinFix[1]++;}
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPinFix",hdaPinFix,sizeof(hdaPinFix));
+}
+// WEXHDAValidEDIDEntry (-wex-hda-trace, one codec read per call): state when AppleHDA's
+// handleValidEDID runs, to find which early exit it takes on display replug.
+// {calls, then last 4 x 3: head pin(+0x147) | index(+0x148)<<8 | codec(+0x149)<<16 | signal(+0x138)<<24 (low byte),
+//  head+0x18 nonzero | pin sense F09<<32 (presence bit63, ELDV bit62), AUD_PIN_ELD_CP_VLD}.
+static uint64_t hdaValidEntry[1+4*3];
+static void hdaRecordValidEDIDEntry(void *head) {
+ if(!head || reinterpret_cast<uintptr_t>(head)<0xFFFFFF8000000000ULL)return;
+ auto h=static_cast<const uint8_t *>(head);
+ const auto n=hdaValidEntry[0]++;auto r=hdaValidEntry+1+(n%4)*3;
+ r[0]=h[0x147]|(h[0x148]<<8)|(h[0x149]<<16)|(static_cast<uint64_t>(*reinterpret_cast<const uint32_t *>(h+0x138))<<32);
+ uint32_t sense=0xFFFFFFFF;
+ if(h[0x147])hdaCodecGet(h[0x147],0xF09,0,sense);
+ r[1]=(*reinterpret_cast<const uint64_t *>(h+0x18) ? 1ULL : 0ULL)|(static_cast<uint64_t>(sense)<<32);
+ uint32_t vld=0xFFFFFFFF;
+ if(auto match=IOService::serviceMatching("AppleIntelFramebuffer")) {
+  if(auto it=IOService::getMatchingServices(match)) {
+   IOPCIDevice *pci=nullptr;
+   if(auto fb=OSDynamicCast(IOService,it->getNextObject()))
+    for(IOService *p=fb;p && !pci;p=p->getProvider())pci=OSDynamicCast(IOPCIDevice,p);
+   if(pci) if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+    if(map->getLength()>=0x70000 && map->getVirtualAddress())vld=*reinterpret_cast<volatile uint32_t *>(reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress())+0x650C0);
+    map->release();
+   }
+   it->release();
+  }
+  match->release();
+ }
+ r[2]=vld;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAValidEDIDEntry",hdaValidEntry,sizeof(hdaValidEntry));
+}
+static uint32_t hdaPlay[37+4*5];
+static void hdaPlaySnapshot(uint32_t ret) {
+ if(hdaPlay[0]>=8)return;
+ hdaPlay[0]++;hdaPlay[1]=ret;
+ static constexpr uint32_t cvts[4] {0x03,0x05,0x07,0x09};
+ for(uint32_t i=0;i<4;i++) {
+  auto e=hdaPlay+2+i*4;
+  hdaCodecGet(cvts[i],0xF06,0,e[0]);hdaCodecGet(cvts[i],0xA00,0,e[1]);hdaCodecGet(cvts[i],0xF0D,0,e[2]);hdaCodecGet(cvts[i],0xF05,0,e[3]);
+ }
+ static constexpr uint32_t pins[2] {0x0D,0x0B};
+ for(uint32_t i=0;i<2;i++) {
+  auto e=hdaPlay+18+i*6;
+  hdaCodecGet(pins[i],0xF01,0,e[0]);hdaCodecGet(pins[i],0xF07,0,e[1]);hdaCodecGet(pins[i],0xF05,0,e[2]);
+  hdaCodecGet(pins[i],0xF09,0,e[3]);hdaCodecGet(pins[i],0xF00,0x0E,e[4]);hdaCodecGet(pins[i],0xF02,0,e[5]);
+ }
+ // display engine audio registers (transcoder B carries the external display on the 9720)
+ if(auto match=IOService::serviceMatching("AppleIntelFramebuffer")) {
+  if(auto it=IOService::getMatchingServices(match)) {
+   IOPCIDevice *pci=nullptr;
+   if(auto fb=OSDynamicCast(IOService,it->getNextObject()))
+    for(IOService *p=fb;p && !pci;p=p->getProvider())pci=OSDynamicCast(IOPCIDevice,p);
+   if(pci) if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+    if(map->getLength()>=0x70000 && map->getVirtualAddress()) {
+     auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+     auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+     hdaPlay[30]=r32(0x650C0);hdaPlay[31]=r32(0x65100);hdaPlay[32]=r32(0x65128);hdaPlay[33]=r32(0x651B4);
+     hdaPlay[34]=r32(0x61400);hdaPlay[35]=r32(0x48414);
+    }
+    map->release();
+   }
+   it->release();
+  }
+  match->release();
+ }
+ // HDA controller output stream descriptors
+ if(auto pci=wexFindHDA()) {
+  if(pci->configRead16(0x04)&2) if(auto map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache)) {
+   if(map->getLength()>=0x1000 && map->getVirtualAddress()) {
+    auto b=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+    auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+    const uint32_t gcap=*reinterpret_cast<volatile uint16_t *>(b);hdaPlay[36]=gcap;
+    const uint32_t iss=(gcap>>8)&0xF,oss=(gcap>>12)&0xF;
+    for(uint32_t i=0;i<oss && i<4;i++) {
+     const uint32_t sd=0x80+0x20*(iss+i);auto e=hdaPlay+37+i*5;
+     e[0]=r32(sd);e[1]=r32(sd+0x04);e[3]=r32(sd+0x08);e[4]=*reinterpret_cast<volatile uint16_t *>(b+sd+0x12);
+    }
+    IOSleep(50);
+    for(uint32_t i=0;i<oss && i<4;i++)hdaPlay[37+i*5+2]=r32(0x80+0x20*(iss+i)+0x04);
+   }
+   map->release();
+  }
+  pci->release();
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPlay",hdaPlay,sizeof(hdaPlay));
+}
+// -wex-hda-allpins: the generic AppleHDAWidget never sets its capability mask (+0x64);
+// AppleHDAWidget::initForNodeID ANDs the converter's PCM sizes/rates (param 0x0A, +0x28) with
+// it, so on 0x8086281C every converter caches 0 and AppleHDANode::isSampleRateSupported /
+// isBitDepthSupported reject every format. Apple's Intel classes (AppleHDAWidget_80862807,
+// AppleHDAFunctionGroup_80862807) set the mask to 0xFFFFFFFF; do the same for converter
+// widgets and reload +0x28/+0x2C from params 0x0A/0x0B. Widgets via fg->getWidget(nid) (vt 0x218).
+// WEXHDACvtFix: {fixed converters (UINT64_MAX if none), then per converter (max 8):
+//  nid | old +0x28<<8 | old mask +0x64<<40 (truncated), new +0x28 (param 0x0A), new +0x2C (param 0x0B)}.
+static uint64_t hdaCvtFix[1+8*3];
+static void hdaFixConverterCaps(void *fg) {
+ if(hdaCvtFix[0] || !hdaHdmiAudio() || hdaCodecProbe[0]!=1)return;
+ auto vt=*reinterpret_cast<uintptr_t **>(fg);
+ auto getWidget=reinterpret_cast<uint8_t *(*)(void *,uint16_t)>(vt[0x218/8]);
+ uint32_t n=0;
+ for(uint32_t i=0;i<24 && n<8;i++) {
+  auto e=hdaCodecProbe+6+i*4;
+  if(!e[0] || e[1]==0xFFFFFFFF || ((e[1]>>20)&0xF)!=0)continue; // converters (type 0) only
+  auto w=getWidget(fg,static_cast<uint16_t>(e[0]));
+  if(!w || *reinterpret_cast<uint32_t *>(w+0x20)!=0)continue;
+  uint32_t pcm=0,fmts=0;
+  if(!hdaCodecGet(e[0],0xF00,0x0A,pcm) || !hdaCodecGet(e[0],0xF00,0x0B,fmts) || !pcm || pcm==0xFFFFFFFF)continue;
+  auto r=hdaCvtFix+1+n*3;
+  r[0]=e[0]|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(w+0x28))<<8)|(static_cast<uint64_t>(*reinterpret_cast<uint32_t *>(w+0x64))<<40);
+  *reinterpret_cast<uint32_t *>(w+0x64)=0xFFFFFFFF;
+  *reinterpret_cast<uint32_t *>(w+0x28)=pcm;
+  *reinterpret_cast<uint32_t *>(w+0x2C)=fmts;
+  r[1]=pcm;r[2]=fmts;n++;
+ }
+ hdaCvtFix[0]=n ? n : UINT64_MAX;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDACvtFix",hdaCvtFix,sizeof(hdaCvtFix));
+}
+static bool wrapFgCanDiscover(void *fg) {
+ bool r=FunctionCast(wrapFgCanDiscover,hdaOrgCanDiscover)(fg);
+ const auto vendor=hdaFgVendor(fg);
+ if((vendor>>16)==0x8086) {hdaProbeCodec();hdaFixConverterCaps(fg);}
+ if(!r && (vendor>>16)==0x8086) {r=true;hdaDiscover[7]++;}
+ hdaDiscover[1]++;hdaDiscover[2]=vendor;hdaDiscover[3]=r;hdaDiscoverPublish();
+ return r;
+}
+// -wex-hda-allpins: with all pins enabled the ADL-P codec exposes 4 converters
+// (0x03/05/07/09) and 9 pins (0x04/06/08/0A-0F); AppleHDA's generic discovery walker
+// rejects that topology (kIOReturnBadArgument). Apple's own Intel classes build a fixed
+// map of {pin, converter} pairs in the same nesting the generic walker produces:
+// paths[ set[ alt[ path[ {NodeID=pin}, {NodeID=cvt} ] ] ] ]. Build that from the probed
+// widget list: framebuffer-advertised pins (audio-codec-info byte 2) first, then the rest,
+// one distinct converter per pin.
+// WEXHDAPathOverride: {used, generic ret, pairs, pin0, cvt0, pin1, cvt1, pin2, cvt2, pin3, cvt3}.
+static uint32_t hdaPathOverride[11];
+static OSArray *hdaBuildIntelPathMap() {
+ if(hdaCodecProbe[0]!=1)return nullptr;
+ uint32_t cvts[8],pins[16],ncvt=0,npin=0;
+ for(uint32_t i=0;i<24;i++) {
+  auto e=hdaCodecProbe+6+i*4;
+  if(!e[0] || e[1]==0xFFFFFFFF)continue;
+  const uint32_t type=(e[1]>>20)&0xF,digital=(e[1]>>9)&1;
+  if(type==0 && digital && ncvt<8)cvts[ncvt++]=e[0];
+  if(type==4 && digital && npin<16)pins[npin++]=e[0];
+ }
+ if(!ncvt || !npin)return nullptr;
+ uint32_t order[16],n=0;
+ auto add=[&](uint32_t pin){for(uint32_t i=0;i<n;i++)if(order[i]==pin)return;for(uint32_t i=0;i<npin;i++)if(pins[i]==pin && n<16){order[n++]=pin;return;}};
+ if(auto match=IOService::serviceMatching("AppleIntelFramebuffer")) {
+  if(auto it=IOService::getMatchingServices(match)) {
+   while(auto o=it->getNextObject())
+    if(auto fb=OSDynamicCast(IOService,o))
+     if(auto d=OSDynamicCast(OSData,fb->getProperty("audio-codec-info")))
+      if(d->getLength()>=3) {auto b=static_cast<const uint8_t *>(d->getBytesNoCopy());if(b[2])add(b[2]);}
+   it->release();
+  }
+  match->release();
+ }
+ // audio-codec-info is usually not published yet when AppleHDA runs discovery, so fall
+ // back to the TGL/ADL-P port->pin table (Linux patch_hdmi tgl map: A 0x04, B 0x06,
+ // C 0x08, TC1-TC4 0x0A-0x0D, then 0x0E/0x0F): Type-C ports carry the external
+ // displays on these laptops (9720: Samsung on TC2 -> pin 0x0B), so they get the
+ // four converters first.
+ for(uint32_t pin=0x0A;pin<=0x0D;pin++)add(pin);
+ for(uint32_t i=0;i<npin;i++)add(pins[i]);
+ const uint32_t pairs=n<ncvt ? n : ncvt;
+ auto paths=OSArray::withCapacity(pairs);
+ if(!paths)return nullptr;
+ // AppleHDAPath::initPathFromXML takes the stream limits only from these optional keys; without
+ // them the path keeps zeroed limits (max rate 0) and isAudioStreamSupported rejects every
+ // format (352/352 on the 9720). Values match the ADL-P converters (param 0x0A 0x001A07F0:
+ // 32-192 kHz, 16/24/32-bit); 24-bit max is the HDMI/DP LPCM ceiling, the sink's SADs filter further.
+ auto node=[](uint32_t nid)->OSDictionary * {
+  auto d=OSDictionary::withCapacity(5);if(!d)return nullptr;
+  auto put=[&](const char *key,uint32_t value){if(auto num=OSNumber::withNumber(value,32)) {d->setObject(key,num);num->release();}};
+  put("NodeID",nid);put("MinimumSampleRate",32000);put("MaximumSampleRate",192000);put("MinimumBitDepth",16);put("MaximumBitDepth",24);
+  return d;
+ };
+ for(uint32_t i=0;i<pairs;i++) {
+  auto path=OSArray::withCapacity(2),alt=OSArray::withCapacity(1),set=OSArray::withCapacity(1);
+  auto pin=node(order[i]),cvt=node(cvts[i]);
+  if(path && alt && set && pin && cvt) {
+   path->setObject(pin);path->setObject(cvt);alt->setObject(path);set->setObject(alt);paths->setObject(set);
+   if(i<4) {hdaPathOverride[3+i*2]=order[i];hdaPathOverride[4+i*2]=cvts[i];}
+  }
+  OSSafeReleaseNULL(path);OSSafeReleaseNULL(alt);OSSafeReleaseNULL(set);OSSafeReleaseNULL(pin);OSSafeReleaseNULL(cvt);
+ }
+ hdaPathOverride[2]=paths->getCount();
+ if(!paths->getCount())OSSafeReleaseNULL(paths);
+ return paths;
+}
+static uint32_t wrapFgConstructDiscover(void *fg,OSArray **out) {
+ auto r=FunctionCast(wrapFgConstructDiscover,hdaOrgConstructDiscover)(fg,out);
+ if(r!=kIOReturnSuccess && out && (hdaFgVendor(fg)>>16)==0x8086 && hdaHdmiAudio()) {
+  hdaPathOverride[1]=r;
+  if(auto built=hdaBuildIntelPathMap()) {
+   OSSafeReleaseNULL(*out);
+   *out=built;r=kIOReturnSuccess;hdaPathOverride[0]=1;
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPathOverride",hdaPathOverride,sizeof(hdaPathOverride));
+ }
+ hdaDiscover[4]++;hdaDiscover[5]=r;
+ OSArray *paths=out ? *out : nullptr;
+ hdaDiscover[6]=paths ? paths->getCount() : UINT64_MAX;
+ if(paths && (hdaFgVendor(fg)>>16)==0x8086)IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPathMap",paths);
+ hdaDiscoverPublish();
+ return r;
+}
+static bool hdaPatchSlot(uintptr_t slot,uintptr_t expected,uintptr_t replacement) {
+ if(*reinterpret_cast<uintptr_t *>(slot)!=expected) {hdaDiscover[0]=3;return false;}
+ if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS) {hdaDiscover[0]=4;return false;}
+ lilu_os_memcpy(reinterpret_cast<void *>(slot),&replacement,sizeof(replacement));
+ MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+ if(*reinterpret_cast<uintptr_t *>(slot)!=replacement) {hdaDiscover[0]=4;return false;}
+ return true;
+}
+static void hdaInstallDiscover(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(hdaOrgCanDiscover || (!checkKernelArgument("-wex-hda-discover") && !hdaHdmiAudio()))return;
+ auto solve=[&](const char *n){auto a=patcher.solveSymbol<mach_vm_address_t>(index,n,address,size);patcher.clearError();return a;};
+ const auto vtable=solve("__ZTV21AppleHDAFunctionGroup");
+ const auto can=solve("__ZN21AppleHDAFunctionGroup34pathMapCanBeConstructedByDiscoveryEv");
+ const auto construct=solve("__ZN21AppleHDAFunctionGroup27constructPathMapByDiscoveryEPP7OSArray");
+ if(!vtable || !can || !construct) {hdaDiscover[0]=2;hdaDiscoverPublish();return;}
+ const auto base=static_cast<uintptr_t>(vtable)+0x10;
+ if(*reinterpret_cast<uintptr_t *>(base+hdaFgSlotCan)!=can || *reinterpret_cast<uintptr_t *>(base+hdaFgSlotConstruct)!=construct) {
+  hdaDiscover[0]=3;hdaDiscoverPublish();return;
+ }
+ hdaOrgCanDiscover=can;hdaOrgConstructDiscover=construct;
+ if(hdaPatchSlot(base+hdaFgSlotConstruct,construct,reinterpret_cast<uintptr_t>(wrapFgConstructDiscover)) &&
+    hdaPatchSlot(base+hdaFgSlotCan,can,reinterpret_cast<uintptr_t>(wrapFgCanDiscover)))hdaDiscover[0]=1;
+ hdaDiscoverPublish();
+}
+bool wexHDAMainProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ hdaInstallDiscover(patcher,index,address,size);
+ if(!orgCGStart && hdaHdmiAudio())
+  hdaRouteAddr(patcher,index,address,size,"__ZN20AppleHDACodecGeneric5startEP9IOService",reinterpret_cast<void *>(wrapCGStart),orgCGStart);
+ if(!orgEngPStart && hdaHdmiAudio())
+  hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDAEngine23performAudioEngineStartEv",reinterpret_cast<void *>(wrapEngPStart),orgEngPStart);
+ if(orgDStart || !checkKernelArgument("-wex-hda-trace"))return false;
+ bool ok=true;
+ if(!orgHDAValidEDID) {
+  ok=hdaRouteAddr(patcher,index,address,size,"__ZN21AppleHDAHDMI_DPDriver15handleValidEDIDEP27HDAGFXHeadAssociationStruct",reinterpret_cast<void *>(wrapHDAValidEDID),orgHDAValidEDID);
+  ok=hdaRouteAddr(patcher,index,address,size,"__ZN21AppleHDAHDMI_DPDriver17handleInvalidEDIDEP27HDAGFXHeadAssociationStruct",reinterpret_cast<void *>(wrapHDAInvalidEDID),orgHDAInvalidEDID) && ok;
+ }
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDADriver5startEP9IOService",reinterpret_cast<void *>(wrapDStart),orgDStart) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDADriver12initHardwareEP9IOService",reinterpret_cast<void *>(wrapDInitHw),orgDInitHw) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDADriver18initHardwareActionEP9IOService",reinterpret_cast<void *>(wrapDInitAct),orgDInitAct) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDADriver13completeStartEv",reinterpret_cast<void *>(wrapDComplete),orgDComplete) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDADriver18createAudioEnginesEP7OSArray",reinterpret_cast<void *>(wrapDCreate),orgDCreate) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDADriver20activateAudioEnginesEv",reinterpret_cast<void *>(wrapDActivate),orgDActivate) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN20AppleHDACodecGeneric7messageEjP9IOServicePv",reinterpret_cast<void *>(wrapCGMsg),orgCGMsg) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN21AppleHDAHDMI_DPDriver7messageEjP9IOServicePv",reinterpret_cast<void *>(wrapDPMsg),orgDPMsg) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN21AppleHDAHDMI_DPDriver25createAudioOutputEngineDPEP7OSArrayiP27HDAGFXHeadAssociationStruct",reinterpret_cast<void *>(wrapDPCreate),orgDPCreate) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDAEngine5startEP9IOServiceP13IOAudioDevice",reinterpret_cast<void *>(wrapEngStart),orgEngStart) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDAEngine12initHardwareEP9IOService",reinterpret_cast<void *>(wrapEngInit),orgEngInit) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN20AppleHDAEngineOutput12initHardwareEP9IOService",reinterpret_cast<void *>(wrapOutInit),orgOutInit) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN20AppleHDAEngineOutput15initAudioStreamEv",reinterpret_cast<void *>(wrapOutStream),orgOutStream) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN22AppleHDAEngineOutputDP15initAudioStreamEv",reinterpret_cast<void *>(wrapDPStream),orgDPStream) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN22AppleHDAEngineOutputDP23publishAvailableFormatsEP13IOAudioStreamP20_IOAudioStreamFormatP18_IOAudioSampleRatejPb",reinterpret_cast<void *>(wrapDPFormats),orgDPFormats) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN15AppleHDAPathSet6enableEP11IOHDAStreamjj",reinterpret_cast<void *>(wrapPSEnable),orgPSEnable) && ok;
+ hdaGetPrimaryPathFn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN15AppleHDAPathSet14getPrimaryPathEv",address,size);patcher.clearError();
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN15AppleHDAPathSet22isAudioStreamSupportedEjjj",reinterpret_cast<void *>(wrapPSSupported),orgPSSupported) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN22AppleHDAEngineOutputDP18validateEdidFormatEjjjjj",reinterpret_cast<void *>(wrapDPVEdid),orgDPVEdid) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN22AppleHDAEngineOutputDP30validateSampleRateForVideoModeEjjjj",reinterpret_cast<void *>(wrapDPVRate),orgDPVRate) && ok;
+ if(!orgEngPStart)ok=hdaRouteAddr(patcher,index,address,size,"__ZN14AppleHDAEngine23performAudioEngineStartEv",reinterpret_cast<void *>(wrapEngPStart),orgEngPStart) && ok;
+ ok=hdaRouteAddr(patcher,index,address,size,"__ZN21AppleHDAHDMI_DPDriver26addAdditionalDPAudioSourceEP27HDAGFXHeadAssociationStruct",reinterpret_cast<void *>(wrapDPAddSrc),orgDPAddSrc) && ok;
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAMainTraceReady",ok);
+ return ok;
+}
+bool wexHDADeferProcess(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ {
+  // WEXHDAImage (read-only): the AppleHDAController image Lilu resolves/patches,
+  // to compare with the live object's vtable and the handler IOGraphics holds.
+  hdaImageRec[0]=address;hdaImageRec[1]=size;
+  hdaImageRec[2]=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18AppleHDAController20framebufferEventGateEPvP13IOFramebufferiS0_",address,size);patcher.clearError();
+  hdaImageRec[3]=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV18AppleHDAController",address,size);patcher.clearError();
+  hdaHandlerAddr=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18AppleHDAController23framebufferEventHandlerEPvP13IOFramebufferiS0_",address,size);patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAImage",hdaImageRec,sizeof(hdaImageRec));
+ }
+ if((checkKernelArgument("-wex-hda-discover") || hdaHdmiAudio()) && !hdaExecCmdFn) {
+  hdaExecCmdFn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18AppleHDAController19executeCodecCommandEP16IOHDACodecDevicejPj",address,size);
+  patcher.clearError();
+ }
+ if(checkKernelArgument("-wex-hda-regfx") && !hdaGfxMatchedFn) {
+  hdaGfxMatchedFn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18AppleHDAController17gfxMatchedHandlerEPvP9IOServiceP10IONotifier",address,size);
+  patcher.clearError();
+  hdaReadyFBMsgFn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN18AppleHDAController16readyToSendFBMsgEv",address,size);
+  patcher.clearError();
+ }
+ if(checkKernelArgument("-wex-hda-reprobe") && !hdaProbeLink) {
+  auto solve=[&](const char *n){auto a=patcher.solveSymbol<mach_vm_address_t>(index,n,address,size);patcher.clearError();return a;};
+  hdaSetPowerGated=solve("__ZN18AppleHDAController18setPowerStateGatedEj");
+  hdaProbeLink=solve("__ZN18AppleHDAController14probeAudioLinkEv");
+  hdaSetCodecProps=solve("__ZN18AppleHDAController18setCodecPropertiesEv");
+  hdaRegisterCodecs=solve("__ZN18AppleHDAController14registerCodecsEj");
+  SYSLOG("igfx","HDA reprobe symbols %s",hdaSetPowerGated && hdaProbeLink && hdaSetCodecProps && hdaRegisterCodecs ? "resolved" : "missing");
+ }
+ if((checkKernelArgument("-wex-hda-trace") || hdaHdmiAudio()) && !orgHDAFBEvent) {
+  // functional with -wex-hdmi-audio: the event handler (pin fix, ELD write) and the EDID copy
+  bool ok=hdaRouteAddr(patcher,index,address,size,"__ZN18AppleHDAController23framebufferEventHandlerEPvP13IOFramebufferiS0_",reinterpret_cast<void *>(wrapHDAFBEvent),orgHDAFBEvent);
+  ok=hdaRouteAddr(patcher,index,address,size,"__ZN18AppleHDAController19edidIsValidForAudioEP6OSDatai",reinterpret_cast<void *>(wrapHDAEdidValid),orgHDAEdidValid) && ok;
+  if(checkKernelArgument("-wex-hda-trace")) {
+   ok=hdaRouteAddr(patcher,index,address,size,"__ZN18AppleHDAController20framebufferEventGateEPvP13IOFramebufferiS0_",reinterpret_cast<void *>(wrapHDAFBGate),orgHDAFBGate) && ok;
+   ok=hdaRouteAddr(patcher,index,address,size,"__ZN18AppleHDAController17gfxMatchedHandlerEPvP9IOServiceP10IONotifier",reinterpret_cast<void *>(wrapHDAGfxMatched),orgHDAGfxMatched) && ok;
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAFBEventsReady",ok);
+ }
+ if(orgHDAAsyncStart || !checkKernelArgument("-wex-hda-defer"))return false;
+ KernelPatcher::RouteRequest route {"__ZN18AppleHDAController23handleAsynchronousStartEPv",wrapHDAAsyncStart,orgHDAAsyncStart};
+ const bool ok=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ hdaDeferRec[1]=ok ? 1 : 0;hdaDeferPublish();
+ SYSLOG("igfx","HDA deferred start route %s",ok ? "installed" : "failed");
+ return ok;
+}
+namespace {
+static void display13HDADeferNote(void *target) {
+ volatile uint8_t *base=nullptr;
+ if(!hdaDeferDisplay && display13TCReadable(target,base))hdaDeferDisplay=base;
+ if(base)audSnapTake(1,base);
+}
+static void display13AudioWake(void *target) {
+ volatile uint8_t *base=nullptr;
+ if(d13AudWakeBase || !checkKernelArgument("-wex-audio-wake") || !display13TCReadable(target,base))return;
+ display13AudioWakeAt(base,2);
+}
+static void display13AudioWakeAt(volatile uint8_t *base,uint64_t stageSet) {
+ // -wex-audio-freq: program AUD_FREQ_CNTRL (0x65900) to i915's Gen12 value
+ // AUD_FREQ_GEN12 = AUD_FREQ_8T(2<<2) | AUD_FREQ_PULLCLKS(0) | AUD_FREQ_BCLK_96M(1<<4) = 0x18
+ // before the codec wake, as i915_audio_component_get_power() does.
+ if(checkKernelArgument("-wex-audio-freq")) {
+  auto freq=reinterpret_cast<volatile uint32_t *>(base+0x65900);
+  d13AudFreqRec[0]=*freq;if(d13AudFreqRec[0]!=UINT32_MAX) {*freq=0x18;d13AudFreqRec[1]=*freq;}
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioFreq",d13AudFreqRec,sizeof(d13AudFreqRec));
+ }
+ if(checkKernelArgument("-wex-audio-pinbuf")) {
+  auto pinbuf=reinterpret_cast<volatile uint32_t *>(base+0x48414);
+  hdaPinBufEarly[0]=*pinbuf;if(hdaPinBufEarly[0]!=UINT32_MAX)*pinbuf=hdaPinBufEarly[0]|0x80000000U;hdaPinBufEarly[1]=*pinbuf;
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAPinBufEarly",hdaPinBufEarly,sizeof(hdaPinBufEarly));
+ }
+ auto reg=reinterpret_cast<volatile uint32_t *>(base+0x65F10);
+ d13AudWakeOrig=*reg;d13AudWakeRec[2]=d13AudWakeOrig;
+ if(d13AudWakeOrig==UINT32_MAX) {d13AudWakeRec[1]=9;d13AudWakePublish();return;}
+ d13AudWakeBase=base;
+ *reg=d13AudWakeOrig&~(1U<<15);IODelay(1000);
+ *reg=(*reg)|(1U<<15);IODelay(1000);
+ d13AudWakeRec[1]=stageSet;d13AudWakeRec[3]=*reg;uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&d13AudWakeRec[5]);
+ d13AudWakePublish();
+ d13AudWakeRestoreCall=thread_call_allocate(d13AudWakeRestore,nullptr);
+ uint64_t deadline;clock_interval_to_deadline(300,NSEC_PER_SEC,&deadline);
+ if(d13AudWakeRestoreCall)thread_call_enter_delayed(d13AudWakeRestoreCall,deadline);
+}
+// Read-only HDA controller readout (PCI class 0x0403 or 0x0401, e.g. 8086:51C8), for the
+// HDMI-audio bring-up. Never writes; reads only status/capability registers.
+// WEXHDAReadout: {version, reads, valid, vendorDevice, GCAP|VMIN<<16|VMAJ<<24, GCTL,
+//  WAKEEN|STATESTS<<16, INTCTL, LLCH, mlOffset, links, ppOffset, PPCTL,
+//  EM 0x1000..0x103C (16 words), then per link i<8: LCAP, LCTL, LOSIDV, LSDIID,
+//  v2: [61..72] CORBLBASE, CORBUBASE, CORBWP|CORBRP<<16, CORBCTL|STS|SIZE, RIRBLBASE, RIRBUBASE,
+//  RIRBWP|RINTCNT<<16, RIRBCTL|STS|SIZE, ICIS, SSYNC(0x18)?, INTSTS 0x24, WALCLK 0x30;
+//  [73..120] raw 0x500..0x53C, 0x800..0x83C, 0xC00..0xC3C}.
+namespace {
+IOMemoryMap *wexHDAMap;IOPCIDevice *wexHDADevice;
+IOPCIDevice *wexFindHDA() {
+ auto match=IOService::serviceMatching("IOPCIDevice");if(!match)return nullptr;
+ IOPCIDevice *found=nullptr;
+ if(auto it=IOService::getMatchingServices(match)) {
+  while(auto o=it->getNextObject()) {
+   auto pci=OSDynamicCast(IOPCIDevice,o);if(!pci)continue;
+   auto cc=OSDynamicCast(OSData,pci->getProperty("class-code"));auto vid=OSDynamicCast(OSData,pci->getProperty("vendor-id"));
+   if(cc && cc->getLength()>=4 && vid && vid->getLength()>=2) {
+    auto c=static_cast<const uint8_t *>(cc->getBytesNoCopy());auto v=static_cast<const uint8_t *>(vid->getBytesNoCopy());
+    // 0x0403 = classic HDA; 0x0401 = DSP-capable cAVS/ACE controllers (e.g. 51C8): BAR0 is still the HDA block.
+    if(c[2]==0x04 && (c[1]==0x03 || c[1]==0x01) && v[0]==0x86 && v[1]==0x80) {found=pci;found->retain();break;}
+   }
+  }
+  it->release();
+ }
+ match->release();return found;
+}
+} // namespace
+static bool wexHDASerialize(void *,void *,OSSerialize *serializer) {
+ static uint32_t reads=0;uint32_t q[13+16+32+12+48] {2};
+ q[1]=__atomic_add_fetch(&reads,1U,__ATOMIC_RELAXED);
+ if(q[1]<4096) {
+  if(!wexHDADevice)wexHDADevice=wexFindHDA();
+  if(wexHDADevice && !wexHDAMap)wexHDAMap=wexHDADevice->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
+  if(wexHDAMap && wexHDAMap->getLength()>=0x2000 && wexHDAMap->getVirtualAddress()) {
+   auto b=reinterpret_cast<volatile uint8_t *>(wexHDAMap->getVirtualAddress());
+   auto r32=[&](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(b+o);};
+   auto r16=[&](uint32_t o){return static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t *>(b+o));};
+   q[2]=1;q[3]=wexHDADevice->configRead32(0);
+   q[4]=r16(0)|(static_cast<uint32_t>(b[2])<<16)|(static_cast<uint32_t>(b[3])<<24);q[5]=r32(0x08);q[6]=r16(0x0C)|(r16(0x0E)<<16);
+   q[7]=r32(0x20);q[8]=r32(0x14);
+   uint32_t off=q[8]&0xFFFF;unsigned guard=0;
+   while(off && off<0x2000-0x200 && guard++<10) {
+    const auto hdr=r32(off);const auto id=(hdr>>16)&0xFFF;
+    if(id==1 && !q[9]) {q[9]=off;}
+    if(id==3 && !q[11]) {q[11]=off;q[12]=r32(off+0x04);}
+    const auto next=hdr&0xFFFF;if(next==off)break;off=next;
+   }
+   for(unsigned i=0;i<16;++i)q[13+i]=r32(0x1000+4*i);
+   // v2: command-ring state (CORB/RIRB/immediate) and raw capability blocks.
+   q[61]=r32(0x40);q[62]=r32(0x44);q[63]=r16(0x48)|(r16(0x4A)<<16);q[64]=r32(0x4C);
+   q[65]=r32(0x50);q[66]=r32(0x54);q[67]=r16(0x58)|(r16(0x5A)<<16);q[68]=r32(0x5C);
+   q[69]=r32(0x68);q[70]=r32(0x18);q[71]=r32(0x24);q[72]=r32(0x30);
+   for(unsigned i=0;i<16;++i) {q[73+i]=r32(0x500+4*i);q[89+i]=r32(0x800+4*i);q[105+i]=r32(0xC00+4*i);}
+   if(q[9]) {
+    q[10]=(r32(q[9]+0x04)&0xF)+1; // MLCD: number of links - 1
+    for(unsigned l=0;l<8 && l<q[10];++l) {
+     const auto lb=q[9]+0x40+0x40*l;if(lb+0x10>=0x2000)break;
+     q[29+4*l]=r32(lb);q[30+4*l]=r32(lb+4);q[31+4*l]=r32(lb+8);q[32+4*l]=r32(lb+0xC);
+    }
+   }
+  }
+ }
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool adlnGTPowerSerialize(void *target,void *,OSSerialize *serializer) {
  static uint32_t reads=0;
  uint64_t q[16] {1285};auto &c=display13FBPower;
@@ -5684,6 +7654,9 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
     }
     if(adlnOutputWiring.panel)processDisplay13Panel(patcher,index,address,size);
     display13FBTCHooksReady=processDisplay13FramebufferTC(patcher,index,address,size);
+    display13AudioProbeInstall(patcher,index,address,size); // read-only audio diagnostic
+    display13DPAudioInstall(patcher,index,address,size); // opt-in -wex-dp-audio
+    display13EarlyWellsInstall(patcher,index,address,size); // opt-in -wex-hda-early-wells
     processDisplay13Training(patcher,index,address,size);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCHooksReady",display13FBTCHooksReady);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBOutputHooksReady",display13FBOutputHooksReady);
@@ -8828,6 +10801,13 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
   if(auto power=OSSerializer::forTarget(that,adlnGTPowerSerialize)) {
    that->setProperty("N97GTPowerSample",power);power->release();
   }
+  if(auto tc=OSSerializer::forTarget(that,display13TCLiveSerialize)) {that->setProperty("WEXDisplay13TCLive",tc);tc->release();}
+  if(auto fia=OSSerializer::forTarget(that,display13TCFIASerialize)) {that->setProperty("WEXDisplay13TCFIA",fia);fia->release();}
+  if(auto aud=OSSerializer::forTarget(that,display13AudioSerialize)) {that->setProperty("WEXDisplay13Audio",aud);aud->release();}
+  display13AudioWake(that);
+  display13HDALateSchedule(that);
+  display13HDADeferNote(that);
+  if(auto hda=OSSerializer::forTarget(nullptr,wexHDASerialize)) {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDAReadout",hda);hda->release();}
  }
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferStartAccepted",accepted);
 	return accepted;
