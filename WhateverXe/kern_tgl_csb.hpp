@@ -10,6 +10,62 @@ constexpr uint32_t Capacity = 12;
 constexpr uint32_t ResetIndex = Capacity - 1;
 constexpr uint64_t Sentinel = UINT64_MAX;
 
+// S0 Deep Idle wake planner (opt-in via -wex-s0-csb-resync).
+// Preserve the hardware CSB only when GFX_MODE bit 3 is intact and the idle
+// hardware write pointer, HWS tail, software head and active bank match the
+// pre-sleep snapshot; otherwise re-arm GFX_MODE bit 3 (if lost) and reinitialize.
+enum class WakeAction : uint8_t { Initialize, Preserve, RearmAndInitialize };
+struct WakeBaseline {
+	uint32_t pointer {}, tail {}, head {}, active {};
+	bool valid {};
+};
+struct WakePlan {
+	WakeAction action {WakeAction::Initialize};
+	bool restoreMode {};
+};
+constexpr bool hasCSB12Mode(uint32_t mode) {
+	return mode != UINT32_MAX && (mode & 8U) != 0;
+}
+constexpr WakePlan planMode(uint32_t mode, uint32_t modeAtInit) {
+	if (mode == UINT32_MAX || hasCSB12Mode(mode))
+		return {WakeAction::Initialize, false};
+	return {WakeAction::RearmAndInitialize,
+	        modeAtInit == UINT32_MAX || hasCSB12Mode(modeAtInit)};
+}
+inline WakePlan planWake(const WakeBaseline &prior, uint32_t pointer,
+                         uint32_t tail, uint32_t mode,
+                         uint32_t softwareHead, uint32_t active,
+                         uint32_t modeAtInit) {
+	const auto modePlan = planMode(mode, modeAtInit);
+	if (modePlan.action == WakeAction::RearmAndInitialize || mode == UINT32_MAX)
+		return modePlan;
+	if (pointer == UINT32_MAX)
+		return {WakeAction::Initialize, false};
+	const uint32_t write = pointer & 0xFU;
+	if (!prior.valid || write >= Capacity || tail >= Capacity ||
+	    softwareHead >= Capacity || pointer != prior.pointer ||
+	    write != prior.tail || write != tail ||
+	    write != softwareHead || softwareHead != prior.head ||
+	    active != prior.active)
+		return {WakeAction::Initialize, false};
+	return {WakeAction::Preserve, false};
+}
+template<class IO>
+uint32_t readTail(IO &io) {
+	if (!io.mmioTail)
+		return io.readHWSPLastWrite();
+	io.acquire();
+	return io.readMMIOPointer() & 0xFU;
+}
+template<class IO>
+bool ensureCSB12Mode(const WakePlan &plan, IO &io, uint32_t &modeAfter) {
+	if (plan.restoreMode) {
+		io.writeMode(0x00080008U);
+		modeAfter = io.readMode();
+	}
+	return hasCSB12Mode(modeAfter);
+}
+
 // Mask only the Gen11+ read/write fields defined in intel_lrc_reg.h.
 // r92's broad 0xffff mask also cleared bits15:12 (observed 7 -> 0),
 // after which HWSP and indexed-MMIO events appeared one slot apart.
@@ -110,6 +166,26 @@ inline LegacyEntry legacyEntry(const Event &event) {
 	const uint32_t identity = ((lo & 0xF8) << 26) | ((lo << 10) & 0x3F0000)
 		| ((hi >> 3) & 0x1F800000) | ((hi >> 10) & 0xFFE0) | ((hi >> 12) & 7);
 	return {flags, identity};
+}
+
+// Opt-in same-context ElementComplete handling (-wex-s0-csb-resync, #171 c4):
+// donor scheduler can submit the same hardware context in both ELSP ports;
+// element 0 completing into element 1 of the same context has away==to with
+// newQueue=0 and detail=0. Keep default classify()/legacyEntry() unchanged.
+inline Event classifyS0(uint64_t raw) {
+	auto event = classify(raw);
+	if (event.kind == Kind::Invalid && raw != Sentinel &&
+	    !event.newQueue && !event.away.idle() && event.away == event.to && !event.detail)
+		event.kind = Kind::ElementComplete;
+	return event;
+}
+inline LegacyEntry legacyEntryS0(const Event &event) {
+	auto entry = legacyEntry(event);
+	if (!event.away.idle() && event.away == event.to && !event.newQueue) {
+		entry.flags |= 4U;
+		entry.flags &= ~0x8000U;
+	}
+	return entry;
 }
 
 enum class Handler : uint8_t {

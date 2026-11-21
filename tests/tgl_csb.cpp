@@ -115,6 +115,124 @@ static void eventTests() {
 	assert(metadata.semaphoreWaitMode && metadata.waitDetail == 120);
 }
 
+static void s0WakeTests() {
+	struct ModeIO {
+		uint32_t mode {0}, hwspTail {5}, mmioPointer {0x7003U};
+		unsigned writes {}, acquires {};
+		bool mmioTail {false}, rejectWrite {false};
+		void acquire() { ++acquires; }
+		uint32_t readHWSPLastWrite() const { return hwspTail; }
+		uint32_t readMMIOPointer() const { return mmioPointer; }
+		uint32_t readMode() const { return mode; }
+		void writeMode(uint32_t value) {
+			++writes;
+			assert(value == 0x00080008U);
+			if (!rejectWrite) mode = (mode & ~8U) | (value & 8U);
+		}
+	};
+	// TGLCSB::readTail chooses HWSP vs MMIO pointer without extra forcewake.
+	{
+		ModeIO io;
+		assert(readTail(io) == 5 && io.acquires == 0);
+		io.mmioTail = true;
+		assert(readTail(io) == 3 && io.acquires == 1);
+	}
+	// Preserve when GFX_MODE bit 3 is intact and drained state matches snapshot.
+	for (uint32_t idx = 0; idx < Capacity; ++idx) {
+		for (uint32_t active = 0; active <= 1; ++active) {
+			const uint32_t ptr = 0x7000U | (idx << 8) | idx;
+			const WakeBaseline prior {ptr, idx, idx, active, true};
+			const auto plan = planWake(prior, ptr, idx, 8U, idx, active, 8U);
+			assert(plan.action == WakeAction::Preserve && !plan.restoreMode);
+			ModeIO io; io.mode = 8U; uint32_t after = io.mode;
+			assert(ensureCSB12Mode(plan, io, after) && after == 8U && io.writes == 0);
+		}
+	}
+	// Lost GFX_MODE bit 3 on a previously initialized engine re-arms 0x00080008.
+	{
+		const WakeBaseline prior {0x7303U, 3U, 3U, 0U, true};
+		const auto plan = planWake(prior, 0x7303U, 3U, 0U, 3U, 0U, 8U);
+		assert(plan.action == WakeAction::RearmAndInitialize && plan.restoreMode);
+		ModeIO io; io.mode = 0U; uint32_t after = io.mode;
+		assert(ensureCSB12Mode(plan, io, after) && after == 8U && io.writes == 1);
+	}
+	// Regression: render-domain gpuRestart or wake before an engine's first
+	// submission clears GFX_MODE to 0 while modeAtInit is still UINT32_MAX.
+	// planMode/planWake must re-arm bit 3 instead of latching Unavailable.
+	{
+		const auto initPlan = planMode(0U, UINT32_MAX);
+		assert(initPlan.action == WakeAction::RearmAndInitialize && initPlan.restoreMode);
+		ModeIO mio; mio.mode = 0U; uint32_t after = mio.mode;
+		assert(ensureCSB12Mode(initPlan, mio, after) && after == 8U && mio.writes == 1);
+		State state; IO io; fresh(state, io); Consumer accept {io};
+		assert(drain(state, io, accept) == Error::None);
+
+		const WakeBaseline none {};
+		const auto wakePlan = planWake(none, 0x7007U, 11U, 0U, 11U, 0U, UINT32_MAX);
+		assert(wakePlan.action == WakeAction::RearmAndInitialize && wakePlan.restoreMode);
+	}
+	// Hardware rejecting bit-3 write fails ensureCSB12Mode cleanly.
+	{
+		const auto plan = planMode(0U, UINT32_MAX);
+		ModeIO io; io.mode = 0U; io.rejectWrite = true; uint32_t after = io.mode;
+		assert(!ensureCSB12Mode(plan, io, after) && after == 0U && io.writes == 1);
+	}
+	// Explicit non-CSB12 modeAtInit=0 never forces bit 3.
+	{
+		const auto plan = planMode(0U, 0U);
+		assert(plan.action == WakeAction::RearmAndInitialize && !plan.restoreMode);
+		ModeIO io; io.mode = 0U; uint32_t after = io.mode;
+		assert(!ensureCSB12Mode(plan, io, after) && after == 0U && io.writes == 0);
+	}
+	// Unreadable MMIO (mode == UINT32_MAX) never writes modeReg.
+	{
+		const WakeBaseline prior {0x7303U, 3U, 3U, 0U, true};
+		const auto p1 = planMode(UINT32_MAX, 8U);
+		const auto p2 = planWake(prior, 0x7303U, 3U, UINT32_MAX, 3U, 0U, 8U);
+		assert(p1.action == WakeAction::Initialize && !p1.restoreMode);
+		assert(p2.action == WakeAction::Initialize && !p2.restoreMode);
+		ModeIO io; io.mode = UINT32_MAX; uint32_t after = io.mode;
+		assert(!ensureCSB12Mode(p2, io, after) && io.writes == 0);
+	}
+	// Any snapshot mismatch or hardware reset falls back to Initialize.
+	{
+		const WakeBaseline prior {0x7303U, 3U, 3U, 0U, true};
+		assert(planWake({}, 0x7303U, 3U, 8U, 3U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, UINT32_MAX, 3U, 8U, 3U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x0F0F0B0BU, 11U, 8U, 3U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x730CU, 12U, 8U, 3U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x7303U, 4U, 8U, 3U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x7303U, 3U, 8U, 4U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x7303U, 3U, 8U, 3U, 1U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x7303U, 12U, 8U, 3U, 0U, 8U).action == WakeAction::Initialize);
+		assert(planWake(prior, 0x7303U, 3U, 8U, 12U, 0U, 8U).action == WakeAction::Initialize);
+	}
+	// Opt-in same-context ElementComplete (#171 c4): default classify() stays Invalid.
+	{
+		const uint64_t sameCtx = 0x0001000000010000ULL;
+		assert(classify(sameCtx).kind == Kind::Invalid);
+		const auto event = classifyS0(sameCtx);
+		assert(event.kind == Kind::ElementComplete);
+		assert(handlerFor(event) == Handler::ElementSwitch);
+		const auto entry = legacyEntryS0(event);
+		assert((entry.flags & 0x14U) == 0x14U && (entry.flags & 0x8000U) == 0);
+		assert(entry.identity == legacyEntry(event).identity);
+		// Non-zero detail, Sentinel, and idle->idle remain Invalid.
+		for (unsigned detail = 1; detail <= 15; ++detail)
+			assert(classifyS0(sameCtx | (static_cast<uint64_t>(detail) << 32)).kind == Kind::Invalid);
+		assert(classifyS0(Sentinel).kind == Kind::Invalid);
+		assert(classifyS0(0x03FF800003FF8000ULL).kind == Kind::Invalid);
+		// Normal LiteRestore (newQueue=1) and distinct ElementComplete are unchanged.
+		const auto lite = classifyS0(sameCtx | 1ULL);
+		assert(lite.kind == Kind::LiteRestore);
+		assert(legacyEntryS0(lite).flags == legacyEntry(lite).flags);
+		assert((legacyEntryS0(lite).flags & 0x8000U) != 0 && (legacyEntryS0(lite).flags & 4U) == 0);
+		const auto elem = classifyS0(0x0001000000018000ULL);
+		assert(elem.kind == Kind::ElementComplete);
+		assert(legacyEntryS0(elem).flags == legacyEntry(elem).flags);
+	}
+}
+
 int main(int argc, char **argv) {
 	// The external exact-donor audit uses this to compare ABI translation.
 	if (argc == 2) {
@@ -124,6 +242,7 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 	eventTests();
+	s0WakeTests();
 	// Model masked-register semantics, including r89's observed 0x7007.
 	// Only documented read/write fields may change. This does not model GPU
 	// ring behavior; the predicted HWSP/MMIO alignment needs a live test.
