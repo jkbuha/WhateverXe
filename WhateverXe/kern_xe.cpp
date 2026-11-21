@@ -17874,7 +17874,7 @@ bool XE::wrapAlderLakeNNativeIRQ(IOService *that) {
 }
 
 bool XE::wrapTGLAcceleratorEngine(IOService *that) {
- if (callbackXE->adlnDetected) {
+ if (callbackXE->adlnDetected && (!checkKernelArgument("-wex-s0-csb-resync") || tglHost.startingOwner==that)) {
   auto a=reinterpret_cast<uint8_t *>(that);
   uint32_t caps[] {*reinterpret_cast<uint32_t *>(a+0x1120),*reinterpret_cast<uint32_t *>(a+0x1124),
    *reinterpret_cast<uint32_t *>(a+0x1158),*reinterpret_cast<uint32_t *>(a+0x115C),
@@ -18120,9 +18120,18 @@ struct TGLCSBIO {
  }
  ~TGLCSBIO() { if (awake) tglCSBForceWake[wakeVariant](owner,false,7); }
  void acquire() { if (!awake) {tglCSBForceWake[wakeVariant](owner,true,7);awake=true;} }
- uint32_t readTail() {
-  if (!mmioTail) return sampledTail=*reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
-  acquire();return sampledTail=*reinterpret_cast<volatile uint32_t *>(bar+pointerReg)&15;
+ uint32_t readHWSPLastWrite() {
+  return *reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
+ }
+ uint32_t readMMIOPointer() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+pointerReg);
+ }
+ uint32_t readTail() { return sampledTail=TGLCSB::readTail(*this); }
+ uint32_t readMode() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+modeReg);
+ }
+ void writeMode(uint32_t value) {
+  *reinterpret_cast<volatile uint32_t *>(bar+modeReg)=value;
  }
  void readFence() { __asm__ volatile("lfence" ::: "memory"); }
  uint64_t readEntry(uint32_t i) { return *reinterpret_cast<volatile uint64_t *>(hwsp+0x40+i*8); }
@@ -18146,12 +18155,103 @@ struct TGLCSBIO {
  }
 };
 
+// Opt-in S0 Deep Idle CSB preservation (-wex-s0-csb-resync, #117 / #80).
+// Snapshots drained CSB state after native IntelAccelerator::systemWillSleep(),
+// drops spurious mid-sleep CSB interrupts, and preserves unchanged retained CSB
+// state on resetOnWake() without touching CSB_PTR or poisoning HWSP.
+struct TGLS0SleepRecord {
+ TGLCSB::WakeBaseline before {};
+ uint32_t elStatus {};
+ uintptr_t slots[4] {};
+ void *streamer {};
+ uint32_t epoch {};
+};
+static TGLS0SleepRecord tglS0Sleep[6];
+static uint32_t tglS0Epoch {};
+static mach_vm_address_t tglS0OrgWillSleep {};
+static mach_vm_address_t tglS0OrgDidWake {};
+static bool tglS0ResyncRequested {};
+static bool tglS0SleepHookRouted {};
+static volatile uint32_t tglS0AsleepMask {};
+static uint32_t tglS0Dropped[6] {};
+static uint32_t tglS0WakeTrace[6][16] {};
+static uint32_t tglS0WakeCount {};
+
+static void tglS0WrapWillSleep(void *accelerator) {
+ reinterpret_cast<void (*)(void *)>(tglS0OrgWillSleep)(accelerator);
+ const uint32_t epoch=__sync_add_and_fetch(&tglS0Epoch,1);
+ uint32_t asleep=0;
+ for (unsigned i=0;i<arrsize(tglS0Sleep);++i) {
+  auto &record=tglS0Sleep[i];auto &engine=tglCSBEngines[i];
+  __atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
+  record.before.valid=false;
+  record.elStatus=0;
+  record.streamer=engine.streamer;
+  if (!engine.streamer || !engine.hardwareReady ||
+      engine.state.error!=TGLCSB::Error::None) continue;
+  TGLCSBIO io(engine.streamer,0);io.acquire();
+  const auto pointer=io.readMMIOPointer();
+  const auto tail=io.readTail();
+  const auto mode=io.readMode();
+  const auto head=engine.state.head;
+  const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const auto elStatus=(io.pointerReg>=0x3A0) ? *reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234) : 0U;
+  const auto idle=pointer!=UINT32_MAX && mode!=UINT32_MAX && (mode&8U) &&
+     head<TGLCSB::Capacity && tail==head && (pointer&0xFU)==head && active<=1;
+  record.before={pointer,tail,head,active,idle};
+  record.elStatus=elStatus;
+  for (unsigned j=0;j<4;++j)
+   record.slots[j]=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8);
+  __atomic_store_n(&record.epoch,epoch,__ATOMIC_RELEASE);
+  asleep|=(1U<<i);
+ }
+ __atomic_store_n(&tglS0AsleepMask,asleep,__ATOMIC_RELEASE);
+}
+
+static void tglS0WrapDidWake(void *accelerator) {
+ reinterpret_cast<void (*)(void *)>(tglS0OrgDidWake)(accelerator);
+ __atomic_store_n(&tglS0AsleepMask,0U,__ATOMIC_RELEASE);
+}
+
+// Fixed CPU-only lazy serializer; zero allocations in sleep/wake hot paths.
+static bool tglS0WakeTraceSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[4+6*16] {2,tglS0Epoch,tglS0WakeCount,tglS0SleepHookRouted};
+ for (unsigned i=0;i<6;++i)
+  for (unsigned j=0;j<16;++j)
+   out[4+i*16+j]=__atomic_load_n(&tglS0WakeTrace[i][j],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));
+ if (!data) return false;
+ const bool success=data->serialize(serializer);data->release();return success;
+}
+
 void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ if (tglS0ResyncRequested) {
+  __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
+  __sync_fetch_and_and(&tglS0AsleepMask,~(1U<<io.engine));
+ }
  // Called before the first submission, wake reset, or GPU-reset replay. Never
  // at reset's return: that method can submit GPU work before it returns.
- engine.streamer=streamer;TGLCSB::initialize(engine.state,io);
- engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ engine.streamer=streamer;
+ if (tglS0ResyncRequested) {
+  engine.hardwareReady=false;
+  io.acquire();
+  uint32_t mode=io.readMode();
+  const auto modePlan=TGLCSB::planMode(mode,engine.modeAtInit);
+  if (!TGLCSB::ensureCSB12Mode(modePlan,io,mode)) {
+   engine.state.error=TGLCSB::Error::Unavailable;
+   return;
+  }
+  TGLCSB::initialize(engine.state,io);
+  if (engine.state.error!=TGLCSB::Error::None) {
+   engine.hardwareReady=false;
+   return;
+  }
+  engine.modeAtInit=mode;
+ } else {
+  TGLCSB::initialize(engine.state,io);
+  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ }
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
 }
@@ -18258,6 +18358,35 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
+ tglS0ResyncRequested=ok && checkKernelArgument("-wex-s0-csb-resync");
+ if (tglS0ResyncRequested) {
+  const auto sleepSym="__ZN16IntelAccelerator15systemWillSleepEv";
+  const auto wakeSym="__ZN16IntelAccelerator13systemDidWakeEv";
+  const uint8_t sleepPrologue[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB,0x48};
+  const uint8_t wakePrologue[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB,0x31,0xC0};
+  const auto sleepTarget=patcher.solveSymbol<mach_vm_address_t>(index,sleepSym,address,size);
+  const auto wakeTarget=patcher.solveSymbol<mach_vm_address_t>(index,wakeSym,address,size);
+  bool sleepOK=size>0x2897A+sizeof(wakePrologue) &&
+   sleepTarget==address+0x28916 &&
+   wakeTarget==address+0x2897A &&
+   !memcmp(reinterpret_cast<void *>(sleepTarget),sleepPrologue,sizeof(sleepPrologue)) &&
+   !memcmp(reinterpret_cast<void *>(wakeTarget),wakePrologue,sizeof(wakePrologue));
+  patcher.clearError();
+  if (sleepOK) {
+   KernelPatcher::RouteRequest sleepRoutes[] {
+    {sleepSym,tglS0WrapWillSleep,tglS0OrgWillSleep},
+    {wakeSym,tglS0WrapDidWake,tglS0OrgDidWake}
+   };
+   sleepOK=patcher.routeMultiple(index,sleepRoutes,arrsize(sleepRoutes),address,size);
+   patcher.clearError();
+  }
+  tglS0SleepHookRouted=sleepOK;
+  root->setProperty("WEXS0SleepHookRouted",sleepOK);
+  if (sleepOK) {
+   auto trace=OSSerializer::forTarget(nullptr,tglS0WakeTraceSerialize);
+   if (trace) {root->setProperty("WEXS0CSBWakeTrace",trace);trace->release();}
+  }
+ }
  tglCSB12Enabled=ok;patcher.clearError();return ok;
 }
 
@@ -18268,6 +18397,11 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
   // storage here, but defer forcewake/MMIO until the first submission or the
   // native wake-reset entry point, where that hardware access is established.
   TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  if (tglS0ResyncRequested) {
+   e.modeAtInit=UINT32_MAX;
+   __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
+   __sync_fetch_and_and(&tglS0AsleepMask,~(1U<<io.engine));
+  }
   e.streamer=streamer;e.hardwareReady=false;
   io.writeTail(TGLCSB::ResetIndex);
   for (unsigned i=0;i<TGLCSB::Capacity;++i) io.writeEntry(i,TGLCSB::Sentinel);
@@ -18276,18 +18410,82 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+void XE::wrapTGLCSBWake(void *streamer) {
+ if (!tglS0ResyncRequested || !tglS0SleepHookRouted) {
+  tglCSBInitialize(streamer);
+  return;
+ }
+ bool preserve=false,modeReady=false;
+ unsigned engineIdx=0;
+ {
+  TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  engineIdx=io.engine;
+  auto &snap=tglS0Sleep[io.engine];
+  const uint32_t epoch=__atomic_load_n(&snap.epoch,__ATOMIC_ACQUIRE);
+  io.acquire();
+  const uint32_t pointer=io.readMMIOPointer();
+  const uint32_t tail=io.readTail();
+  const uint32_t mode=io.readMode();
+  const uint32_t activeBefore=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const uint32_t elStatus=(io.pointerReg>=0x3A0) ? *reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234) : 0U;
+  const auto before=(epoch && snap.streamer==streamer &&
+      e.hardwareReady && e.state.error==TGLCSB::Error::None)
+      ? snap.before : TGLCSB::WakeBaseline {};
+  const bool elMatch=before.valid && ((elStatus&1U)==(snap.elStatus&1U));
+  const uint32_t effectiveActive=(elMatch && before.active<=1) ? before.active : activeBefore;
+  const auto plan=TGLCSB::planWake(before,pointer,tail,mode,e.state.head,effectiveActive,e.modeAtInit);
+  auto action=plan.action;
+  uint32_t modeAfter=mode;
+  modeReady=TGLCSB::ensureCSB12Mode(plan,io,modeAfter);
+  if (!modeReady) {
+   e.state.error=TGLCSB::Error::Unavailable;
+   e.hardwareReady=false;
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
+   for (unsigned j=0;j<4;++j)
+    if (snap.slots[j]!=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8)) {
+     action=TGLCSB::WakeAction::Initialize;break;
+    }
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
+   e.state.head=pointer&0xFU;
+   e.state.error=TGLCSB::Error::None;
+   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=e.state.head;
+   if (before.active<=1 && activeBefore!=before.active)
+    *reinterpret_cast<uint32_t *>(io.streamer+0x50)=before.active;
+   e.modeAtInit=modeAfter;
+   ++e.resets;
+   preserve=true;
+  }
+  const uint32_t data[16] {epoch,snap.before.pointer,snap.before.tail,
+   snap.before.head,snap.before.active,before.valid?1U:0U,
+   pointer,tail,mode,static_cast<uint32_t>(action),modeAfter,
+   activeBefore,e.state.head,snap.elStatus,elStatus,tglS0Dropped[io.engine]};
+  for (unsigned j=0;j<16;++j)
+   __atomic_store_n(&tglS0WakeTrace[io.engine][j],data[j],__ATOMIC_RELAXED);
+  __sync_fetch_and_add(&tglS0WakeCount,1);
+  __atomic_store_n(&snap.epoch,0U,__ATOMIC_RELEASE);
+ }
+ if (modeReady && !preserve) tglCSBInitialize(streamer);
+ __sync_fetch_and_and(&tglS0AsleepMask,~(1U<<engineIdx));
+}
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
- TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ TGLCSBIO io(streamer,flags);
+ if (tglS0ResyncRequested && (__atomic_load_n(&tglS0AsleepMask,__ATOMIC_ACQUIRE)&(1U<<io.engine))) {
+  __sync_fetch_and_add(&tglS0Dropped[io.engine],1);
+  return;
+ }
+ auto &engine=tglCSBEngines[io.engine];
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
  auto consume=[&](const TGLCSB::Sample &sample) {
-  const auto event=TGLCSB::classify(sample.raw);const auto entry=TGLCSB::legacyEntry(event);
+  const auto event=tglS0ResyncRequested ? TGLCSB::classifyS0(sample.raw) : TGLCSB::classify(sample.raw);
+  const auto entry=tglS0ResyncRequested ? TGLCSB::legacyEntryS0(event) : TGLCSB::legacyEntry(event);
   engine.lastRaw=sample.raw;engine.retries+=sample.retries;
   engine.fallback+=sample.source==TGLCSB::Source::MMIO;
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;

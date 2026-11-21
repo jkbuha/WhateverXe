@@ -174,5 +174,6 @@
   "-wex-tc3-legacy": [],
   "-wex-tc4-legacy": [],
   "-wex-resume-park": [],
-  "-wex-aud-apple-unplug": []
+  "-wex-aud-apple-unplug": [],
+  "-wex-s0-csb-resync": []
 }
