@@ -458,6 +458,12 @@ private:
     static bool prepareDisplay13Wake(IOService *fb);
 	static void wrapAlderLakeNPowerOverride(void *power,bool enable);
 	static void wrapAlderLakeNPowerRestore(void *power,bool waking);
+	static uint64_t wrapDisplay13EnableDC9(void *controller);
+	static void wrapDisplay13DC9BeforeSleep(IOService *fb);
+	void finishDisplay13DC9Wake(IOService *fb);
+	mach_vm_address_t orgDisplay13PrepareToExitWake {};
+	bool display13DC9HookReady {};
+	__attribute__((noinline)) bool processDisplay13DC9PwrOff(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 	__attribute__((noinline)) bool processDisplay13FramebufferLifecycle(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 	mach_vm_address_t orgAlderLakeNEngineEnable {};
 	mach_vm_address_t orgAlderLakeNDisableDisplay {};

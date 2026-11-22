@@ -3,6 +3,7 @@
 #include <IOKit/IOMessage.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 //
 //  kern_xe.cpp
@@ -96,6 +97,7 @@ void endTGLBootMode(void *path) {
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
+#include "kern_display13_dc9_pwroff.hpp"
 #include "kern_tgl_pcode_gate.hpp"
 #include "kern_tgl_pcode_edram.hpp"
 #include "kern_tgl_tc_cold.hpp"
@@ -4826,6 +4828,7 @@ struct Display13FBPowerContext {
     Display13Power::NativeBridge bridge;
     Display13Power::MainLinkAUX mainLink[2];
     Display13Power::Lease engine;
+    Display13Power::Lease dc9LinkLease;
     Display13DBUF::State dbuf;
     Display13WM::Latency latency;
     bool watermarkFaulted {};
@@ -7815,6 +7818,8 @@ bool XE::processDisplay13FramebufferLifecycle(KernelPatcher &patcher,size_t inde
 	KernelPatcher::RouteRequest pathRoute {pathSymbol,wrapAlderLakeNFreePath,orgAlderLakeNFreePath};
 	const bool pathRouted=disableRouted && pathKnown && patcher.routeMultipleShort(index,&pathRoute,1,address,size);
 	patcher.clearError();
+	if(pathRouted && checkKernelArgument("-wex-d13-dc9-pwroff"))
+		display13DC9HookReady=processDisplay13DC9PwrOff(patcher,index,address,size);
     return pathRouted && (!Display13FBTopology::multiOutputWiring(adlnOutputWiring) ||
         processDisplay13Retirement(patcher,index,address,size));
 }
@@ -10258,9 +10263,13 @@ struct AlderLakeNGammaObservation {
     uint32_t writes[1024] {};
 };
 static AlderLakeNGammaObservation adlnGammaObservations[4];
+static Display13DC9PwrOff::State display13DC9State;
+static bool display13DC9PwrOffRequested();
+static bool display13DC9PwrOffActive();
 struct AlderLakeNPreGammaUpload {
     uintptr_t thread {};void *access {};uint32_t dataReg {};
     Display13Color::PreGammaStream stream;uint32_t source[35] {};
+    uint32_t emittedCount {};uint32_t emitted[Display13DC9PwrOff::PreCscGamcCount] {};
     uint32_t failure {},indexWrites {},indexValues[4] {};
 };
 static AlderLakeNPreGammaUpload adlnPreGammaUploads[4];
@@ -10336,14 +10345,34 @@ void XE::wrapAlderLakeNPreGamma(void *path,void *transaction,uint32_t control) {
         Display13Color::registerPair(pipe,*reinterpret_cast<uint32_t *>(p+0xC),*reinterpret_cast<uint32_t *>(p+0x10),true);
     if(associated && !nested)for(auto &o:adlnPreGammaUploads)if(__sync_bool_compare_and_swap(&o.thread,0,thread)) {
         slot=&o;o.access=*reinterpret_cast<void **>(fb+0x4A40);o.dataReg=*reinterpret_cast<uint32_t *>(p+0x10);
-        o.stream={};o.failure=o.indexWrites=0;memset(o.source,0,sizeof(o.source));memset(o.indexValues,0,sizeof(o.indexValues));break;
+        o.stream={};o.emittedCount=0;memset(o.emitted,0,sizeof(o.emitted));
+        o.failure=o.indexWrites=0;memset(o.source,0,sizeof(o.source));memset(o.indexValues,0,sizeof(o.indexValues));break;
     }
     static uint32_t calls {};const auto call=__sync_add_and_fetch(&calls,1);
     uint64_t r[64] {2,call,control,associated,slot!=nullptr};r[17]=pipe;
     if(fb)r[5]=fb[0x4230];if(p)r[6]=*reinterpret_cast<uint32_t *>(p+0x18C);
+    // After DC9 PW_A power-off, Apple's wake configurePlane() calls configurePipePreCSCGamma
+    // with control=0x2 (ENABLE only, without 0x4 UPLOAD). Promote the first post-DC9 Pipe 0
+    // call to 0x6 (UPLOAD | ENABLE) when a Pre-CSC mode is active so Apple's live curve is
+    // reloaded under its own lock (belts-and-suspenders alongside Phase 2a SRAM restore).
+    bool promoted=false;
+    if(associated && !nested && pipe==0 && control==0x2U && display13DC9PwrOffActive() &&
+       fb && fb[0x4230]>=1 && fb[0x4230]<=6 &&
+       __atomic_load_n(&display13DC9State.preGammaPromotePending,__ATOMIC_ACQUIRE)) {
+        control=0x6U;
+        promoted=true;
+    }
     // Keep donor generation, DC6-disabled native lock, trigger queue and enable
     // sequencing. Only the 35 DATA writes become 131 under that SAME lock.
     FunctionCast(wrapAlderLakeNPreGamma,callbackXE->orgAlderLakeNPreGamma)(path,transaction,control);
+    if(associated && !nested && pipe==0 && slot && slot->stream.complete() &&
+       slot->emittedCount==Display13DC9PwrOff::PreCscGamcCount && !slot->failure && display13FBPower.lock) {
+        IOLockLock(display13FBPower.lock);
+        Display13DC9PwrOff::cachePreGamma(display13DC9State,slot->emitted);
+        if(promoted)++display13DC9State.color.preGammaPromoteCount;
+        __atomic_store_n(&display13DC9State.preGammaPromotePending,false,__ATOMIC_RELEASE);
+        IOLockUnlock(display13FBPower.lock);
+    }
     if(p)r[7]=*reinterpret_cast<uint32_t *>(p+0x18C);
     if(slot) {
         r[8]=slot->stream.inputs;r[9]=slot->stream.outputs;r[10]=slot->failure;
@@ -10430,6 +10459,13 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
         for(unsigned i=0;i<arrsize(indices);++i)r[89+i]=slot->writes[indices[i]];
         r[105]=slot->maxWrites;r[106]=slot->maxFailure;
         for(unsigned i=0;i<6;++i) {r[107+i]=slot->maxOriginal[i];r[113+i]=slot->maxActual[i];}
+        if(p && fb && r[3]==0 && slot->access && slot->dataWrites==Display13DC9PwrOff::PalPrecCount &&
+           !slot->nested && !slot->overflow && display13FBPower.lock) {
+            IOLockLock(display13FBPower.lock);
+            const bool extValid=(slot->maxWrites==6 && !slot->maxFailure);
+            Display13DC9PwrOff::cachePostGamma(display13DC9State,slot->writes,slot->maxActual,extValid);
+            IOLockUnlock(display13FBPower.lock);
+        }
     }
     static uint32_t pipeCalls[3] {},uploadCalls[3] {};
     if(p && fb && r[3]<3) {
@@ -10480,7 +10516,10 @@ void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
         for(auto &slot:adlnPreGammaUploads)if(__sync_fetch_and_add(&slot.thread,0)==thread && access==slot.access) {
             if(reg==slot.dataReg && !slot.failure) {
                 if(slot.stream.inputs<35)slot.source[slot.stream.inputs]=value;
-                auto emit=[access,&slot](uint32_t v) {FunctionCast(wrapDisplay13GMBusWrite,callbackXE->orgDisplay13GMBusWrite)(access,slot.dataReg,v);};
+                auto emit=[access,&slot](uint32_t v) {
+                    if(slot.emittedCount<Display13DC9PwrOff::PreCscGamcCount)slot.emitted[slot.emittedCount++]=v;
+                    FunctionCast(wrapDisplay13GMBusWrite,callbackXE->orgDisplay13GMBusWrite)(access,slot.dataReg,v);
+                };
                 if(slot.stream.push(value,emit))return;
                 ++slot.failure;
             } else if(reg==slot.dataReg-4) {
@@ -12054,6 +12093,279 @@ static bool adlnWriterMappingBound() {
 
 
 
+
+// Opt-in (-wex-d13-dc9-pwroff) Display13 Deep Idle power-well teardown &
+// full eDP wake restore (kern_display13_dc9_pwroff.hpp). Zero behavior change
+// when the boot-arg is absent.
+static bool display13DC9PwrOffRequested() {
+	static int v=-1;
+	if(v<0)v=checkKernelArgument("-wex-d13-dc9-pwroff") ? 1 : 0;
+	return v==1;
+}
+static bool display13DC9PwrOffActive() {
+	return display13DC9PwrOffRequested() && !display13DC9State.fallbackTripped;
+}
+static bool display13IsDeepIdleSleep() {
+	auto *root=IOService::getPMRootDomain();
+	if(!root)return false;
+	auto *num=OSDynamicCast(OSNumber,root->getProperty("IOPMSystemSleepType"));
+	return num && num->unsigned32BitValue()==7U;
+}
+struct Display13DC9IO {
+	IOMemoryMap *map;
+	bool validOffset(uint32_t r) const {
+		return map && map->getVirtualAddress() && map->getLength()==0x1000000 && !(r&3U) && r<=0xFFFFFCU;
+	}
+	static bool writable(uint32_t r) {
+		namespace D=Display13DC9PwrOff;
+		switch(r) {
+		case D::PwrWellCtlBios: case D::PwrWellCtlDriver:
+		case D::PwrWellAuxBios: case D::PwrWellAuxDriver:
+		case D::PwrWellDdiBios: case D::PwrWellDdiDriver:
+		case D::DcStateEn: case D::SouthDplsGateReg:
+		case D::DbufSliceRegs[0]: case D::DbufSliceRegs[1]:
+		case D::DbufSliceRegs[2]: case D::DbufSliceRegs[3]:
+		case D::CdclkPllEnable:
+		case 0x46010: case 0x46014: case 0x46018:
+		case 0x164284: case 0x164288: case 0x16428C: case 0x164290: case 0x164294: case 0x164298:
+		case D::DpcaCfgcr0: case D::TransClkSelA:
+		case D::TransHtotalA: case D::TransHblankA: case D::TransHsyncA:
+		case D::TransVtotalA: case D::TransVblankA: case D::TransVsyncA:
+		case D::PipeSrcA: case D::TransVsyncShiftA:
+		case D::PipeDataM1A: case D::PipeDataN1A: case D::PipeLinkM1A: case D::PipeLinkN1A:
+		case D::TransDdiFuncCtlA: case D::TransDdiFuncCtl2A: case D::TransMsaMiscA:
+		case D::DpTpCtlA: case D::DdiBufCtlA: case D::AuxChCtlA:
+		case D::AuxChDataA: case D::AuxChDataA+4: case D::AuxChDataA+8:
+		case D::AuxChDataA+12: case D::AuxChDataA+16:
+		case D::PsWinPos1A: case D::PsWinSz1A: case D::PsCtrl1A:
+		case D::TransConfA: case D::PipeMiscA: case D::PipeBottomColorA:
+		case D::CurCtlA: case D::CurBaseA: case D::PlaneCtl1A: case D::PlaneSurf1A: case D::PlaneColorCtl1A:
+		case D::CscCoeffA: case D::CscCoeffA+4: case D::CscCoeffA+8:
+		case D::CscCoeffA+12: case D::CscCoeffA+16: case D::CscCoeffA+20:
+		case D::CscModeA:
+		case D::CscPreOffA: case D::CscPreOffA+4: case D::CscPreOffA+8:
+		case D::CscPostOffA: case D::CscPostOffA+4: case D::CscPostOffA+8:
+		case D::OcscCoeffA: case D::OcscCoeffA+4: case D::OcscCoeffA+8:
+		case D::OcscCoeffA+12: case D::OcscCoeffA+16: case D::OcscCoeffA+20:
+		case D::OcscPreOffA: case D::OcscPreOffA+4: case D::OcscPreOffA+8:
+		case D::OcscPostOffA: case D::OcscPostOffA+4: case D::OcscPostOffA+8:
+		case D::PalPrecIndexA: case D::PalPrecDataA:
+		case D::PalPrecGcMaxA: case D::PalPrecGcMaxA+4: case D::PalPrecGcMaxA+8:
+		case D::PalPrecExtGcMaxA: case D::PalPrecExtGcMaxA+4: case D::PalPrecExtGcMaxA+8:
+		case D::PalPrecExt2GcMaxA: case D::PalPrecExt2GcMaxA+4: case D::PalPrecExt2GcMaxA+8:
+		case D::GammaModeA: case D::PreCscGamcIndexA: case D::PreCscGamcDataA:
+		case D::PortClDw10A: case D::PortPcsDw1GrpA: case D::PortTxDw5GrpA:
+		case D::PortTxDw2LnA[0]: case D::PortTxDw2LnA[1]: case D::PortTxDw2LnA[2]: case D::PortTxDw2LnA[3]:
+		case D::PortTxDw4LnA[0]: case D::PortTxDw4LnA[1]: case D::PortTxDw4LnA[2]: case D::PortTxDw4LnA[3]:
+		case D::PortTxDw7LnA[0]: case D::PortTxDw7LnA[1]: case D::PortTxDw7LnA[2]: case D::PortTxDw7LnA[3]:
+		case D::PpControl: case D::PpOnDelays: case D::PpOffDelays: case D::PpDivisor:
+		case D::BlcPwmCtl1: case D::BlcPwmFreq1: case D::BlcPwmDuty1:
+			return true;
+		default:
+			return false;
+		}
+	}
+	uint32_t read(uint32_t r) const {
+		return validOffset(r) ? *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r) : UINT32_MAX;
+	}
+	void write(uint32_t r,uint32_t v) {
+		if(validOffset(r) && writable(r))
+			*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;
+	}
+	void delayUs(unsigned us) { IODelay(us); }
+	void sleepMs(unsigned ms) { IOSleep(ms); }
+};
+static void display13DC9Publish(bool hookReady) {
+	const auto &st=display13DC9State;
+	const auto &s=st.snapshot;
+	const auto &td=st.lastTeardown;
+	const auto &rs=st.lastRestore;
+	uint32_t rec[32] {
+		1U, display13DC9PwrOffRequested() ? 1U : 0U,
+		hookReady ? 1U : 0U,
+		st.fallbackTripped ? 1U : 0U, st.fallbackReason,
+		st.snapshotCount, st.teardownCount, st.teardownSkipCount, st.lastSkipReason,
+		st.restoreCount, st.verifyPassCount, st.verifyFailCount,
+		st.poweredDown ? 1U : 0U, s.valid ? 1U : 0U,
+		td.flags, td.wellsBiosAfter, td.wellsDriverAfter, td.dbufS0After, td.dcStateAfter,
+		rs.flags, rs.failReasons, rs.dpllAfter, rs.ddiBufAfter, rs.transConfAfter,
+		rs.transFunc2After, rs.transMsaAfter, rs.ppStatusAfter,
+		(uint32_t(rs.lastLaneStatus[0])|(uint32_t(rs.lastLaneStatus[1])<<8)|(uint32_t(rs.lastLaneStatus[2])<<16)),
+		s.dpllIndex, Display13DC9PwrOff::resolvedLanes(s),
+		(uint32_t(s.dpcdCfg[0])|(uint32_t(s.dpcdRateSet)<<8)|(uint32_t(s.dpcdCfg[1])<<16)),
+		s.transDdiFuncCtl2
+	};
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9PwrOff",rec,sizeof(rec));
+	const auto &cc=st.color;
+	uint32_t crec[24] {
+		1U,
+		cc.preGammaValid ? 1U : 0U, cc.postGammaValid ? 1U : 0U, cc.postExtMaxValid ? 1U : 0U,
+		cc.preCacheCount, cc.preZeroSkipCount, cc.postCacheCount, cc.postZeroSkipCount,
+		cc.preModesetRestoreCount, cc.postModesetRestoreCount, cc.preGammaPromoteCount,
+		st.colorRestoredOnWake ? 1U : 0U,
+		__atomic_load_n(&st.preGammaPromotePending,__ATOMIC_RELAXED) ? 1U : 0U,
+		cc.lastRestoreFlags,
+		s.pipeMisc, s.color.gammaMode, s.color.cscMode, s.color.pipeBottomColor, s.color.planeColorCtl,
+		cc.lastPipeMiscAfter, cc.lastGammaModeAfter, cc.lastCscModeAfter,
+		cc.preGamma[0], cc.preGamma[128]
+	};
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9Color",crec,sizeof(crec));
+}
+static void display13DC9ReleaseLinkLeaseLocked() {
+	auto &c=display13FBPower;
+	if(c.dc9LinkLease.owner!=&c.bridge.state || !c.map)return;
+	Display13FBPowerIO io {c.map};
+	const auto rel=Display13Power::release(io,c.bridge.state,c.dc9LinkLease);
+	if(rel.status==Display13Power::Status::Complete)
+		Display13Power::publishObject(c.bridge,c.power,0x80,c.controller,0x1C20);
+}
+bool XE::processDisplay13DC9PwrOff(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+	static const char *dc9Sym="__ZN31AppleIntelFramebufferController9enableDC9Ev";
+	static const uint8_t dc9Entry[20] {
+		0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x49,0x89,0xFE,0x48,0xFF,0x05,0x91,0x6C,0x09,0x00,0x48,0x8B,0xBF
+	};
+	static const char *exitWakeSym="__ZN21AppleIntelFramebuffer17prepareToExitWakeEv";
+	static const uint8_t exitWakeEntry[20] {
+		0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0xFF,0x05,0x3D,0x30,0x0B,0x00,0x49,0x89,0xFF
+	};
+	const auto dc9Fn=patcher.solveSymbol<mach_vm_address_t>(index,dc9Sym,address,size);
+	patcher.clearError();
+	const auto exitWakeFn=patcher.solveSymbol<mach_vm_address_t>(index,exitWakeSym,address,size);
+	patcher.clearError();
+	const bool known=size>0x47620 && dc9Fn==address+0x475B6 && !memcmp(reinterpret_cast<void *>(dc9Fn),dc9Entry,sizeof(dc9Entry)) &&
+		exitWakeFn==address+0x25062 && !memcmp(reinterpret_cast<void *>(exitWakeFn),exitWakeEntry,sizeof(exitWakeEntry));
+	if(!known) {
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9PwrOffReady",false);
+		return false;
+	}
+	// prepareToExitWake has 10 non-RIP-relative prologue bytes before incq (%rip) at +10.
+	KernelPatcher::RouteRequest exitWakeRoute(exitWakeSym,wrapDisplay13DC9BeforeSleep,orgDisplay13PrepareToExitWake);
+	KernelPatcher::RouteRequest dc9Route {dc9Sym,wrapDisplay13EnableDC9};
+	const bool routed=patcher.routeMultipleShort(index,&exitWakeRoute,1,address,size) &&
+		patcher.routeMultiple(index,&dc9Route,1,address,size);
+	patcher.clearError();
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9PwrOffReady",routed);
+	return routed;
+}
+void XE::wrapDisplay13DC9BeforeSleep(IOService *fb) {
+	auto &c=display13FBPower;
+	const bool eligible=display13DC9PwrOffActive() && fb && c.lock && c.map && !(callbackXE && callbackXE->adlnOutputWiring.dsi) && c.bootPanel;
+	bool pipe0=false;
+	if(eligible) {
+		IOLockLock(c.lock);
+		pipe0=Display13FBMemory::boundPipe(c.pipe,fb)==0;
+		if(pipe0) {
+			Display13DC9IO dc9IO {c.map};
+			if(Display13DC9PwrOff::captureSnapshot(dc9IO,display13DC9State.snapshot))
+				++display13DC9State.snapshotCount;
+		}
+		IOLockUnlock(c.lock);
+	}
+	FunctionCast(wrapDisplay13DC9BeforeSleep,callbackXE->orgDisplay13PrepareToExitWake)(fb);
+	if(pipe0 && c.lock) {
+		IOLockLock(c.lock);
+		display13DC9ReleaseLinkLeaseLocked();
+		IOLockUnlock(c.lock);
+	}
+}
+uint64_t XE::wrapDisplay13EnableDC9(void *controller) {
+	auto &c=display13FBPower;
+	auto &st=display13DC9State;
+	if(!c.lock || !controller || controller!=c.controller || !c.map)return 0;
+	IOLockLock(c.lock);
+	Display13DC9IO io {c.map};
+	uint32_t skipReason=0;
+	if(!display13DC9PwrOffRequested())skipReason=1;
+	else if(st.fallbackTripped)skipReason=2;
+	else if(!display13IsDeepIdleSleep())skipReason=3;
+	else if((callbackXE && callbackXE->adlnOutputWiring.dsi) || !c.bootPanel)skipReason=4;
+	else if(!c.bridge.begun || c.bridge.state.faulted || c.clockFaulted || !c.bridge.state.suspended)skipReason=5;
+	else if(!st.snapshot.valid) {
+		if(Display13DC9PwrOff::captureSnapshot(io,st.snapshot))++st.snapshotCount;
+		else skipReason=6;
+	}
+	if(!skipReason) {
+		const auto td=Display13DC9PwrOff::teardown(io,st);
+		// Sync Display13Power & Display13DBUF software state to collapsed hardware
+		// so wake restore reacquires all wells/DBUF cleanly as driver-owned.
+		c.bridge.state.owned=0;
+		c.bridge.state.borrowed=0;
+		c.bridge.state.suspended=true;
+		c.dbuf.initialRequests=0;
+		c.dbuf.owned=0;
+		c.dbuf.requested=0;
+		c.dbuf.powered=0;
+		SYSLOG("igfx","Display13 DC9 pwroff teardown: complete=%u flags=0x%x ctl1=0x%x ctl2=0x%x dbuf0=0x%x dc=0x%x",
+			td.complete?1U:0U,td.flags,td.wellsBiosAfter,td.wellsDriverAfter,td.dbufS0After,td.dcStateAfter);
+	} else {
+		++st.teardownSkipCount;
+		st.lastSkipReason=skipReason;
+		// Exact original AppleIntelFramebufferController::enableDC9 behavior.
+		const auto dc=io.read(Display13DC9PwrOff::DcStateEn);
+		if(dc!=UINT32_MAX)io.write(Display13DC9PwrOff::DcStateEn,dc|Display13DC9PwrOff::Dc9Enable);
+	}
+	IOLockUnlock(c.lock);
+	display13DC9Publish(callbackXE && callbackXE->display13DC9HookReady);
+	return 0;
+}
+void XE::finishDisplay13DC9Wake(IOService *fb) {
+	auto &c=display13FBPower;
+	if(!display13DC9PwrOffRequested() || !c.lock || !fb || adlnOutputWiring.dsi)return;
+	if(!ownedDisplay13Framebuffer(fb))return;
+	IOLockLock(c.lock);
+	if(!display13DC9State.poweredDown || !c.map || !c.bootPanel || !c.controller ||
+	   Display13FBMemory::boundPipe(c.pipe,fb)!=0) {
+		IOLockUnlock(c.lock);
+		return;
+	}
+	Display13FBPowerIO pwrIO {c.map};
+	const uint32_t linkDomains=(Display13Power::bit(Display13Power::Domain::PW1)|
+		Display13Power::bit(Display13Power::Domain::PW2)|
+		Display13Power::bit(Display13Power::Domain::PipeA)|
+		Display13Power::bit(Display13Power::Domain::DDIA)) & c.bridge.state.allowed;
+	const uint32_t auxDomains=Display13Power::bit(Display13Power::Domain::AUXA) & c.bridge.state.allowed;
+	Display13Power::Lease auxLease;
+	bool wellsOk=true;
+	if(c.dc9LinkLease.owner!=&c.bridge.state && linkDomains)
+		wellsOk=Display13Power::acquire(pwrIO,c.bridge.state,c.dc9LinkLease,linkDomains).status==Display13Power::Status::Complete;
+	if(wellsOk && auxDomains)
+		wellsOk=Display13Power::acquire(pwrIO,c.bridge.state,auxLease,auxDomains).status==Display13Power::Status::Complete;
+	if(wellsOk)Display13Power::publishObject(c.bridge,c.power,0x80,c.controller,0x1C20);
+	Display13DC9IO dc9IO {c.map};
+	// If native prepareToEnterWake left Pipe A off and DBUF allocation restore
+	// is still pending, restore Pipe A DDB/MBUS credits before enabling TRANSCONF_A.
+	if((c.dbuf.restorePending & 1U) && !(dc9IO.read(Display13DC9PwrOff::TransConfA) & 0x80000000U)) {
+		Display13FBDBUFIO dbufIO {c.map};
+		(void)Display13DBUF::restoreAllocation(dbufIO,c.dbuf,0);
+	}
+	const auto rs=Display13DC9PwrOff::verifyOrRestoreEDP(dc9IO,display13DC9State);
+	if(auxLease.owner==&c.bridge.state)Display13Power::release(pwrIO,c.bridge.state,auxLease);
+	const bool nativeActive=(rs.flags & Display13DC9PwrOff::RsNativeActive)!=0;
+	if(rs.verified) {
+		if(nativeActive)display13DC9ReleaseLinkLeaseLocked();
+		SYSLOG("igfx","Display13 DC9 pwroff wake VERIFIED: native=%u flags=0x%x dpll=0x%x ddi=0x%x conf=0x%x ctl2=0x%x msa=0x%x pp=0x%x",
+			nativeActive?1U:0U,rs.flags,rs.dpllAfter,rs.ddiBufAfter,rs.transConfAfter,rs.transFunc2After,rs.transMsaAfter,rs.ppStatusAfter);
+	} else {
+		display13DC9ReleaseLinkLeaseLocked();
+		SYSLOG("igfx","Display13 DC9 pwroff wake FAILED (reasons=0x%x flags=0x%x dpll=0x%x ddi=0x%x conf=0x%x pp=0x%x st=%02x/%02x/%02x) - falling back to no-poweroff next sleep",
+			rs.failReasons,rs.flags,rs.dpllAfter,rs.ddiBufAfter,rs.transConfAfter,rs.ppStatusAfter,
+			rs.lastLaneStatus[0],rs.lastLaneStatus[1],rs.lastLaneStatus[2]);
+	}
+	Display13Power::publishObject(c.bridge,c.power,0x80,c.controller,0x1C20);
+	display13DC9Publish(display13DC9HookReady);
+	auto controller=static_cast<IOService *>(c.controller);
+	IOLockUnlock(c.lock);
+	if(rs.verified && !nativeActive) {
+		auto &irq=display13FBIRQ;
+		if(irq.lock && controller) {
+			const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
+			const bool needIrq=irq.powerLost || irq.rearmPending;
+			IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
+			if(needIrq)wrapDisplay13FBEnableIRQ(controller);
+		}
+	}
+}
+
 void XE::wrapAlderLakeNDisableDisplay(IOService *controller,IOService *fb,OSObject *path,uint8_t mode) {
 	if(callbackXE->adlnOutputWiring.dsi && dsiLifecycleTarget(fb,path)) {
         const bool stopped=callbackXE->quiesceDSIPath(controller,fb,path);
@@ -12561,6 +12873,11 @@ bool XE::enableDisplay13EngineLocked(void *power) {
 		Display13FBDBUFIO io {c.map};
 		status=Display13DBUF::begin(io,c.dbuf,__builtin_popcount(callbackXE->adlnOutputWiring.selected())>=3 ? 7U : 0U,c.transcoders);
 		if(status==Display13DBUF::Status::Complete) {
+			// Unjoined ADL-P MBUS 2x2 hashing requires S0|S1 (0x3) powered whenever Pipe A
+			// is active (Apple Complete modeset writes 0x03ff0028 S0-only before expanding).
+			if(display13DC9PwrOffRequested() && display13DC9State.teardownCount &&
+			   !c.dbuf.joined && !c.dbuf.initialRequests && (c.dbuf.selected & 1U))
+				c.dbuf.initialRequests=3U;
 			if(acquired.status==Display13Power::Status::Complete)status=Display13DBUF::resumeEngine(io,c.dbuf);
 			else status=Display13DBUF::Status::Power;
 		}
@@ -12648,6 +12965,9 @@ void XE::stopDisplay13Engine(void *power,bool systemSuspend) {
 		else {
 			Display13FBClockGuard guard;
 			if(ensureGate() && adlnBeginClockGuard(guard)) {
+				if(display13DC9PwrOffRequested() && c.dbuf.initialRequests &&
+				   (c.dbuf.initialRequests & ~c.dbuf.owned)==0)
+					c.dbuf.initialRequests=0;
 				Display13FBDBUFIO io {c.map};status=Display13DBUF::stop(io,c.dbuf);
 				if(status==Display13DBUF::Status::Complete) {
 					Display13FBClockIO clockIO {c.map};clock=Display13Clock::stop(clockIO,{true,false,0},display13ClockVariant());
@@ -12718,6 +13038,11 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	if(!enable && callbackXE->display13ShutdownPowerCaller &&
 	   reinterpret_cast<uintptr_t>(__builtin_return_address(0))==callbackXE->display13ShutdownPowerCaller)
 		finishDisplay13TCShutdown(c.controller);
+	if(!enable && display13DC9PwrOffRequested() && c.lock) {
+		IOLockLock(c.lock);
+		display13DC9ReleaseLinkLeaseLocked();
+		IOLockUnlock(c.lock);
+	}
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)stopDisplay13Engine(power,true);
@@ -12882,7 +13207,20 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
         }
         cold[3]=io.read(reg);return cold[3]!=UINT32_MAX && (cold[3]&1);
     };
+    if(display13DC9PwrOffRequested() && display13DC9State.poweredDown && c.map) {
+        Display13DC9IO dc9IO {c.map};
+        Display13DC9PwrOff::exitDC9(dc9IO);
+        Display13DC9PwrOff::restorePpsDelaysIfZero(dc9IO,display13DC9State.snapshot);
+    }
     result=Display13Power::restore(io,c.bridge.state,c.restorePending,selectDSI);
+    // Restore Pipe A LUT SRAMs, CSC, GAMMA_MODE, and PIPE_MISC lost when DC9 powered off PW_A,
+    // BEFORE Apple's prepareToExitSleep -> hwUpdateRegCache() caches the wiped reset values.
+    if(result.status==Display13Power::Status::Complete && display13DC9PwrOffRequested() &&
+       display13DC9State.poweredDown && !display13DC9State.colorRestoredOnWake && c.map &&
+       !(callbackXE && callbackXE->adlnOutputWiring.dsi)) {
+        Display13DC9IO dc9IO {c.map};
+        Display13DC9PwrOff::restoreColorState(dc9IO,display13DC9State,true);
+    }
     if(result.status==Display13Power::Status::Complete && c.restorePending) {
         // No clock/MBUS writes after any output starts scanning out.
         // Hibernation resume: firmware/boot.efi relit the internal eDP on pipe
