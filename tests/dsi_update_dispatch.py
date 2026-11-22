@@ -80,6 +80,7 @@ unsigned streamCalls=0;OSObject *expectedPath=nullptr;
 uint32_t nativeStream(IOService*,IOService*,OSObject*,const void*);
 struct XE {
  static bool prepareDisplay13Wake(IOService*){return true;}
+ void finishDisplay13DC9Wake(IOService*){}
  // Native common completion is covered by display13_power_dispatch.py.
  bool ownedDisplay13Framebuffer(IOService*)const{return false;}
  struct {unsigned dsi=1;}adlnOutputWiring;bool dsiStopAttempted=false,dsiResourcesReady=true;

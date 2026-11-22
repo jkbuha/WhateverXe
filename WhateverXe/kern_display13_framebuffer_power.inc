@@ -84,6 +84,7 @@ uint32_t XE::wrapDisplay13SetPowerState(IOService *fb,uint32_t state) {
         const bool enteringWake=state==2 && callbackXE->ownedDisplay13Framebuffer(fb) &&
             Display13FBMemory::field<uint32_t>(fb,0x4284)!=2;
         const auto status=FunctionCast(wrapDisplay13SetPowerState,callbackXE->orgDSIAttributes[2])(fb,state);
+        if(state==2 && status==kIOReturnSuccess)callbackXE->finishDisplay13DC9Wake(fb);
         nativePowerOn=enteringWake && status==kIOReturnSuccess;
         return status;
     }();
