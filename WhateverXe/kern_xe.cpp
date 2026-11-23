@@ -10179,6 +10179,30 @@ bool XE::display13BootPanelDSCOff(void *port,unsigned ddi) {
  };
  IOLockLock(c.lock);const bool ready=stopped();IOLockUnlock(c.lock);
  bool complete=false;
+ // -wex-edp-nodsc-train (opt-in, xps-unified; b00t0x/WhateverXe#185):
+ static int noDSCTrain=-1;
+ if(noDSCTrain<0)noDSCTrain=checkKernelArgument("-wex-edp-nodsc-train") ? 1 : 0;
+ if(!ready && noDSCTrain==1) {
+  // A boot panel whose receiver reports no DSC support has no DSC
+  // state to turn off, so the first training need not wait for a full output
+  // stop. The XPS 13 9320 (RPL-P A7A0, 1920x1200 eDP, no DSC) never reached that
+  // stop: its firmware leaves TRANS_DDI_FUNC_CTL2 bit 3 and CMTG enabled (#185),
+  // 0.8.4 refused its eDP training with kIOReturnNotReady and the panel stayed
+  // dark ("FB0: Hardware mode set failed, err = 0xe00002d8").
+  // Only positive evidence counts: an identified receiver below DPCD 1.4, or
+  // DSC_SUPPORT (0x060) readable with bit 0 clear.
+  uint8_t revision=0,cap=0;
+  const bool identified=!wrapDisplay13ReadAUX(port,0,&revision,1) && revision>=0x10 && revision!=0xff;
+  const bool noDSC=identified && (revision<0x14 || (!wrapDisplay13ReadAUX(port,0x60,&cap,1) && !(cap&1)));
+  if(noDSC) {
+   IOLockLock(c.lock);
+   if(ddi==c.bridge.bootPort)c.bootPanelDSCCheckPending=false;
+   IOLockUnlock(c.lock);
+   uint32_t record[]={1,ddi,pipe,ready,1,revision,cap};
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13BootPanelDSCOff",record,sizeof(record));
+   return true;
+  }
+ }
  if(ready) {
   // Link retention may have failed before any receiver observation. Do
   // not infer DSC capability (or an off state) from that missing evidence.
