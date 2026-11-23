@@ -270,8 +270,10 @@ inline bool sharedReservationAccepted(const SharedReservation &r,uint64_t manage
 // The start is a page; the length is the native byte count, width x height x 4, which
 // need not be whole pages (2880x1620, 1600x900). Its last page must still be inside.
 inline bool apertureRange(const Pool &p,uint32_t base,uint32_t bytes,uint64_t apertureBytes) {
+    // The descriptor exposes bytes. The last page it maps must be owned too.
     const auto end=uint64_t(base)+((uint64_t(bytes)+4095)&~uint64_t(4095));
-    return bytes && !(base&4095) && base>=p.base && end<=uint64_t(p.base)+p.bytes && end<=apertureBytes;
+    return bytes && !(base&4095) && base>=p.base && end<=uint64_t(p.base)+p.bytes &&
+        end<=uint64_t(p.base)+uint64_t(p.pages)*4096 && end<=apertureBytes;
 }
 // Native IntelScaledModeData is a 64-byte CPU allocation. Its map/memory
 // references are owned by the display pipe until native deallocateScanoutMemory.
