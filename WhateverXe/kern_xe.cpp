@@ -7843,8 +7843,15 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
     if(display13FBOutputHooksReady && !adlnOutputWiring.dsi) {
         const char *symbol="__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE";
         const uint8_t call[]={0xe8,0x9e,0xf3,0xff,0xff,0x84,0xc0,0x74,0x3d};
+        // xps-unified: -wex-edp-keep (wrapDisplay13RegsNeedUpdate) routes this same
+        // function first. Routing it again built the trampoline from that jump,
+        // and the first native modeset (WindowServer) crashed the XPS 17 9720.
+        // The two hooks make the same keep-or-retrain decision: keep the one
+        // already installed, and never route an entry that is no longer native.
+        const uint8_t entry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
         const auto target=patcher.solveSymbol(index,symbol,address,size);
-        const bool known=size>0x4fcaa && target==address+0x4f044 &&
+        const bool known=size>0x4fcaa && target==address+0x4f044 && !orgDisplay13RegsNeedUpdate &&
+            !memcmp(reinterpret_cast<void *>(target),entry,sizeof(entry)) &&
             !memcmp(reinterpret_cast<void *>(address+0x4fca1),call,sizeof(call));
         patcher.clearError();
         KernelPatcher::RouteRequest route(symbol,wrapBootModeCompare,orgBootModeCompare);
