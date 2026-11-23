@@ -3,6 +3,7 @@
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 //
 //  kern_xe.cpp
@@ -67,6 +68,7 @@
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
+#include "kern_display13_dc9_pwroff.hpp"
 #include "kern_tgl_pcode_gate.hpp"
 #include "kern_tgl_pcode_edram.hpp"
 #include "kern_tgl_tc_cold.hpp"
@@ -4926,6 +4928,7 @@ struct Display13FBPowerContext {
     Display13Power::NativeBridge bridge;
     Display13Power::MainLinkAUX mainLink[2];
     Display13Power::Lease engine;
+    Display13Power::Lease dc9LinkLease;
     Display13DBUF::State dbuf;
     Display13WM::Latency latency;
     bool watermarkFaulted {};
@@ -7891,6 +7894,8 @@ bool XE::processDisplay13FramebufferLifecycle(KernelPatcher &patcher,size_t inde
 	KernelPatcher::RouteRequest pathRoute {pathSymbol,wrapAlderLakeNFreePath,orgAlderLakeNFreePath};
 	const bool pathRouted=disableRouted && pathKnown && patcher.routeMultipleShort(index,&pathRoute,1,address,size);
 	patcher.clearError();
+	if(pathRouted && checkKernelArgument("-wex-d13-dc9-pwroff"))
+		display13DC9HookReady=processDisplay13DC9PwrOff(patcher,index,address,size);
     return pathRouted && (!Display13FBTopology::multiOutputWiring(adlnOutputWiring) ||
         processDisplay13Retirement(patcher,index,address,size));
 }
@@ -10402,9 +10407,13 @@ struct AlderLakeNGammaObservation {
     uint32_t writes[1024] {};
 };
 static AlderLakeNGammaObservation adlnGammaObservations[4];
+static Display13DC9PwrOff::State display13DC9State;
+static bool display13DC9PwrOffRequested();
+static bool display13DC9PwrOffActive();
 struct AlderLakeNPreGammaUpload {
     uintptr_t thread {};void *access {};uint32_t dataReg {};
     Display13Color::PreGammaStream stream;uint32_t source[35] {};
+    uint32_t emittedCount {};uint32_t emitted[Display13DC9PwrOff::PreCscGamcCount] {};
     uint32_t failure {},indexWrites {},indexValues[4] {};
 };
 static AlderLakeNPreGammaUpload adlnPreGammaUploads[4];
@@ -10480,14 +10489,34 @@ void XE::wrapAlderLakeNPreGamma(void *path,void *transaction,uint32_t control) {
         Display13Color::registerPair(pipe,*reinterpret_cast<uint32_t *>(p+0xC),*reinterpret_cast<uint32_t *>(p+0x10),true);
     if(associated && !nested)for(auto &o:adlnPreGammaUploads)if(__sync_bool_compare_and_swap(&o.thread,0,thread)) {
         slot=&o;o.access=*reinterpret_cast<void **>(fb+0x4A40);o.dataReg=*reinterpret_cast<uint32_t *>(p+0x10);
-        o.stream={};o.failure=o.indexWrites=0;memset(o.source,0,sizeof(o.source));memset(o.indexValues,0,sizeof(o.indexValues));break;
+        o.stream={};o.emittedCount=0;memset(o.emitted,0,sizeof(o.emitted));
+        o.failure=o.indexWrites=0;memset(o.source,0,sizeof(o.source));memset(o.indexValues,0,sizeof(o.indexValues));break;
     }
     static uint32_t calls {};const auto call=__sync_add_and_fetch(&calls,1);
     uint64_t r[64] {2,call,control,associated,slot!=nullptr};r[17]=pipe;
     if(fb)r[5]=fb[0x4230];if(p)r[6]=*reinterpret_cast<uint32_t *>(p+0x18C);
+    // After DC9 PW_A power-off, Apple's wake configurePlane() calls configurePipePreCSCGamma
+    // with control=0x2 (ENABLE only, without 0x4 UPLOAD). Promote the first post-DC9 Pipe 0
+    // call to 0x6 (UPLOAD | ENABLE) when a Pre-CSC mode is active so Apple's live curve is
+    // reloaded under its own lock (belts-and-suspenders alongside Phase 2a SRAM restore).
+    bool promoted=false;
+    if(associated && !nested && pipe==0 && control==0x2U && display13DC9PwrOffActive() &&
+       fb && fb[0x4230]>=1 && fb[0x4230]<=6 &&
+       __atomic_load_n(&display13DC9State.preGammaPromotePending,__ATOMIC_ACQUIRE)) {
+        control=0x6U;
+        promoted=true;
+    }
     // Keep donor generation, DC6-disabled native lock, trigger queue and enable
     // sequencing. Only the 35 DATA writes become 131 under that SAME lock.
     FunctionCast(wrapAlderLakeNPreGamma,callbackXE->orgAlderLakeNPreGamma)(path,transaction,control);
+    if(associated && !nested && pipe==0 && slot && slot->stream.complete() &&
+       slot->emittedCount==Display13DC9PwrOff::PreCscGamcCount && !slot->failure && display13FBPower.lock) {
+        IOLockLock(display13FBPower.lock);
+        Display13DC9PwrOff::cachePreGamma(display13DC9State,slot->emitted);
+        if(promoted)++display13DC9State.color.preGammaPromoteCount;
+        __atomic_store_n(&display13DC9State.preGammaPromotePending,false,__ATOMIC_RELEASE);
+        IOLockUnlock(display13FBPower.lock);
+    }
     if(p)r[7]=*reinterpret_cast<uint32_t *>(p+0x18C);
     if(slot) {
         r[8]=slot->stream.inputs;r[9]=slot->stream.outputs;r[10]=slot->failure;
@@ -10574,6 +10603,13 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
         for(unsigned i=0;i<arrsize(indices);++i)r[89+i]=slot->writes[indices[i]];
         r[105]=slot->maxWrites;r[106]=slot->maxFailure;
         for(unsigned i=0;i<6;++i) {r[107+i]=slot->maxOriginal[i];r[113+i]=slot->maxActual[i];}
+        if(p && fb && r[3]==0 && slot->access && slot->dataWrites==Display13DC9PwrOff::PalPrecCount &&
+           !slot->nested && !slot->overflow && display13FBPower.lock) {
+            IOLockLock(display13FBPower.lock);
+            const bool extValid=(slot->maxWrites==6 && !slot->maxFailure);
+            Display13DC9PwrOff::cachePostGamma(display13DC9State,slot->writes,slot->maxActual,extValid);
+            IOLockUnlock(display13FBPower.lock);
+        }
     }
     static uint32_t pipeCalls[3] {},uploadCalls[3] {};
     if(p && fb && r[3]<3) {
@@ -10624,7 +10660,10 @@ void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
         for(auto &slot:adlnPreGammaUploads)if(__sync_fetch_and_add(&slot.thread,0)==thread && access==slot.access) {
             if(reg==slot.dataReg && !slot.failure) {
                 if(slot.stream.inputs<35)slot.source[slot.stream.inputs]=value;
-                auto emit=[access,&slot](uint32_t v) {FunctionCast(wrapDisplay13GMBusWrite,callbackXE->orgDisplay13GMBusWrite)(access,slot.dataReg,v);};
+                auto emit=[access,&slot](uint32_t v) {
+                    if(slot.emittedCount<Display13DC9PwrOff::PreCscGamcCount)slot.emitted[slot.emittedCount++]=v;
+                    FunctionCast(wrapDisplay13GMBusWrite,callbackXE->orgDisplay13GMBusWrite)(access,slot.dataReg,v);
+                };
                 if(slot.stream.push(value,emit))return;
                 ++slot.failure;
             } else if(reg==slot.dataReg-4) {
@@ -12251,6 +12290,279 @@ static bool adlnWriterMappingBound() {
 
 
 
+
+// Opt-in (-wex-d13-dc9-pwroff) Display13 Deep Idle power-well teardown &
+// full eDP wake restore (kern_display13_dc9_pwroff.hpp). Zero behavior change
+// when the boot-arg is absent.
+static bool display13DC9PwrOffRequested() {
+	static int v=-1;
+	if(v<0)v=checkKernelArgument("-wex-d13-dc9-pwroff") ? 1 : 0;
+	return v==1;
+}
+static bool display13DC9PwrOffActive() {
+	return display13DC9PwrOffRequested() && !display13DC9State.fallbackTripped;
+}
+static bool display13IsDeepIdleSleep() {
+	auto *root=IOService::getPMRootDomain();
+	if(!root)return false;
+	auto *num=OSDynamicCast(OSNumber,root->getProperty("IOPMSystemSleepType"));
+	return num && num->unsigned32BitValue()==7U;
+}
+struct Display13DC9IO {
+	IOMemoryMap *map;
+	bool validOffset(uint32_t r) const {
+		return map && map->getVirtualAddress() && map->getLength()==0x1000000 && !(r&3U) && r<=0xFFFFFCU;
+	}
+	static bool writable(uint32_t r) {
+		namespace D=Display13DC9PwrOff;
+		switch(r) {
+		case D::PwrWellCtlBios: case D::PwrWellCtlDriver:
+		case D::PwrWellAuxBios: case D::PwrWellAuxDriver:
+		case D::PwrWellDdiBios: case D::PwrWellDdiDriver:
+		case D::DcStateEn: case D::SouthDplsGateReg:
+		case D::DbufSliceRegs[0]: case D::DbufSliceRegs[1]:
+		case D::DbufSliceRegs[2]: case D::DbufSliceRegs[3]:
+		case D::CdclkPllEnable:
+		case 0x46010: case 0x46014: case 0x46018:
+		case 0x164284: case 0x164288: case 0x16428C: case 0x164290: case 0x164294: case 0x164298:
+		case D::DpcaCfgcr0: case D::TransClkSelA:
+		case D::TransHtotalA: case D::TransHblankA: case D::TransHsyncA:
+		case D::TransVtotalA: case D::TransVblankA: case D::TransVsyncA:
+		case D::PipeSrcA: case D::TransVsyncShiftA:
+		case D::PipeDataM1A: case D::PipeDataN1A: case D::PipeLinkM1A: case D::PipeLinkN1A:
+		case D::TransDdiFuncCtlA: case D::TransDdiFuncCtl2A: case D::TransMsaMiscA:
+		case D::DpTpCtlA: case D::DdiBufCtlA: case D::AuxChCtlA:
+		case D::AuxChDataA: case D::AuxChDataA+4: case D::AuxChDataA+8:
+		case D::AuxChDataA+12: case D::AuxChDataA+16:
+		case D::PsWinPos1A: case D::PsWinSz1A: case D::PsCtrl1A:
+		case D::TransConfA: case D::PipeMiscA: case D::PipeBottomColorA:
+		case D::CurCtlA: case D::CurBaseA: case D::PlaneCtl1A: case D::PlaneSurf1A: case D::PlaneColorCtl1A:
+		case D::CscCoeffA: case D::CscCoeffA+4: case D::CscCoeffA+8:
+		case D::CscCoeffA+12: case D::CscCoeffA+16: case D::CscCoeffA+20:
+		case D::CscModeA:
+		case D::CscPreOffA: case D::CscPreOffA+4: case D::CscPreOffA+8:
+		case D::CscPostOffA: case D::CscPostOffA+4: case D::CscPostOffA+8:
+		case D::OcscCoeffA: case D::OcscCoeffA+4: case D::OcscCoeffA+8:
+		case D::OcscCoeffA+12: case D::OcscCoeffA+16: case D::OcscCoeffA+20:
+		case D::OcscPreOffA: case D::OcscPreOffA+4: case D::OcscPreOffA+8:
+		case D::OcscPostOffA: case D::OcscPostOffA+4: case D::OcscPostOffA+8:
+		case D::PalPrecIndexA: case D::PalPrecDataA:
+		case D::PalPrecGcMaxA: case D::PalPrecGcMaxA+4: case D::PalPrecGcMaxA+8:
+		case D::PalPrecExtGcMaxA: case D::PalPrecExtGcMaxA+4: case D::PalPrecExtGcMaxA+8:
+		case D::PalPrecExt2GcMaxA: case D::PalPrecExt2GcMaxA+4: case D::PalPrecExt2GcMaxA+8:
+		case D::GammaModeA: case D::PreCscGamcIndexA: case D::PreCscGamcDataA:
+		case D::PortClDw10A: case D::PortPcsDw1GrpA: case D::PortTxDw5GrpA:
+		case D::PortTxDw2LnA[0]: case D::PortTxDw2LnA[1]: case D::PortTxDw2LnA[2]: case D::PortTxDw2LnA[3]:
+		case D::PortTxDw4LnA[0]: case D::PortTxDw4LnA[1]: case D::PortTxDw4LnA[2]: case D::PortTxDw4LnA[3]:
+		case D::PortTxDw7LnA[0]: case D::PortTxDw7LnA[1]: case D::PortTxDw7LnA[2]: case D::PortTxDw7LnA[3]:
+		case D::PpControl: case D::PpOnDelays: case D::PpOffDelays: case D::PpDivisor:
+		case D::BlcPwmCtl1: case D::BlcPwmFreq1: case D::BlcPwmDuty1:
+			return true;
+		default:
+			return false;
+		}
+	}
+	uint32_t read(uint32_t r) const {
+		return validOffset(r) ? *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r) : UINT32_MAX;
+	}
+	void write(uint32_t r,uint32_t v) {
+		if(validOffset(r) && writable(r))
+			*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;
+	}
+	void delayUs(unsigned us) { IODelay(us); }
+	void sleepMs(unsigned ms) { IOSleep(ms); }
+};
+static void display13DC9Publish(bool hookReady) {
+	const auto &st=display13DC9State;
+	const auto &s=st.snapshot;
+	const auto &td=st.lastTeardown;
+	const auto &rs=st.lastRestore;
+	uint32_t rec[32] {
+		1U, display13DC9PwrOffRequested() ? 1U : 0U,
+		hookReady ? 1U : 0U,
+		st.fallbackTripped ? 1U : 0U, st.fallbackReason,
+		st.snapshotCount, st.teardownCount, st.teardownSkipCount, st.lastSkipReason,
+		st.restoreCount, st.verifyPassCount, st.verifyFailCount,
+		st.poweredDown ? 1U : 0U, s.valid ? 1U : 0U,
+		td.flags, td.wellsBiosAfter, td.wellsDriverAfter, td.dbufS0After, td.dcStateAfter,
+		rs.flags, rs.failReasons, rs.dpllAfter, rs.ddiBufAfter, rs.transConfAfter,
+		rs.transFunc2After, rs.transMsaAfter, rs.ppStatusAfter,
+		(uint32_t(rs.lastLaneStatus[0])|(uint32_t(rs.lastLaneStatus[1])<<8)|(uint32_t(rs.lastLaneStatus[2])<<16)),
+		s.dpllIndex, Display13DC9PwrOff::resolvedLanes(s),
+		(uint32_t(s.dpcdCfg[0])|(uint32_t(s.dpcdRateSet)<<8)|(uint32_t(s.dpcdCfg[1])<<16)),
+		s.transDdiFuncCtl2
+	};
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9PwrOff",rec,sizeof(rec));
+	const auto &cc=st.color;
+	uint32_t crec[24] {
+		1U,
+		cc.preGammaValid ? 1U : 0U, cc.postGammaValid ? 1U : 0U, cc.postExtMaxValid ? 1U : 0U,
+		cc.preCacheCount, cc.preZeroSkipCount, cc.postCacheCount, cc.postZeroSkipCount,
+		cc.preModesetRestoreCount, cc.postModesetRestoreCount, cc.preGammaPromoteCount,
+		st.colorRestoredOnWake ? 1U : 0U,
+		__atomic_load_n(&st.preGammaPromotePending,__ATOMIC_RELAXED) ? 1U : 0U,
+		cc.lastRestoreFlags,
+		s.pipeMisc, s.color.gammaMode, s.color.cscMode, s.color.pipeBottomColor, s.color.planeColorCtl,
+		cc.lastPipeMiscAfter, cc.lastGammaModeAfter, cc.lastCscModeAfter,
+		cc.preGamma[0], cc.preGamma[128]
+	};
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9Color",crec,sizeof(crec));
+}
+static void display13DC9ReleaseLinkLeaseLocked() {
+	auto &c=display13FBPower;
+	if(c.dc9LinkLease.owner!=&c.bridge.state || !c.map)return;
+	Display13FBPowerIO io {c.map};
+	const auto rel=Display13Power::release(io,c.bridge.state,c.dc9LinkLease);
+	if(rel.status==Display13Power::Status::Complete)
+		Display13Power::publishObject(c.bridge,c.power,0x80,c.controller,0x1C20);
+}
+bool XE::processDisplay13DC9PwrOff(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+	static const char *dc9Sym="__ZN31AppleIntelFramebufferController9enableDC9Ev";
+	static const uint8_t dc9Entry[20] {
+		0x55,0x48,0x89,0xE5,0x41,0x56,0x53,0x49,0x89,0xFE,0x48,0xFF,0x05,0x91,0x6C,0x09,0x00,0x48,0x8B,0xBF
+	};
+	static const char *exitWakeSym="__ZN21AppleIntelFramebuffer17prepareToExitWakeEv";
+	static const uint8_t exitWakeEntry[20] {
+		0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0xFF,0x05,0x3D,0x30,0x0B,0x00,0x49,0x89,0xFF
+	};
+	const auto dc9Fn=patcher.solveSymbol<mach_vm_address_t>(index,dc9Sym,address,size);
+	patcher.clearError();
+	const auto exitWakeFn=patcher.solveSymbol<mach_vm_address_t>(index,exitWakeSym,address,size);
+	patcher.clearError();
+	const bool known=size>0x47620 && dc9Fn==address+0x475B6 && !memcmp(reinterpret_cast<void *>(dc9Fn),dc9Entry,sizeof(dc9Entry)) &&
+		exitWakeFn==address+0x25062 && !memcmp(reinterpret_cast<void *>(exitWakeFn),exitWakeEntry,sizeof(exitWakeEntry));
+	if(!known) {
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9PwrOffReady",false);
+		return false;
+	}
+	// prepareToExitWake has 10 non-RIP-relative prologue bytes before incq (%rip) at +10.
+	KernelPatcher::RouteRequest exitWakeRoute(exitWakeSym,wrapDisplay13DC9BeforeSleep,orgDisplay13PrepareToExitWake);
+	KernelPatcher::RouteRequest dc9Route {dc9Sym,wrapDisplay13EnableDC9};
+	const bool routed=patcher.routeMultipleShort(index,&exitWakeRoute,1,address,size) &&
+		patcher.routeMultiple(index,&dc9Route,1,address,size);
+	patcher.clearError();
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13DC9PwrOffReady",routed);
+	return routed;
+}
+void XE::wrapDisplay13DC9BeforeSleep(IOService *fb) {
+	auto &c=display13FBPower;
+	const bool eligible=display13DC9PwrOffActive() && fb && c.lock && c.map && !(callbackXE && callbackXE->adlnOutputWiring.dsi) && c.bootPanel;
+	bool pipe0=false;
+	if(eligible) {
+		IOLockLock(c.lock);
+		pipe0=Display13FBMemory::boundPipe(c.pipe,fb)==0;
+		if(pipe0) {
+			Display13DC9IO dc9IO {c.map};
+			if(Display13DC9PwrOff::captureSnapshot(dc9IO,display13DC9State.snapshot))
+				++display13DC9State.snapshotCount;
+		}
+		IOLockUnlock(c.lock);
+	}
+	FunctionCast(wrapDisplay13DC9BeforeSleep,callbackXE->orgDisplay13PrepareToExitWake)(fb);
+	if(pipe0 && c.lock) {
+		IOLockLock(c.lock);
+		display13DC9ReleaseLinkLeaseLocked();
+		IOLockUnlock(c.lock);
+	}
+}
+uint64_t XE::wrapDisplay13EnableDC9(void *controller) {
+	auto &c=display13FBPower;
+	auto &st=display13DC9State;
+	if(!c.lock || !controller || controller!=c.controller || !c.map)return 0;
+	IOLockLock(c.lock);
+	Display13DC9IO io {c.map};
+	uint32_t skipReason=0;
+	if(!display13DC9PwrOffRequested())skipReason=1;
+	else if(st.fallbackTripped)skipReason=2;
+	else if(!display13IsDeepIdleSleep())skipReason=3;
+	else if((callbackXE && callbackXE->adlnOutputWiring.dsi) || !c.bootPanel)skipReason=4;
+	else if(!c.bridge.begun || c.bridge.state.faulted || c.clockFaulted || !c.bridge.state.suspended)skipReason=5;
+	else if(!st.snapshot.valid) {
+		if(Display13DC9PwrOff::captureSnapshot(io,st.snapshot))++st.snapshotCount;
+		else skipReason=6;
+	}
+	if(!skipReason) {
+		const auto td=Display13DC9PwrOff::teardown(io,st);
+		// Sync Display13Power & Display13DBUF software state to collapsed hardware
+		// so wake restore reacquires all wells/DBUF cleanly as driver-owned.
+		c.bridge.state.owned=0;
+		c.bridge.state.borrowed=0;
+		c.bridge.state.suspended=true;
+		c.dbuf.initialRequests=0;
+		c.dbuf.owned=0;
+		c.dbuf.requested=0;
+		c.dbuf.powered=0;
+		SYSLOG("igfx","Display13 DC9 pwroff teardown: complete=%u flags=0x%x ctl1=0x%x ctl2=0x%x dbuf0=0x%x dc=0x%x",
+			td.complete?1U:0U,td.flags,td.wellsBiosAfter,td.wellsDriverAfter,td.dbufS0After,td.dcStateAfter);
+	} else {
+		++st.teardownSkipCount;
+		st.lastSkipReason=skipReason;
+		// Exact original AppleIntelFramebufferController::enableDC9 behavior.
+		const auto dc=io.read(Display13DC9PwrOff::DcStateEn);
+		if(dc!=UINT32_MAX)io.write(Display13DC9PwrOff::DcStateEn,dc|Display13DC9PwrOff::Dc9Enable);
+	}
+	IOLockUnlock(c.lock);
+	display13DC9Publish(callbackXE && callbackXE->display13DC9HookReady);
+	return 0;
+}
+void XE::finishDisplay13DC9Wake(IOService *fb) {
+	auto &c=display13FBPower;
+	if(!display13DC9PwrOffRequested() || !c.lock || !fb || adlnOutputWiring.dsi)return;
+	if(!ownedDisplay13Framebuffer(fb))return;
+	IOLockLock(c.lock);
+	if(!display13DC9State.poweredDown || !c.map || !c.bootPanel || !c.controller ||
+	   Display13FBMemory::boundPipe(c.pipe,fb)!=0) {
+		IOLockUnlock(c.lock);
+		return;
+	}
+	Display13FBPowerIO pwrIO {c.map};
+	const uint32_t linkDomains=(Display13Power::bit(Display13Power::Domain::PW1)|
+		Display13Power::bit(Display13Power::Domain::PW2)|
+		Display13Power::bit(Display13Power::Domain::PipeA)|
+		Display13Power::bit(Display13Power::Domain::DDIA)) & c.bridge.state.allowed;
+	const uint32_t auxDomains=Display13Power::bit(Display13Power::Domain::AUXA) & c.bridge.state.allowed;
+	Display13Power::Lease auxLease;
+	bool wellsOk=true;
+	if(c.dc9LinkLease.owner!=&c.bridge.state && linkDomains)
+		wellsOk=Display13Power::acquire(pwrIO,c.bridge.state,c.dc9LinkLease,linkDomains).status==Display13Power::Status::Complete;
+	if(wellsOk && auxDomains)
+		wellsOk=Display13Power::acquire(pwrIO,c.bridge.state,auxLease,auxDomains).status==Display13Power::Status::Complete;
+	if(wellsOk)Display13Power::publishObject(c.bridge,c.power,0x80,c.controller,0x1C20);
+	Display13DC9IO dc9IO {c.map};
+	// If native prepareToEnterWake left Pipe A off and DBUF allocation restore
+	// is still pending, restore Pipe A DDB/MBUS credits before enabling TRANSCONF_A.
+	if((c.dbuf.restorePending & 1U) && !(dc9IO.read(Display13DC9PwrOff::TransConfA) & 0x80000000U)) {
+		Display13FBDBUFIO dbufIO {c.map};
+		(void)Display13DBUF::restoreAllocation(dbufIO,c.dbuf,0);
+	}
+	const auto rs=Display13DC9PwrOff::verifyOrRestoreEDP(dc9IO,display13DC9State);
+	if(auxLease.owner==&c.bridge.state)Display13Power::release(pwrIO,c.bridge.state,auxLease);
+	const bool nativeActive=(rs.flags & Display13DC9PwrOff::RsNativeActive)!=0;
+	if(rs.verified) {
+		if(nativeActive)display13DC9ReleaseLinkLeaseLocked();
+		SYSLOG("igfx","Display13 DC9 pwroff wake VERIFIED: native=%u flags=0x%x dpll=0x%x ddi=0x%x conf=0x%x ctl2=0x%x msa=0x%x pp=0x%x",
+			nativeActive?1U:0U,rs.flags,rs.dpllAfter,rs.ddiBufAfter,rs.transConfAfter,rs.transFunc2After,rs.transMsaAfter,rs.ppStatusAfter);
+	} else {
+		display13DC9ReleaseLinkLeaseLocked();
+		SYSLOG("igfx","Display13 DC9 pwroff wake FAILED (reasons=0x%x flags=0x%x dpll=0x%x ddi=0x%x conf=0x%x pp=0x%x st=%02x/%02x/%02x) - falling back to no-poweroff next sleep",
+			rs.failReasons,rs.flags,rs.dpllAfter,rs.ddiBufAfter,rs.transConfAfter,rs.ppStatusAfter,
+			rs.lastLaneStatus[0],rs.lastLaneStatus[1],rs.lastLaneStatus[2]);
+	}
+	Display13Power::publishObject(c.bridge,c.power,0x80,c.controller,0x1C20);
+	display13DC9Publish(display13DC9HookReady);
+	auto controller=static_cast<IOService *>(c.controller);
+	IOLockUnlock(c.lock);
+	if(rs.verified && !nativeActive) {
+		auto &irq=display13FBIRQ;
+		if(irq.lock && controller) {
+			const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
+			const bool needIrq=irq.powerLost || irq.rearmPending;
+			IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
+			if(needIrq)wrapDisplay13FBEnableIRQ(controller);
+		}
+	}
+}
+
 void XE::wrapAlderLakeNDisableDisplay(IOService *controller,IOService *fb,OSObject *path,uint8_t mode) {
 	if(callbackXE->adlnOutputWiring.dsi && dsiLifecycleTarget(fb,path)) {
         const bool stopped=callbackXE->quiesceDSIPath(controller,fb,path);
@@ -12758,6 +13070,11 @@ bool XE::enableDisplay13EngineLocked(void *power) {
 		Display13FBDBUFIO io {c.map};
 		status=Display13DBUF::begin(io,c.dbuf,__builtin_popcount(callbackXE->adlnOutputWiring.selected())>=3 ? 7U : 0U,c.transcoders);
 		if(status==Display13DBUF::Status::Complete) {
+			// Unjoined ADL-P MBUS 2x2 hashing requires S0|S1 (0x3) powered whenever Pipe A
+			// is active (Apple Complete modeset writes 0x03ff0028 S0-only before expanding).
+			if(display13DC9PwrOffRequested() && display13DC9State.teardownCount &&
+			   !c.dbuf.joined && !c.dbuf.initialRequests && (c.dbuf.selected & 1U))
+				c.dbuf.initialRequests=3U;
 			if(acquired.status==Display13Power::Status::Complete)status=Display13DBUF::resumeEngine(io,c.dbuf);
 			else status=Display13DBUF::Status::Power;
 		}
@@ -12845,6 +13162,9 @@ void XE::stopDisplay13Engine(void *power,bool systemSuspend) {
 		else {
 			Display13FBClockGuard guard;
 			if(ensureGate() && adlnBeginClockGuard(guard)) {
+				if(display13DC9PwrOffRequested() && c.dbuf.initialRequests &&
+				   (c.dbuf.initialRequests & ~c.dbuf.owned)==0)
+					c.dbuf.initialRequests=0;
 				Display13FBDBUFIO io {c.map};status=Display13DBUF::stop(io,c.dbuf);
 				if(status==Display13DBUF::Status::Complete) {
 					Display13FBClockIO clockIO {c.map};clock=Display13Clock::stop(clockIO,{true,false,0},display13ClockVariant());
@@ -12915,6 +13235,11 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	if(!enable && callbackXE->display13ShutdownPowerCaller &&
 	   reinterpret_cast<uintptr_t>(__builtin_return_address(0))==callbackXE->display13ShutdownPowerCaller)
 		finishDisplay13TCShutdown(c.controller);
+	if(!enable && display13DC9PwrOffRequested() && c.lock) {
+		IOLockLock(c.lock);
+		display13DC9ReleaseLinkLeaseLocked();
+		IOLockUnlock(c.lock);
+	}
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)stopDisplay13Engine(power,true);
@@ -13035,7 +13360,20 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
         }
         cold[3]=io.read(reg);return cold[3]!=UINT32_MAX && (cold[3]&1);
     };
+    if(display13DC9PwrOffRequested() && display13DC9State.poweredDown && c.map) {
+        Display13DC9IO dc9IO {c.map};
+        Display13DC9PwrOff::exitDC9(dc9IO);
+        Display13DC9PwrOff::restorePpsDelaysIfZero(dc9IO,display13DC9State.snapshot);
+    }
     result=Display13Power::restore(io,c.bridge.state,c.restorePending,selectDSI);
+    // Restore Pipe A LUT SRAMs, CSC, GAMMA_MODE, and PIPE_MISC lost when DC9 powered off PW_A,
+    // BEFORE Apple's prepareToExitSleep -> hwUpdateRegCache() caches the wiped reset values.
+    if(result.status==Display13Power::Status::Complete && display13DC9PwrOffRequested() &&
+       display13DC9State.poweredDown && !display13DC9State.colorRestoredOnWake && c.map &&
+       !(callbackXE && callbackXE->adlnOutputWiring.dsi)) {
+        Display13DC9IO dc9IO {c.map};
+        Display13DC9PwrOff::restoreColorState(dc9IO,display13DC9State,true);
+    }
     if(result.status==Display13Power::Status::Complete && c.restorePending) {
         // No clock/MBUS writes after any output starts scanning out.
         // Hibernation resume: firmware/boot.efi relit the internal eDP on pipe
@@ -14359,6 +14697,29 @@ bool tglInstallContextOwners(KernelPatcher &patcher,size_t index,mach_vm_address
 
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
+ // -wex-noccs (opt-in; b00t0x/WhateverXe#163, port of skmaiti2050 f2d016b+bd5940e):
+ // keep compute off the Compute Command Streamer. The donor Info.plist sets
+ // EnableMultiContext=1; TGL PRM Vol14 "Dual Context - Invalidate hang" requires
+ // CCS and RCS never run in parallel, and i915 never uses the CCS on Gen12 LP.
+ // Rename the only lookup of the key so populateAccelConfig reads its code default
+ // 0 ("Multi-Context (Compute Command Streamer) Disabled!"). Matched by content,
+ // only if the NUL-terminated key occurs exactly once in the image.
+ // WhateverXeNoCCS: {occurrences, patched}.
+ if(checkKernelArgument("-wex-noccs") && currentGraphics) {
+  static const uint8_t f[]="EnableMultiContext",r[]="EnableMultiContexX";
+  uint32_t rec[2] {};
+  auto base=reinterpret_cast<const uint8_t *>(address);
+  const uint8_t *site=nullptr;
+  for(size_t i=0;size>=sizeof(f) && i<=size-sizeof(f);i++)
+   if(base[i]=='E' && !memcmp(base+i,f,sizeof(f))) {rec[0]++;site=base+i;}
+  if(rec[0]==1) {
+   KernelPatcher::LookupPatch patch {currentGraphics,f,r,sizeof(f),1};
+   patcher.applyLookupPatch(&patch,const_cast<uint8_t *>(site),sizeof(f)+1); // Lilu needs the window one byte larger
+   rec[1]=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,r,sizeof(r));
+  }
+  patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeNoCCS",rec,sizeof(rec));
+ }
  // Framebuffer-only mode must never enter the donor accelerator probe.
  // The bring-up payload omits this bundle; also reject it if already present.
  if (!tglAcceleratorRequested) {
@@ -18161,7 +18522,7 @@ bool XE::wrapAlderLakeNNativeIRQ(IOService *that) {
 }
 
 bool XE::wrapTGLAcceleratorEngine(IOService *that) {
- if (callbackXE->adlnDetected) {
+ if (callbackXE->adlnDetected && (!checkKernelArgument("-wex-s0-csb-resync") || tglHost.startingOwner==that)) {
   auto a=reinterpret_cast<uint8_t *>(that);
   uint32_t caps[] {*reinterpret_cast<uint32_t *>(a+0x1120),*reinterpret_cast<uint32_t *>(a+0x1124),
    *reinterpret_cast<uint32_t *>(a+0x1158),*reinterpret_cast<uint32_t *>(a+0x115C),
@@ -18398,9 +18759,18 @@ struct TGLCSBIO {
  }
  ~TGLCSBIO() { if (awake) tglCSBForceWake[wakeVariant](owner,false,7); }
  void acquire() { if (!awake) {tglCSBForceWake[wakeVariant](owner,true,7);awake=true;} }
- uint32_t readTail() {
-  if (!mmioTail) return sampledTail=*reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
-  acquire();return sampledTail=*reinterpret_cast<volatile uint32_t *>(bar+pointerReg)&15;
+ uint32_t readHWSPLastWrite() {
+  return *reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
+ }
+ uint32_t readMMIOPointer() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+pointerReg);
+ }
+ uint32_t readTail() { return sampledTail=TGLCSB::readTail(*this); }
+ uint32_t readMode() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+modeReg);
+ }
+ void writeMode(uint32_t value) {
+  *reinterpret_cast<volatile uint32_t *>(bar+modeReg)=value;
  }
  void readFence() { __asm__ volatile("lfence" ::: "memory"); }
  uint64_t readEntry(uint32_t i) { return *reinterpret_cast<volatile uint64_t *>(hwsp+0x40+i*8); }
@@ -18588,13 +18958,103 @@ void tglCSBRecordHWS(const TGLCSBIO &io) {
  const uint32_t v=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80);
  if (v && v!=UINT32_MAX && !tglHWSPGA[io.engine]) tglHWSPGA[io.engine]=v;
 }
+// Opt-in S0 Deep Idle CSB preservation (-wex-s0-csb-resync, #117 / #80).
+// Snapshots drained CSB state after native IntelAccelerator::systemWillSleep(),
+// drops spurious mid-sleep CSB interrupts, and preserves unchanged retained CSB
+// state on resetOnWake() without touching CSB_PTR or poisoning HWSP.
+struct TGLS0SleepRecord {
+ TGLCSB::WakeBaseline before {};
+ uint32_t elStatus {};
+ uintptr_t slots[4] {};
+ void *streamer {};
+ uint32_t epoch {};
+};
+static TGLS0SleepRecord tglS0Sleep[6];
+static uint32_t tglS0Epoch {};
+static mach_vm_address_t tglS0OrgWillSleep {};
+static mach_vm_address_t tglS0OrgDidWake {};
+static bool tglS0ResyncRequested {};
+static bool tglS0SleepHookRouted {};
+static volatile uint32_t tglS0AsleepMask {};
+static uint32_t tglS0Dropped[6] {};
+static uint32_t tglS0WakeTrace[6][16] {};
+static uint32_t tglS0WakeCount {};
+
+static void tglS0WrapWillSleep(void *accelerator) {
+ reinterpret_cast<void (*)(void *)>(tglS0OrgWillSleep)(accelerator);
+ const uint32_t epoch=__sync_add_and_fetch(&tglS0Epoch,1);
+ uint32_t asleep=0;
+ for (unsigned i=0;i<arrsize(tglS0Sleep);++i) {
+  auto &record=tglS0Sleep[i];auto &engine=tglCSBEngines[i];
+  __atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
+  record.before.valid=false;
+  record.elStatus=0;
+  record.streamer=engine.streamer;
+  if (!engine.streamer || !engine.hardwareReady ||
+      engine.state.error!=TGLCSB::Error::None) continue;
+  TGLCSBIO io(engine.streamer,0);io.acquire();
+  const auto pointer=io.readMMIOPointer();
+  const auto tail=io.readTail();
+  const auto mode=io.readMode();
+  const auto head=engine.state.head;
+  const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const auto elStatus=(io.pointerReg>=0x3A0) ? *reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234) : 0U;
+  const auto idle=pointer!=UINT32_MAX && mode!=UINT32_MAX && (mode&8U) &&
+     head<TGLCSB::Capacity && tail==head && (pointer&0xFU)==head && active<=1;
+  record.before={pointer,tail,head,active,idle};
+  record.elStatus=elStatus;
+  for (unsigned j=0;j<4;++j)
+   record.slots[j]=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8);
+  __atomic_store_n(&record.epoch,epoch,__ATOMIC_RELEASE);
+  asleep|=(1U<<i);
+ }
+ __atomic_store_n(&tglS0AsleepMask,asleep,__ATOMIC_RELEASE);
+}
+
+static void tglS0WrapDidWake(void *accelerator) {
+ reinterpret_cast<void (*)(void *)>(tglS0OrgDidWake)(accelerator);
+ __atomic_store_n(&tglS0AsleepMask,0U,__ATOMIC_RELEASE);
+}
+
+// Fixed CPU-only lazy serializer; zero allocations in sleep/wake hot paths.
+static bool tglS0WakeTraceSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[4+6*16] {2,tglS0Epoch,tglS0WakeCount,tglS0SleepHookRouted};
+ for (unsigned i=0;i<6;++i)
+  for (unsigned j=0;j<16;++j)
+   out[4+i*16+j]=__atomic_load_n(&tglS0WakeTrace[i][j],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));
+ if (!data) return false;
+ const bool success=data->serialize(serializer);data->release();return success;
+}
 
 void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ if (tglS0ResyncRequested) {
+  __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
+  __sync_fetch_and_and(&tglS0AsleepMask,~(1U<<io.engine));
+ }
  // Called before the first submission, wake reset, or GPU-reset replay. Never
  // at reset's return: that method can submit GPU work before it returns.
- engine.streamer=streamer;TGLCSB::initialize(engine.state,io);
- engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ engine.streamer=streamer;
+ if (tglS0ResyncRequested) {
+  engine.hardwareReady=false;
+  io.acquire();
+  uint32_t mode=io.readMode();
+  const auto modePlan=TGLCSB::planMode(mode,engine.modeAtInit);
+  if (!TGLCSB::ensureCSB12Mode(modePlan,io,mode)) {
+   engine.state.error=TGLCSB::Error::Unavailable;
+   return;
+  }
+  TGLCSB::initialize(engine.state,io);
+  if (engine.state.error!=TGLCSB::Error::None) {
+   engine.hardwareReady=false;
+   return;
+  }
+  engine.modeAtInit=mode;
+ } else {
+  TGLCSB::initialize(engine.state,io);
+  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ }
  tglCSBRecordHWS(io);
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
@@ -18829,6 +19289,35 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
  }
+ tglS0ResyncRequested=ok && checkKernelArgument("-wex-s0-csb-resync");
+ if (tglS0ResyncRequested) {
+  const auto sleepSym="__ZN16IntelAccelerator15systemWillSleepEv";
+  const auto wakeSym="__ZN16IntelAccelerator13systemDidWakeEv";
+  const uint8_t sleepPrologue[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB,0x48};
+  const uint8_t wakePrologue[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB,0x31,0xC0};
+  const auto sleepTarget=patcher.solveSymbol<mach_vm_address_t>(index,sleepSym,address,size);
+  const auto wakeTarget=patcher.solveSymbol<mach_vm_address_t>(index,wakeSym,address,size);
+  bool sleepOK=size>0x2897A+sizeof(wakePrologue) &&
+   sleepTarget==address+0x28916 &&
+   wakeTarget==address+0x2897A &&
+   !memcmp(reinterpret_cast<void *>(sleepTarget),sleepPrologue,sizeof(sleepPrologue)) &&
+   !memcmp(reinterpret_cast<void *>(wakeTarget),wakePrologue,sizeof(wakePrologue));
+  patcher.clearError();
+  if (sleepOK) {
+   KernelPatcher::RouteRequest sleepRoutes[] {
+    {sleepSym,tglS0WrapWillSleep,tglS0OrgWillSleep},
+    {wakeSym,tglS0WrapDidWake,tglS0OrgDidWake}
+   };
+   sleepOK=patcher.routeMultiple(index,sleepRoutes,arrsize(sleepRoutes),address,size);
+   patcher.clearError();
+  }
+  tglS0SleepHookRouted=sleepOK;
+  root->setProperty("WEXS0SleepHookRouted",sleepOK);
+  if (sleepOK) {
+   auto trace=OSSerializer::forTarget(nullptr,tglS0WakeTraceSerialize);
+   if (trace) {root->setProperty("WEXS0CSBWakeTrace",trace);trace->release();}
+  }
+ }
  tglCSB12Enabled=ok;patcher.clearError();return ok;
 }
 
@@ -18839,6 +19328,11 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
   // storage here, but defer forcewake/MMIO until the first submission or the
   // native wake-reset entry point, where that hardware access is established.
   TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  if (tglS0ResyncRequested) {
+   e.modeAtInit=UINT32_MAX;
+   __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
+   __sync_fetch_and_and(&tglS0AsleepMask,~(1U<<io.engine));
+  }
   e.streamer=streamer;e.hardwareReady=false;
   io.writeTail(TGLCSB::ResetIndex);
   for (unsigned i=0;i<TGLCSB::Capacity;++i) io.writeEntry(i,TGLCSB::Sentinel);
@@ -18847,7 +19341,6 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
 // Guilty-context skip. The native reset skips the hung (in-flight) element by
 // rewriting only its stamp into the freshly reset ring, but the same context's
 // queued elements are only marked for later replay (flag 0x8). When the owner
@@ -18889,6 +19382,65 @@ void tglSkipGuiltyQueue(void *streamer,unsigned engine) {
  }
 }
 
+void XE::wrapTGLCSBWake(void *streamer) {
+ if (!tglS0ResyncRequested || !tglS0SleepHookRouted) {
+  tglCSBInitialize(streamer);
+  return;
+ }
+ bool preserve=false,modeReady=false;
+ unsigned engineIdx=0;
+ {
+  TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  engineIdx=io.engine;
+  auto &snap=tglS0Sleep[io.engine];
+  const uint32_t epoch=__atomic_load_n(&snap.epoch,__ATOMIC_ACQUIRE);
+  io.acquire();
+  const uint32_t pointer=io.readMMIOPointer();
+  const uint32_t tail=io.readTail();
+  const uint32_t mode=io.readMode();
+  const uint32_t activeBefore=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const uint32_t elStatus=(io.pointerReg>=0x3A0) ? *reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234) : 0U;
+  const auto before=(epoch && snap.streamer==streamer &&
+      e.hardwareReady && e.state.error==TGLCSB::Error::None)
+      ? snap.before : TGLCSB::WakeBaseline {};
+  const bool elMatch=before.valid && ((elStatus&1U)==(snap.elStatus&1U));
+  const uint32_t effectiveActive=(elMatch && before.active<=1) ? before.active : activeBefore;
+  const auto plan=TGLCSB::planWake(before,pointer,tail,mode,e.state.head,effectiveActive,e.modeAtInit);
+  auto action=plan.action;
+  uint32_t modeAfter=mode;
+  modeReady=TGLCSB::ensureCSB12Mode(plan,io,modeAfter);
+  if (!modeReady) {
+   e.state.error=TGLCSB::Error::Unavailable;
+   e.hardwareReady=false;
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
+   for (unsigned j=0;j<4;++j)
+    if (snap.slots[j]!=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8)) {
+     action=TGLCSB::WakeAction::Initialize;break;
+    }
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
+   e.state.head=pointer&0xFU;
+   e.state.error=TGLCSB::Error::None;
+   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=e.state.head;
+   if (before.active<=1 && activeBefore!=before.active)
+    *reinterpret_cast<uint32_t *>(io.streamer+0x50)=before.active;
+   e.modeAtInit=modeAfter;
+   ++e.resets;
+   preserve=true;
+  }
+  const uint32_t data[16] {epoch,snap.before.pointer,snap.before.tail,
+   snap.before.head,snap.before.active,before.valid?1U:0U,
+   pointer,tail,mode,static_cast<uint32_t>(action),modeAfter,
+   activeBefore,e.state.head,snap.elStatus,elStatus,tglS0Dropped[io.engine]};
+  for (unsigned j=0;j<16;++j)
+   __atomic_store_n(&tglS0WakeTrace[io.engine][j],data[j],__ATOMIC_RELAXED);
+  __sync_fetch_and_add(&tglS0WakeCount,1);
+  __atomic_store_n(&snap.epoch,0U,__ATOMIC_RELEASE);
+ }
+ if (modeReady && !preserve) tglCSBInitialize(streamer);
+ __sync_fetch_and_and(&tglS0AsleepMask,~(1U<<engineIdx));
+}
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBSnapshot(streamer,0);
  TGLResetTrace::record(tglResetTrace,tglTraceNow(),TGLResetTrace::ResetBefore,streamer,0,0);
@@ -18959,7 +19511,12 @@ void XE::wrapTGLCSBReset(void *streamer) {
  }
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
- TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ TGLCSBIO io(streamer,flags);
+ if (tglS0ResyncRequested && (__atomic_load_n(&tglS0AsleepMask,__ATOMIC_ACQUIRE)&(1U<<io.engine))) {
+  __sync_fetch_and_add(&tglS0Dropped[io.engine],1);
+  return;
+ }
+ auto &engine=tglCSBEngines[io.engine];
  // First processed event proves the donor's status page is live: record it once.
  if (io.engine<arrsize(tglHWSPGA) && !tglHWSPGA[io.engine]) tglCSBRecordHWS(io);
  if (!tglDomainRegistersRecorded && tglEngineBase(io)==0x2000) {io.acquire();tglRecordDomainRegisters(io);}
@@ -18967,7 +19524,8 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
  auto consume=[&](const TGLCSB::Sample &sample) {
-  const auto event=TGLCSB::classify(sample.raw);const auto entry=TGLCSB::legacyEntry(event);
+  const auto event=tglS0ResyncRequested ? TGLCSB::classifyS0(sample.raw) : TGLCSB::classify(sample.raw);
+  const auto entry=tglS0ResyncRequested ? TGLCSB::legacyEntryS0(event) : TGLCSB::legacyEntry(event);
   engine.lastRaw=sample.raw;engine.retries+=sample.retries;
   engine.fallback+=sample.source==TGLCSB::Source::MMIO;
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
@@ -19462,6 +20020,32 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
       c->q[5]=i;c->q[6]=gpu;c->q[7]=cpu;c->q[8]=total;c->q[9]=start;
       c->q[10]=read(cpu+start,c->bytes,size);c->q[11]=size;c->q[15]=stamp;
       break;
+     }
+     // Chained command buffers: the hung BB_ADDR can lie past the submitted
+     // extent (MI_BATCH_BUFFER_START into a continuation segment of the same
+     // pool; observed on the XPS 13 9320: oldest pending buffer 0x42086000 +
+     // 1524 bytes, BB_ADDR 0x42089ecc). Take the oldest pending entry whose
+     // start precedes BB_ADDR by at most 1 MB and read, through the same
+     // fault-safe read, its first 4 KB (the chain) and 12 KB around BB_ADDR
+     // (8 KB before, 4 KB after). q[5] |= 1<<32 marks this layout.
+     if (c->q[5]==UINT64_MAX) {
+      uint32_t best=UINT32_MAX;unsigned pick=64;uint64_t pgpu=0,pcpu=0;
+      for (unsigned i=0;i<64;++i) {
+       const auto e=c->ring+0xA0+i*32;uint32_t stamp;uint64_t gpu,cpu;
+       memcpy(&stamp,e,4);memcpy(&gpu,e+8,8);memcpy(&cpu,e+16,8);
+       const uint32_t ahead=stamp-retired;
+       if (static_cast<int32_t>(ahead)<=0 || ahead>=best || bb<gpu || bb-gpu>0x100000 ||
+           (cpu>>47)!=0x1FFFF) continue;
+       best=ahead;pick=i;pgpu=gpu;pcpu=cpu;
+      }
+      if (pick<64) {
+       const uint64_t delta=bb-pgpu,start=delta>8192 ? (delta-8192)&~3ULL : 0;
+       uint32_t stamp;memcpy(&stamp,c->ring+0xA0+pick*32,4);
+       c->q[5]=pick|(1ULL<<32);c->q[6]=pgpu;c->q[7]=pcpu;c->q[8]=0;c->q[9]=start;c->q[15]=stamp;
+       const auto head=read(pcpu,c->bytes,4096);
+       const auto tail=read(pcpu+start,c->bytes+4096,sizeof(c->bytes)-4096);
+       c->q[10]=head|(tail<<32);c->q[11]=sizeof(c->bytes);
+      }
      }
     }
    }

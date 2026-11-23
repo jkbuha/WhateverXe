@@ -48,6 +48,15 @@ template<class F>Display13Power::Result modelRestore(Display13FBBootIO&,Display1
 }
 bool modelPublish(Display13Power::NativeBridge&,void*,unsigned,void*,unsigned){return true;}
 using mach_vm_address_t=uintptr_t;
+static bool display13DC9PwrOffRequested(){return false;}
+struct Display13DC9IO { Map *map; };
+namespace Display13DC9PwrOff {
+ struct State { bool poweredDown=false,colorRestoredOnWake=false; int snapshot=0; };
+ static void exitDC9(Display13DC9IO&){}
+ static void restorePpsDelaysIfZero(Display13DC9IO&,const int&){}
+ static void restoreColorState(Display13DC9IO&,State&,bool){}
+}
+static Display13DC9PwrOff::State display13DC9State;
 // xps-mobile-xelp: -wex-resume-park hibernation park (opt-in, off here).
 bool checkKernelArgument(const char*){return false;}
 struct XE {
