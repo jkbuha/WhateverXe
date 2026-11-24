@@ -7052,6 +7052,10 @@ struct Display13FBIRQContext {
 	Display13FBIRQ::Status status {Display13FBIRQ::Status::Unavailable};
 };
 static Display13FBIRQContext display13FBIRQ;
+// diag-9720-085-irq: live display/GT interrupt counters (read-only observation).
+static volatile uint64_t wexDiagProcessDE,wexDiagProcessDEDenied,wexDiagCollect,wexDiagVBlankToNative;
+static volatile uint64_t wexDiagXelpCalls,wexDiagXelpGT1,wexDiagXelpDisplayBit;
+static volatile uint32_t wexDiagXelpLastMaster;
 // Only the original RegisterAccelerator binds C0 and copies its callbacks.
 // This pointer is an expected identity, not a retained/fabricated accelerator.
 // Clear it after original stop; never dereference it from a display/IRQ hook.
@@ -8703,6 +8707,7 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	// Original ProcessInterrupt holds c+90 here. Keep its real VBL/flip and
 	// DSB busy retirement, atomic E08/E0C/E10 queue and native SW source.
 	*pipe=0;*aux=0;*hotplug=0;
+	__atomic_fetch_add(&wexDiagProcessDE,1,__ATOMIC_RELAXED);
 	if(!adlnIRQOwner(controller))return;
 	auto &c=display13FBIRQ;Display13FBIRQIO io {c.base};
 	// Native ProcessInterrupt already holds c+90. Permission belongs to its
@@ -8718,10 +8723,13 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 		// returns (CPU 0 livelock in interrupt context, spinlock-timeout panics after display
 		// wake, Precision 5570). A disabled bank stays off in hardware and in the cache; its
 		// pending statuses remain for the permitted handler once the scope ends.
+		__atomic_fetch_add(&wexDiagProcessDEDenied,1,__ATOMIC_RELAXED);
 		if(!c.state.enabled) {dropCache();if(io.readable(Display13FBIRQ::Master))io.write(Display13FBIRQ::Master,0);}
 		return;
 	}
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
+	__atomic_fetch_add(&wexDiagCollect,1,__ATOMIC_RELAXED);
+	if(e.pipe&1)__atomic_fetch_add(&wexDiagVBlankToNative,1,__ATOMIC_RELAXED);
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
 	if(c.state.faulted || !c.state.enabled)dropCache();
 }
@@ -15171,6 +15179,10 @@ static bool xelpIRQSerialize(void *,void *,OSSerialize *serializer) {
 static void xelpVideoIRQ(void *bridge,uint64_t *events) {
  auto io=xelpIRQIO(bridge);*events=0;
  const auto master=io.read(0x190010);
+ __atomic_fetch_add(&wexDiagXelpCalls,1,__ATOMIC_RELAXED);
+ if(master&2)__atomic_fetch_add(&wexDiagXelpGT1,1,__ATOMIC_RELAXED);
+ if(master&0x10000)__atomic_fetch_add(&wexDiagXelpDisplayBit,1,__ATOMIC_RELAXED);
+ wexDiagXelpLastMaster=master;
  if(master&1) {
   const auto bank=io.read(0x190018);
   if(bank) {for(auto read:xelpIRQBank0)read(bridge,events,bank);io.write(0x190018,bank);}
@@ -15186,7 +15198,48 @@ static void xelpVideoIRQ(void *bridge,uint64_t *events) {
 }
 }
 
+// diag-9720-085-irq: WEXDiagIRQLive (root, read on every ioreg access) and a 1 s IOLog for 120 s.
+// Register reads only; pipe registers only while the pipe A well is powered.
+static void wexDiagIRQSnapshot(uint64_t (&q)[40]) {
+ auto &c=display13FBIRQ;auto &s=c.state;
+ q[0]=1;absolutetime_to_nanoseconds(mach_absolute_time(),&q[1]);q[1]/=1000000;
+ if(c.base) {
+  Display13FBIRQIO io {c.base};
+  q[2]=io.read(0x190010);q[3]=io.read(Display13FBIRQ::Master);const auto wells=io.read(Display13FBIRQ::Driver);q[4]=wells;
+  if(Display13FBIRQ::powered(wells,0)) {q[5]=io.read(0x44404);q[6]=io.read(0x44408);q[7]=io.read(0x4440C);q[8]=io.read(0x70008);}
+  else q[5]=q[6]=q[7]=q[8]=0xFFFFFFFFULL;
+ }
+ q[9]=wexDiagProcessDE;q[10]=wexDiagProcessDEDenied;q[11]=wexDiagCollect;q[12]=wexDiagVBlankToNative;
+ q[13]=s.interrupts;q[14]=s.vblanks[0];q[15]=s.flips[0];q[16]=s.underruns[0];q[17]=s.storms;q[18]=s.sinceVBlank;
+ q[19]=s.begun|(s.enabled<<1)|(s.faulted<<2);q[20]=static_cast<uint32_t>(s.firstFailure);q[21]=s.failureRegister;q[22]=s.failureBits;
+ q[23]=static_cast<uint32_t>(c.status);q[24]=c.quiescing|(c.powerLost<<1)|(c.rearmPending<<2);q[25]=c.blockedPipes;q[26]=c.handlers;
+ q[27]=s.active;q[28]=s.configured;q[29]=s.lastMaster;q[30]=s.raw[0];q[31]=s.foreign;q[32]=c.admittedPipes;
+ q[33]=wexDiagXelpCalls;q[34]=wexDiagXelpGT1;q[35]=wexDiagXelpDisplayBit;q[36]=wexDiagXelpLastMaster;
+ q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=0;
+}
+static bool wexDiagIRQSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[40] {};wexDiagIRQSnapshot(q);
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static thread_call_t wexDiagIRQCall;static uint32_t wexDiagIRQTicks;
+static void wexDiagIRQTick(thread_call_param_t,thread_call_param_t) {
+ uint64_t q[40] {};wexDiagIRQSnapshot(q);
+ IOLog("WEX diag irq t=%llu gfx=0x%llx de=0x%llx wells=0x%llx imr=0x%llx iir=0x%llx ier=0x%llx conf=0x%llx pde=%llu deny=%llu col=%llu vbn=%llu int=%llu vbl=%llu flip=%llu storm=%llu since=%llu st=%llu ff=%llu freg=0x%llx fbits=0x%llx cst=%llu q=%llu blk=%llu act=%llu cfg=%llu lm=0x%llx xelp=%llu/%llu/%llu xm=0x%llx\n",
+  q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15],q[17],q[18],q[19],q[20],q[21],q[22],q[23],q[24],q[25],q[27],q[28],q[29],q[33],q[34],q[35],q[36]);
+ if(++wexDiagIRQTicks<120) {uint64_t dl;clock_interval_to_deadline(1,kSecondScale,&dl);thread_call_enter_delayed(wexDiagIRQCall,dl);}
+}
+static void wexDiagIRQInstall() {
+ static bool done;if(done)return;done=true;
+ if(auto live=OSSerializer::forTarget(nullptr,wexDiagIRQSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXDiagIRQLive",live);live->release();
+ }
+ wexDiagIRQCall=thread_call_allocate(wexDiagIRQTick,nullptr);
+ if(wexDiagIRQCall) {uint64_t dl;clock_interval_to_deadline(1,kSecondScale,&dl);thread_call_enter_delayed(wexDiagIRQCall,dl);}
+}
+
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ wexDiagIRQInstall();
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // -wex-noccs (opt-in; b00t0x/WhateverXe#163, port of skmaiti2050 f2d016b+bd5940e):
  // keep compute off the Compute Command Streamer. The donor Info.plist sets
@@ -15709,7 +15762,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
                  xelpIRQWake=reinterpret_cast<decltype(xelpIRQWake)>(wake);
                  patcher.clearError();
                  KernelPatcher::RouteRequest videoIRQ {symbol,xelpVideoIRQ};
-                 if(hostOK)hostOK=patcher.routeMultiple(index,&videoIRQ,1,address,size);
+                 // diag-9720-085-irq: -wex-no-xelp-video-irq keeps native readAndClearInterrupts
+                 // (0.8.3 behaviour). Without the route the retry timer is never armed.
+                 const bool noXelp=checkKernelArgument("-wex-no-xelp-video-irq");
+                 IORegistryEntry::getRegistryRoot()->setProperty("WEXDiagNoXelpVideoIRQ",noXelp);
+                 if(hostOK && !noXelp)hostOK=patcher.routeMultiple(index,&videoIRQ,1,address,size);
                  if(hostOK)if(auto live=OSSerializer::forTarget(nullptr,xelpIRQSerialize)) {
                   IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQState",live);live->release();
                  }
