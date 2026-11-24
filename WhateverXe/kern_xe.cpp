@@ -7237,6 +7237,49 @@ static void adlnIRQCache(IOService *controller,Display13FBIRQIO &io) {
 		*reinterpret_cast<uint32_t *>(c+0xD8C+8*p)=io.read(Display13FBIRQ::PipeIIR(p)-4);
 	}
 }
+// fix-9720-085-vblank2: AppleIntelFramebufferController::hwSetInterruptState (donor +0x7229A) is the
+// IOFramebuffer interrupt-client path. When a pipe's last VBL client goes away it sets IMR bit 0 and
+// clears IER bit 0 in the native cache (controller+0xD88/0xD8C) and writes both registers itself
+// (donor +0x72734..+0x7279A), bypassing hwConfigureVBLInterrupt, so the WEX VBL wrapper never sees it.
+// 9720 (ADL-H, 0.8.5 merge + -wex-edp-keep, 2026-11-24): one native enable at 35.7 s, no disable via
+// hwConfigureVBLInterrupt, yet pipe A IER = 0x8060E008 (VBLANK off) from ~48 s; no VBL is ever raised
+// again, IOAccelDisplayPipe::transaction_wait times out and the first frame never completes (RCS hang).
+// Keep-on: after the native call, re-enable VBLANK on every active, unblocked, powered pipe the WEX
+// bank owns, and keep the native cache in step. Native VBL consumers ignore unrequested VBLs (0.8.3
+// runs with VBL continuously on). Default on with -wex-edp-keep; -wex-vbl-keepon forces it on,
+// -wex-no-vbl-keepon off.
+static volatile uint64_t wexVBLStateCalls,wexVBLRestores,wexVBLLastState;
+static volatile uint32_t wexVBLStateRouted;
+static int wexVBLKeepOn=-1;
+static mach_vm_address_t orgDisplay13FBSetIntState;
+static bool wexVBLKeepOnEnabled() {
+	if(wexVBLKeepOn<0)wexVBLKeepOn=(checkKernelArgument("-wex-vbl-keepon") ||
+		(checkKernelArgument("-wex-edp-keep") && !checkKernelArgument("-wex-no-vbl-keepon"))) ? 1 : 0;
+	return wexVBLKeepOn==1;
+}
+static IOReturn wrapDisplay13FBSetIntState(IOService *controller,void *ref,uint32_t state,IOService *fb) {
+	const auto r=reinterpret_cast<IOReturn (*)(IOService *,void *,uint32_t,IOService *)>(orgDisplay13FBSetIntState)(controller,ref,state,fb);
+	__atomic_fetch_add(&wexVBLStateCalls,1,__ATOMIC_RELAXED);wexVBLLastState=state;
+	auto &c=display13FBIRQ;
+	if(!wexVBLKeepOnEnabled() || !c.lock || !c.base || !adlnIRQOwner(controller))return r;
+	Display13FBIRQIO io {c.base};
+	const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
+	if(c.state.begun && c.state.enabled && !c.state.faulted && !c.quiescing) {
+		const auto wells=io.read(Display13FBIRQ::Driver);
+		auto cache=reinterpret_cast<uint8_t *>(controller);
+		for(unsigned p=0;p<3;++p) {
+			if(!(c.state.active&(1U<<p)) || (c.blockedPipes&(1U<<p)) || !Display13FBIRQ::powered(wells,p))continue;
+			const auto iir=Display13FBIRQ::PipeIIR(p),ier=io.read(iir+4),imr=io.read(iir-4);
+			if(ier==UINT32_MAX || imr==UINT32_MAX || ((ier&1) && !(imr&1)))continue;
+			io.write(iir-4,imr&~1U);io.write(iir+4,ier|1U);
+			*reinterpret_cast<uint32_t *>(cache+0xD88+8*p)=io.read(iir+4);
+			*reinterpret_cast<uint32_t *>(cache+0xD8C+8*p)=io.read(iir-4);
+			__atomic_fetch_add(&wexVBLRestores,1,__ATOMIC_RELAXED);
+		}
+	}
+	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	return r;
+}
 static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 	auto &c=display13FBIRQ;auto &s=c.state;
 	r[0]=1;r[1]=event;r[2]=static_cast<uint32_t>(c.status);r[3]=s.begun;
@@ -8418,6 +8461,17 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	KernelPatcher::RouteRequest swRoute {swSymbol,wrapDisplay13FBSWIRQ,orgDisplay13FBSWIRQ};
 	const bool swRouted=routed && patcher.routeMultipleShort(index,&swRoute,1,address,size);
 	patcher.clearError();
+	// fix-9720-085-vblank2: hwSetInterruptState keep-on route (exact donor entry only).
+	if(routed) {
+		const char *sisSymbol="__ZN31AppleIntelFramebufferController19hwSetInterruptStateEPvjP21AppleIntelFramebuffer";
+		static const uint8_t sisEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x38,0x48,0xFF,0x05,0xCE,0x42,0x07,0x00};
+		const auto sis=patcher.solveSymbol<mach_vm_address_t>(index,sisSymbol,address,size);patcher.clearError();
+		if(sis==address+0x7229A && !memcmp(reinterpret_cast<void *>(sis),sisEntry,sizeof(sisEntry))) {
+			KernelPatcher::RouteRequest sisRoute {sisSymbol,wrapDisplay13FBSetIntState,orgDisplay13FBSetIntState};
+			wexVBLStateRouted=patcher.routeMultiple(index,&sisRoute,1,address,size) && orgDisplay13FBSetIntState ? 1 : 2;
+			patcher.clearError();
+		} else wexVBLStateRouted=3;
+	}
 	// AppleIntelFramebufferController::IdleTimerFired re-enables a DE master it finds disabled
 	// (DISPLAY_INT_CTL |= Enable) and fakes a VBL. WEX owns that master: it parks it off across
 	// display sleep/wake, power and clock scopes, faults and storms, with c+FD4 = 0 so the native
@@ -15236,7 +15290,7 @@ static void xelpVideoIRQ(void *bridge,uint64_t *events) {
 
 // diag-9720-085-irq: WEXDiagIRQLive (root, read on every ioreg access) and a 1 s IOLog for 120 s.
 // Register reads only; pipe registers only while the pipe A well is powered.
-static void wexDiagIRQSnapshot(uint64_t (&q)[52]) {
+static void wexDiagIRQSnapshot(uint64_t (&q)[56]) {
  auto &c=display13FBIRQ;auto &s=c.state;
  q[0]=1;absolutetime_to_nanoseconds(mach_absolute_time(),&q[1]);q[1]/=1000000;
  if(c.base) {
@@ -15251,22 +15305,23 @@ static void wexDiagIRQSnapshot(uint64_t (&q)[52]) {
  q[23]=static_cast<uint32_t>(c.status);q[24]=c.quiescing|(c.powerLost<<1)|(c.rearmPending<<2);q[25]=c.blockedPipes;q[26]=c.handlers;
  q[27]=s.active;q[28]=s.configured;q[29]=s.lastMaster;q[30]=s.raw[0];q[31]=s.foreign;q[32]=c.admittedPipes;
  q[33]=wexDiagXelpCalls;q[34]=wexDiagXelpGT1;q[35]=wexDiagXelpDisplayBit;q[36]=wexDiagXelpLastMaster;
- q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=2; // schema 2
+ q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=3; // schema 3
  q[40]=wexDiagVBLOn;q[41]=wexDiagVBLOff;q[42]=wexDiagVBLEarly;q[43]=wexDiagVBLTopo;q[44]=wexDiagVBLKept;
  q[45]=wexDiagVBLLast;q[46]=wexDiagVBLLastRA;q[47]=wexDiagVBLLastMs;q[48]=wexDiagVBLOnRA;q[49]=wexDiagVBLOnMs;q[50]=wexDiagVBLOffRA;q[51]=wexDiagVBLOffMs;
+ q[52]=wexVBLStateCalls;q[53]=wexVBLRestores;q[54]=wexVBLStateRouted|(uint64_t(wexVBLKeepOn==1)<<8);q[55]=wexVBLLastState;
 }
 static bool wexDiagIRQSerialize(void *,void *,OSSerialize *serializer) {
- uint64_t q[52] {};wexDiagIRQSnapshot(q);
+ uint64_t q[56] {};wexDiagIRQSnapshot(q);
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 static thread_call_t wexDiagIRQCall;static uint32_t wexDiagIRQTicks;
 static void wexDiagIRQTick(thread_call_param_t,thread_call_param_t) {
- uint64_t q[52] {};wexDiagIRQSnapshot(q);
+ uint64_t q[56] {};wexDiagIRQSnapshot(q);
  IOLog("WEX diag irq t=%llu gfx=0x%llx de=0x%llx wells=0x%llx imr=0x%llx iir=0x%llx ier=0x%llx conf=0x%llx pde=%llu deny=%llu col=%llu vbn=%llu int=%llu vbl=%llu flip=%llu storm=%llu since=%llu st=%llu ff=%llu freg=0x%llx fbits=0x%llx cst=%llu q=%llu blk=%llu act=%llu cfg=%llu lm=0x%llx xelp=%llu/%llu/%llu xm=0x%llx\n",
   q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15],q[17],q[18],q[19],q[20],q[21],q[22],q[23],q[24],q[25],q[27],q[28],q[29],q[33],q[34],q[35],q[36]);
- IOLog("WEX diag vbl t=%llu on=%llu off=%llu early=%llu topo=%llu kept=%llu last=0x%llx lastra=0x%llx lastms=%llu onra=0x%llx onms=%llu offra=0x%llx offms=%llu\n",
-  q[1],q[40],q[41],q[42],q[43],q[44],q[45],q[46],q[47],q[48],q[49],q[50],q[51]);
+ IOLog("WEX diag vbl t=%llu on=%llu off=%llu early=%llu topo=%llu kept=%llu last=0x%llx lastra=0x%llx lastms=%llu onra=0x%llx onms=%llu offra=0x%llx offms=%llu sis=%llu rst=%llu sisr=0x%llx sist=0x%llx\n",
+  q[1],q[40],q[41],q[42],q[43],q[44],q[45],q[46],q[47],q[48],q[49],q[50],q[51],q[52],q[53],q[54],q[55]);
  if(++wexDiagIRQTicks<120) {uint64_t dl;clock_interval_to_deadline(1,kSecondScale,&dl);thread_call_enter_delayed(wexDiagIRQCall,dl);}
 }
 static void wexDiagIRQInstall() {
