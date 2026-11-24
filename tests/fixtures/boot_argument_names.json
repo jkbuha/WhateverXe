@@ -191,5 +191,6 @@
   "-wex-d13-dc9-pwroff": [],
   "-wex-no-bootres": [],
   "-wex-no-xelp-video-irq": [],
-  "-wex-vbl-nodisable": []
+  "-wex-vbl-nodisable": [],
+  "-wex-vbl-reassert": []
 }

@@ -7062,6 +7062,14 @@ static volatile uint64_t wexDiagProcessDE,wexDiagProcessDEDenied,wexDiagCollect,
 static volatile uint64_t wexDiagVBLOn,wexDiagVBLOff,wexDiagVBLEarly,wexDiagVBLTopo,wexDiagVBLKept;
 static volatile uint64_t wexDiagVBLLast,wexDiagVBLLastRA,wexDiagVBLLastMs,wexDiagVBLOnRA,wexDiagVBLOnMs,wexDiagVBLOffRA,wexDiagVBLOffMs;
 static uintptr_t wexDiagDonorBase;
+// fix-9720-085-vblreassert: bit p = the newest native VBL request for pipe p was an enable.
+// Native hwSetInterruptState (+0x7229A, not routed) clears IER/IMR bit0 straight from its own
+// client count; wexVBLCheck notices a wanted pipe whose bit0 is off and (only with
+// -wex-vbl-reassert) turns it back on under the same native simple lock.
+static volatile uint32_t wexVBLWant;
+static volatile uint64_t wexVBLChecks,wexVBLClr,wexVBLRst,wexVBLFirstMs,wexVBLLastMs,wexVBLLastRegs,wexVBLLastPipe;
+static uint64_t wexVBLRestoreMs[3];
+static int wexVBLReassertMode=0;
 static inline uint64_t wexDiagNowMs() {uint64_t ns;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000000;}
 // Records one native VBL request; true = skip this disable (-wex-vbl-nodisable).
 static bool wexDiagVBLCall(unsigned pipe,bool valid,bool enabled,bool getLock,uintptr_t ret) {
@@ -7075,6 +7083,10 @@ static bool wexDiagVBLCall(unsigned pipe,bool valid,bool enabled,bool getLock,ui
 	static int noDisable=-1;
 	if(noDisable<0)noDisable=checkKernelArgument("-wex-vbl-nodisable") ? 1 : 0;
 	if(noDisable==1 && !enabled && valid && pipe<3) {++wexDiagVBLKept;wexDiagVBLLast|=uint64_t(0xF)<<8;return true;}
+	if(valid && pipe<3) {
+		if(enabled)__atomic_fetch_or(&wexVBLWant,1U<<pipe,__ATOMIC_RELAXED);
+		else __atomic_fetch_and(&wexVBLWant,~(1U<<pipe),__ATOMIC_RELAXED);
+	}
 	return false;
 }
 // code: 0xE early return (quiescing/blocked), 0xD invalid association, else Display13FBIRQ::Status.
@@ -7222,6 +7234,36 @@ struct Display13FBIRQIO {
 	uint32_t read(uint32_t reg) const {return *reinterpret_cast<volatile uint32_t *>(base+reg);}
 	void write(uint32_t reg,uint32_t value) {*reinterpret_cast<volatile uint32_t *>(base+reg)=value;}
 };
+// fix-9720-085-vblreassert. Caller holds display13FBIRQ.lock (the native controller+0x90 simple
+// lock): native ProcessInterrupt holds it around wrapDisplay13FBProcessDE, wexVBLTick takes it,
+// and native hwSetInterruptState/hwConfigureVBLInterrupt write IER/IMR only while holding it, so
+// a read-check-write here cannot interleave with theirs. MMIO only: no Apple controller fields are
+// written. Only pipes our IRQ layer has armed (state.active), powered, not blocked, and only while
+// the bank is enabled and not quiescing/power-lost/rearm-pending. Same IMR-then-IER order as
+// Display13FBIRQ::vblank(); pending IIR status is left untouched. At most one restore per pipe
+// per 10 ms (native may clear it again from its own cache).
+static void wexVBLCheck(Display13FBIRQIO &io) {
+	auto &c=display13FBIRQ;auto &s=c.state;
+	++wexVBLChecks;
+	const uint32_t want=__atomic_load_n(&wexVBLWant,__ATOMIC_RELAXED);
+	if(!want || !io.base || c.quiescing || c.powerLost || c.rearmPending || !s.begun || !s.enabled || s.faulted)return;
+	const auto wells=io.read(Display13FBIRQ::Driver);
+	if(wells==UINT32_MAX)return;
+	for(unsigned p=0;p<3;++p) {
+		const uint32_t bit=1U<<p;
+		if(!(want&bit) || !(s.active&bit) || (c.blockedPipes&bit) || !Display13FBIRQ::powered(wells,p))continue;
+		const auto iir=Display13FBIRQ::PipeIIR(p),ier=io.read(iir+4),imr=io.read(iir-4);
+		if(ier==UINT32_MAX || imr==UINT32_MAX || ((ier&1) && !(imr&1)))continue;
+		const uint64_t now=wexDiagNowMs();
+		++wexVBLClr;if(!wexVBLFirstMs)wexVBLFirstMs=now;wexVBLLastMs=now;
+		wexVBLLastRegs=(uint64_t(ier)<<32)|imr;wexVBLLastPipe=p;
+		if(wexVBLReassertMode==1 && now-wexVBLRestoreMs[p]>=10) {
+			wexVBLRestoreMs[p]=now;
+			io.write(iir-4,imr&~1U);io.write(iir+4,ier|1U);
+			++wexVBLRst;
+		}
+	}
+}
 static bool adlnIRQOwner(IOService *controller) {
 	return controller && controller==__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE);
 }
@@ -8765,6 +8807,7 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	}
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
 	__atomic_fetch_add(&wexDiagCollect,1,__ATOMIC_RELAXED);
+	wexVBLCheck(io); // native ProcessInterrupt holds display13FBIRQ.lock here
 	if(e.pipe&1)__atomic_fetch_add(&wexDiagVBlankToNative,1,__ATOMIC_RELAXED);
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
 	if(c.state.faulted || !c.state.enabled)dropCache();
@@ -15236,7 +15279,7 @@ static void xelpVideoIRQ(void *bridge,uint64_t *events) {
 
 // diag-9720-085-irq: WEXDiagIRQLive (root, read on every ioreg access) and a 1 s IOLog for 120 s.
 // Register reads only; pipe registers only while the pipe A well is powered.
-static void wexDiagIRQSnapshot(uint64_t (&q)[52]) {
+static void wexDiagIRQSnapshot(uint64_t (&q)[60]) {
  auto &c=display13FBIRQ;auto &s=c.state;
  q[0]=1;absolutetime_to_nanoseconds(mach_absolute_time(),&q[1]);q[1]/=1000000;
  if(c.base) {
@@ -15251,26 +15294,45 @@ static void wexDiagIRQSnapshot(uint64_t (&q)[52]) {
  q[23]=static_cast<uint32_t>(c.status);q[24]=c.quiescing|(c.powerLost<<1)|(c.rearmPending<<2);q[25]=c.blockedPipes;q[26]=c.handlers;
  q[27]=s.active;q[28]=s.configured;q[29]=s.lastMaster;q[30]=s.raw[0];q[31]=s.foreign;q[32]=c.admittedPipes;
  q[33]=wexDiagXelpCalls;q[34]=wexDiagXelpGT1;q[35]=wexDiagXelpDisplayBit;q[36]=wexDiagXelpLastMaster;
- q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=2; // schema 2
+ q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=3; // schema 3
  q[40]=wexDiagVBLOn;q[41]=wexDiagVBLOff;q[42]=wexDiagVBLEarly;q[43]=wexDiagVBLTopo;q[44]=wexDiagVBLKept;
  q[45]=wexDiagVBLLast;q[46]=wexDiagVBLLastRA;q[47]=wexDiagVBLLastMs;q[48]=wexDiagVBLOnRA;q[49]=wexDiagVBLOnMs;q[50]=wexDiagVBLOffRA;q[51]=wexDiagVBLOffMs;
+ // schema 3 (fix-9720-085-vblreassert): want mask | mode<<8, checks, detections, restores,
+ // first/last detection ms, IER<<32|IMR at the last detection, its pipe.
+ q[52]=wexVBLWant|(uint64_t(wexVBLReassertMode&0xFF)<<8);q[53]=wexVBLChecks;q[54]=wexVBLClr;q[55]=wexVBLRst;
+ q[56]=wexVBLFirstMs;q[57]=wexVBLLastMs;q[58]=wexVBLLastRegs;q[59]=wexVBLLastPipe;
 }
 static bool wexDiagIRQSerialize(void *,void *,OSSerialize *serializer) {
- uint64_t q[52] {};wexDiagIRQSnapshot(q);
+ uint64_t q[60] {};wexDiagIRQSnapshot(q);
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 static thread_call_t wexDiagIRQCall;static uint32_t wexDiagIRQTicks;
 static void wexDiagIRQTick(thread_call_param_t,thread_call_param_t) {
- uint64_t q[52] {};wexDiagIRQSnapshot(q);
+ uint64_t q[60] {};wexDiagIRQSnapshot(q);
  IOLog("WEX diag irq t=%llu gfx=0x%llx de=0x%llx wells=0x%llx imr=0x%llx iir=0x%llx ier=0x%llx conf=0x%llx pde=%llu deny=%llu col=%llu vbn=%llu int=%llu vbl=%llu flip=%llu storm=%llu since=%llu st=%llu ff=%llu freg=0x%llx fbits=0x%llx cst=%llu q=%llu blk=%llu act=%llu cfg=%llu lm=0x%llx xelp=%llu/%llu/%llu xm=0x%llx\n",
   q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15],q[17],q[18],q[19],q[20],q[21],q[22],q[23],q[24],q[25],q[27],q[28],q[29],q[33],q[34],q[35],q[36]);
- IOLog("WEX diag vbl t=%llu on=%llu off=%llu early=%llu topo=%llu kept=%llu last=0x%llx lastra=0x%llx lastms=%llu onra=0x%llx onms=%llu offra=0x%llx offms=%llu\n",
-  q[1],q[40],q[41],q[42],q[43],q[44],q[45],q[46],q[47],q[48],q[49],q[50],q[51]);
+ IOLog("WEX diag vbl t=%llu on=%llu off=%llu early=%llu topo=%llu kept=%llu last=0x%llx lastra=0x%llx lastms=%llu onra=0x%llx onms=%llu offra=0x%llx offms=%llu want=0x%llx chk=%llu clr=%llu rst=%llu clr1=%llu clrN=%llu regs=0x%llx p=%llu\n",
+  q[1],q[40],q[41],q[42],q[43],q[44],q[45],q[46],q[47],q[48],q[49],q[50],q[51],q[52],q[53],q[54],q[55],q[56],q[57],q[58],q[59]);
  if(++wexDiagIRQTicks<120) {uint64_t dl;clock_interval_to_deadline(1,kSecondScale,&dl);thread_call_enter_delayed(wexDiagIRQCall,dl);}
+}
+// fix-9720-085-vblreassert: 50 ms backup check (the DE handler only runs while display
+// interrupts still fire). Takes the native simple lock like the WEX VBL wrapper does.
+static thread_call_t wexVBLCall;
+static void wexVBLTick(thread_call_param_t,thread_call_param_t) {
+ auto &c=display13FBIRQ;
+ if(c.base && c.lock) {
+  const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
+  Display13FBIRQIO io {c.base};wexVBLCheck(io);
+  IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+ }
+ uint64_t dl;clock_interval_to_deadline(50,kMillisecondScale,&dl);thread_call_enter_delayed(wexVBLCall,dl);
 }
 static void wexDiagIRQInstall() {
  static bool done;if(done)return;done=true;
+ wexVBLReassertMode=checkKernelArgument("-wex-vbl-reassert") ? 1 : 0;
+ wexVBLCall=thread_call_allocate(wexVBLTick,nullptr);
+ if(wexVBLCall) {uint64_t dl;clock_interval_to_deadline(1,kSecondScale,&dl);thread_call_enter_delayed(wexVBLCall,dl);}
  if(auto live=OSSerializer::forTarget(nullptr,wexDiagIRQSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WEXDiagIRQLive",live);live->release();
  }
