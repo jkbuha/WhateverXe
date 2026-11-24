@@ -188,5 +188,6 @@
   "-wex-tc4-legacy": [],
   "-wex-noccs": [],
   "-wex-s0-csb-resync": [],
-  "-wex-d13-dc9-pwroff": []
+  "-wex-d13-dc9-pwroff": [],
+  "-wex-no-bootres": []
 }

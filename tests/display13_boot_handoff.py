@@ -95,6 +95,7 @@ methods='\n'.join(fn(x) for x in ['uint8_t *XE::display13SSTPort(', 'uint8_t *XE
 boundaries='''
 // xps-mobile-xelp boundaries: boot-arg probes off, logging dropped.
 static bool checkKernelArgument(const char*){return false;}
+#define WEX_DIAG_IOLOG(...)
 #ifndef SYSLOG
 #define SYSLOG(...) ((void)0)
 #endif

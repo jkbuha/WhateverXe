@@ -14991,6 +14991,16 @@ bool tglInstallContextOwners(KernelPatcher &patcher,size_t index,mach_vm_address
 }
 }
 
+// diag-9720-084-bootres: IOLog reaches the unified log of a hung boot.
+// -wex-no-bootres skips 0.8.4's FB0 boot-resource rewrite (9720 edp-keep A/B).
+#ifndef WEX_DIAG_IOLOG
+#define WEX_DIAG_IOLOG(...) IOLog(__VA_ARGS__)
+#endif
+static bool wexNoBootRes() {
+    const bool skip=checkKernelArgument("-wex-no-bootres");
+    if(skip)WEX_DIAG_IOLOG("WEX diag: boot resource hook skipped (-wex-no-bootres)\n");
+    return skip;
+}
 // initFramebufferResource has acquired the backing but its caller has not
 // published the resource yet. Serialize with slot return under the owner lock.
 void *XE::wrapBootResourceInit(void *pipe,uint32_t index,void *resource) {
@@ -15044,6 +15054,9 @@ void *XE::wrapBootResourceInit(void *pipe,uint32_t index,void *resource) {
     }
     IOLockUnlock(c.lock);
     if(record[0])IORegistryEntry::getRegistryRoot()->setProperty("WEXBootResourceDecision",record,sizeof(record));
+    // diag-9720-084-bootres: IOLog reaches the unified log of a hung boot.
+    WEX_DIAG_IOLOG("WEX diag: boot resource init idx=%u eligible=%u surface=0x%x tile=%u matched=%u linear=%u\n",
+        index,record[0],record[1],record[2],record[3],record[4]);
     return result;
 }
 
@@ -15212,7 +15225,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeNoAccelGuardReady",ready);
   patcher.clearError();return ready;
  }
- if(display13FramebufferRequested && !adlnOutputWiring.dsi) {
+ if(display13FramebufferRequested && !adlnOutputWiring.dsi && !wexNoBootRes()) {
     const char *symbol="__ZN18IGAccelDisplayPipe23initFramebufferResourceEjP16IOAccelResource2";
     const auto target=patcher.solveSymbol(index,symbol,address,size);
     const uint8_t call[]={0xe8,0xb8,0xfb,0xff,0xff};
