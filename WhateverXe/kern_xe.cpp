@@ -7054,6 +7054,35 @@ struct Display13FBIRQContext {
 static Display13FBIRQContext display13FBIRQ;
 // diag-9720-085-irq: live display/GT interrupt counters (read-only observation).
 static volatile uint64_t wexDiagProcessDE,wexDiagProcessDEDenied,wexDiagCollect,wexDiagVBlankToNative;
+// fix-9720-085-vblank: every native hwConfigureVBLInterrupt call as it reaches the WEX wrapper.
+// on/off = requests by direction; early = returned before touching hardware (quiescing or blocked
+// pipe); topo = invalid association/path; kept = disables skipped by -wex-vbl-nodisable; last* =
+// newest call (pipe | valid<<4 | enabled<<5 | getLock<<6 | result<<8), its donor-relative return
+// address and its time (ms). lastOn/lastOff record the newest enable / disable separately.
+static volatile uint64_t wexDiagVBLOn,wexDiagVBLOff,wexDiagVBLEarly,wexDiagVBLTopo,wexDiagVBLKept;
+static volatile uint64_t wexDiagVBLLast,wexDiagVBLLastRA,wexDiagVBLLastMs,wexDiagVBLOnRA,wexDiagVBLOnMs,wexDiagVBLOffRA,wexDiagVBLOffMs;
+static uintptr_t wexDiagDonorBase;
+static inline uint64_t wexDiagNowMs() {uint64_t ns;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000000;}
+// Records one native VBL request; true = skip this disable (-wex-vbl-nodisable).
+static bool wexDiagVBLCall(unsigned pipe,bool valid,bool enabled,bool getLock,uintptr_t ret) {
+	const uint64_t ra=ret-wexDiagDonorBase,now=wexDiagNowMs();
+	if(enabled) {++wexDiagVBLOn;wexDiagVBLOnRA=ra;wexDiagVBLOnMs=now;}
+	else {++wexDiagVBLOff;wexDiagVBLOffRA=ra;wexDiagVBLOffMs=now;}
+	wexDiagVBLLast=(pipe&0xF)|(uint64_t(valid)<<4)|(uint64_t(enabled)<<5)|(uint64_t(getLock)<<6);
+	wexDiagVBLLastRA=ra;wexDiagVBLLastMs=now;
+	// A/B: keep a running pipe's vblank on. A dropped or missing re-enable then cannot strand
+	// IOAccelDisplayPipe::transaction_wait; native consumers ignore extra VBLs.
+	static int noDisable=-1;
+	if(noDisable<0)noDisable=checkKernelArgument("-wex-vbl-nodisable") ? 1 : 0;
+	if(noDisable==1 && !enabled && valid && pipe<3) {++wexDiagVBLKept;wexDiagVBLLast|=uint64_t(0xF)<<8;return true;}
+	return false;
+}
+// code: 0xE early return (quiescing/blocked), 0xD invalid association, else Display13FBIRQ::Status.
+static void wexDiagVBLMark(unsigned code) {
+	if(code==0xE)++wexDiagVBLEarly;
+	if(code==0xD)++wexDiagVBLTopo;
+	wexDiagVBLLast|=uint64_t(code&0xF)<<8;
+}
 static volatile uint64_t wexDiagXelpCalls,wexDiagXelpGT1,wexDiagXelpDisplayBit;
 static volatile uint32_t wexDiagXelpLastMaster;
 // Only the original RegisterAccelerator binds C0 and copies its callbacks.
@@ -8336,6 +8365,7 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 		{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28,0x48,0xFF,0x05,0xAE,0x37,0x07,0x00},
 	};
 	bool known=display13FramebufferRequested && size>0x75D44;
+	wexDiagDonorBase=static_cast<uintptr_t>(address);
 	for(unsigned i=0;i<arrsize(offsets);++i) {
 		const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size);
 		known=known && fn==address+offsets[i] && !memcmp(reinterpret_cast<void *>(fn),entries[i],sizeof(entries[i]));
@@ -8610,7 +8640,12 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		path->getMetaClass()->getClassSize()>=0x3730;
 	const auto pipe=valid ? Display13FBMemory::field<uint32_t>(path,0x3640) : 3;
 	c.state.sinceVBlank=0; // native VBL control activity: not an interrupt storm
+	// fix-9720-085-vblank: record every native VBL request; optional no-disable A/B.
+	if(wexDiagVBLCall(pipe,valid,enabled,getLock,reinterpret_cast<uintptr_t>(__builtin_return_address(0)))) {
+		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
+	}
 	if(c.quiescing || (pipe<3 && (c.blockedPipes&(1U<<pipe)))) {
+		wexDiagVBLMark(0xE);
 		c.status=Display13FBIRQ::Status::Power;adlnIRQCache(controller,io);
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
 	}
@@ -8651,8 +8686,9 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 			c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,display13HotplugPorts(callbackXE->adlnOutputWiring),callbackXE->adlnOutputWiring.typeC);
 		}
 		if(!c.state.faulted)c.status=Display13FBIRQ::vblank(io,c.state,pipe,enabled);
+		wexDiagVBLMark(static_cast<uint32_t>(c.status));
 	}
-	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
+	else {wexDiagVBLMark(0xD);c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);}
 	adlnIRQCache(controller,io);
 	// Publish the first fault seen here (e.g. the interrupt storm breaker) once, so it can be
 	// read without waiting for the next native Enable/DisableIRQ. Registry writes need the
@@ -15200,7 +15236,7 @@ static void xelpVideoIRQ(void *bridge,uint64_t *events) {
 
 // diag-9720-085-irq: WEXDiagIRQLive (root, read on every ioreg access) and a 1 s IOLog for 120 s.
 // Register reads only; pipe registers only while the pipe A well is powered.
-static void wexDiagIRQSnapshot(uint64_t (&q)[40]) {
+static void wexDiagIRQSnapshot(uint64_t (&q)[52]) {
  auto &c=display13FBIRQ;auto &s=c.state;
  q[0]=1;absolutetime_to_nanoseconds(mach_absolute_time(),&q[1]);q[1]/=1000000;
  if(c.base) {
@@ -15215,18 +15251,22 @@ static void wexDiagIRQSnapshot(uint64_t (&q)[40]) {
  q[23]=static_cast<uint32_t>(c.status);q[24]=c.quiescing|(c.powerLost<<1)|(c.rearmPending<<2);q[25]=c.blockedPipes;q[26]=c.handlers;
  q[27]=s.active;q[28]=s.configured;q[29]=s.lastMaster;q[30]=s.raw[0];q[31]=s.foreign;q[32]=c.admittedPipes;
  q[33]=wexDiagXelpCalls;q[34]=wexDiagXelpGT1;q[35]=wexDiagXelpDisplayBit;q[36]=wexDiagXelpLastMaster;
- q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=0;
+ q[37]=reinterpret_cast<uintptr_t>(c.controller)!=0;q[38]=c.scopes.total|(uint64_t(c.scopes.display)<<32);q[39]=2; // schema 2
+ q[40]=wexDiagVBLOn;q[41]=wexDiagVBLOff;q[42]=wexDiagVBLEarly;q[43]=wexDiagVBLTopo;q[44]=wexDiagVBLKept;
+ q[45]=wexDiagVBLLast;q[46]=wexDiagVBLLastRA;q[47]=wexDiagVBLLastMs;q[48]=wexDiagVBLOnRA;q[49]=wexDiagVBLOnMs;q[50]=wexDiagVBLOffRA;q[51]=wexDiagVBLOffMs;
 }
 static bool wexDiagIRQSerialize(void *,void *,OSSerialize *serializer) {
- uint64_t q[40] {};wexDiagIRQSnapshot(q);
+ uint64_t q[52] {};wexDiagIRQSnapshot(q);
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 static thread_call_t wexDiagIRQCall;static uint32_t wexDiagIRQTicks;
 static void wexDiagIRQTick(thread_call_param_t,thread_call_param_t) {
- uint64_t q[40] {};wexDiagIRQSnapshot(q);
+ uint64_t q[52] {};wexDiagIRQSnapshot(q);
  IOLog("WEX diag irq t=%llu gfx=0x%llx de=0x%llx wells=0x%llx imr=0x%llx iir=0x%llx ier=0x%llx conf=0x%llx pde=%llu deny=%llu col=%llu vbn=%llu int=%llu vbl=%llu flip=%llu storm=%llu since=%llu st=%llu ff=%llu freg=0x%llx fbits=0x%llx cst=%llu q=%llu blk=%llu act=%llu cfg=%llu lm=0x%llx xelp=%llu/%llu/%llu xm=0x%llx\n",
   q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15],q[17],q[18],q[19],q[20],q[21],q[22],q[23],q[24],q[25],q[27],q[28],q[29],q[33],q[34],q[35],q[36]);
+ IOLog("WEX diag vbl t=%llu on=%llu off=%llu early=%llu topo=%llu kept=%llu last=0x%llx lastra=0x%llx lastms=%llu onra=0x%llx onms=%llu offra=0x%llx offms=%llu\n",
+  q[1],q[40],q[41],q[42],q[43],q[44],q[45],q[46],q[47],q[48],q[49],q[50],q[51]);
  if(++wexDiagIRQTicks<120) {uint64_t dl;clock_interval_to_deadline(1,kSecondScale,&dl);thread_call_enter_delayed(wexDiagIRQCall,dl);}
 }
 static void wexDiagIRQInstall() {

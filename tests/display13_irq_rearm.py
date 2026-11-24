@@ -35,6 +35,8 @@ bool display13FBAssociations(IOService*c,unsigned,IOService*f,size_t,uintptr_t){
 uintptr_t display13FBExpectedOwner(IOService*){return 1;}
 uint32_t adlnSharedGT(IOService*){return NativeGT;}
 void adlnIRQCache(IOService*,Display13FBIRQIO&){}void adlnIRQRecord(uint64_t*,unsigned){}
+// fix-9720-085-vblank diagnostics: recording only, no-disable A/B off (default).
+static bool wexDiagVBLCall(unsigned,bool,bool,bool,uintptr_t){return false;}static void wexDiagVBLMark(unsigned){}
 // Merged WEX helpers (xps-mobile-xelp): eDP-aware hotplug masks and the 50 ms re-arm retry.
 static uint32_t display13HotplugPorts(const Display13OutputWiring &w){return w.hotplug();}
 static uint32_t display13ExcludedHotplug(const void *p,uint32_t b,const Display13OutputWiring &w){return Display13FBTopology::excludedHotplug(p,b,w);}
