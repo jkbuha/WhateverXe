@@ -4466,10 +4466,14 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
     return ready;
 }
 
+namespace {static void display13AudioWakeEarly(IOPCIDevice *pci);} // defined in the later anonymous namespace
 void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
+	// Wake the display audio codec before AppleHDA resets the HDA link, so the
+	// iDisp codec answers at enumeration (XPS 17 9720). -wex-audio-wake only.
+	if(xeProfile.mobileDisplay13())display13AudioWakeEarly(physicalGPU);
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
