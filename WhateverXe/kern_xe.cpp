@@ -7112,10 +7112,11 @@ struct Display13FBBootIO : Display13FBPowerIO {
 // Display13ResumePark::park writes. Reads are unrestricted within the BAR.
 struct Display13FBResumeParkIO : Display13FBBootIO {
     explicit Display13FBResumeParkIO(IOMemoryMap *m):Display13FBBootIO{m} {}
-    void write(uint32_t r,uint32_t v) {
+    bool write(uint32_t r,uint32_t v) {
         static constexpr uint32_t allowed[] {0x70180,0x7019C,0x70008,0x68170,0x68174,0x68180,0x68270,0x68274,0x68280,
-            0x60404,0x60400,0x64000,0x64100,0x64200,0x60540,0x46140,0x7027C,0x7037C,0x7017C,0x42084};
-        for(auto a:allowed)if(a==r) {*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;return;}
+            0x60404,0x60400,0x64000,0x64100,0x64200,0x60540,0x46140,0x7027C,0x7037C,0x7017C};
+        for(auto a:allowed)if(a==r) {*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;return true;}
+        return false;
     }
     void delay(){IODelay(100);}
 };

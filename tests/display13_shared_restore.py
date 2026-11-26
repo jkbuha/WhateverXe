@@ -15,6 +15,8 @@ code=r'''
 #include "kern_display13_fb_memory.hpp"
 #include "kern_display13_fb_irq.hpp"
 #include "kern_display13_dbuf.hpp"
+#include "kern_display13_resume_park.hpp"
+#include "kern_display13_output_wiring.hpp"
 #include "kern_display13_clock.hpp"
 #include <cassert>
 #include <vector>
@@ -28,6 +30,9 @@ struct Display13FBBootIO {
  uint32_t read(uint32_t r){return reject && r==0x42084 ? map->regs[r/4]&~(1U<<30):map->regs[r/4];}
 };
 using Display13FBPowerIO=Display13FBBootIO;
+struct Display13FBResumeParkIO : Display13FBBootIO {explicit Display13FBResumeParkIO(Map *m):Display13FBBootIO{m}{} bool write(uint32_t r,uint32_t v){map->regs[r/4]=v;return true;} void delay(){}};
+// -wex-resume-park hibernation park (opt-in, off here).
+bool checkKernelArgument(const char*){return false;}
 bool denyPrepare=false,irqRestored=false;
 struct Display13FBClockIO:Display13FBBootIO {
  void write(uint32_t reg,uint32_t value) {
@@ -64,6 +69,7 @@ template<class F>Display13Power::Result modelRestore(Display13FBBootIO&,Display1
 bool modelPublish(Display13Power::NativeBridge&,void*,unsigned,void*,unsigned){return true;}
 using mach_vm_address_t=uintptr_t;
 struct XE {
+ Display13OutputWiring adlnOutputWiring;
  bool display13FBLifecycleHooksReady=true;uintptr_t adlnWorkLoopInGate=0,adlnWorkLoopTryClose=0,adlnWorkLoopOpen=0;
  bool restoreDisplay13ResourcesLocked(void*,bool);
  bool enableDisplay13EngineLocked(void*) {
