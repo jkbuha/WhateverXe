@@ -4910,16 +4910,52 @@ static bool display13TCFIASerialize(void *target,void *,OSSerialize *serializer)
 //  AUD_FREQ_CNTRL 0x65900, PWR_WELL_CTL1 0x45400, PWR_WELL_CTL2 0x45404, PWR_WELL_CTL4 0x4540C,
 //  DC_STATE_EN 0x45504, AUD_CONFIG A..D 0x65000+0x100*t, AUD_CNTL_ST A..D 0x650B4+0x100*t}.
 // AUD_HDMIW_HDMIEDID (ELD FIFO) is never read: reading it advances the FIFO.
+static uint32_t d13AudEldWrite(volatile uint8_t *base,uint32_t t);
 namespace {
 volatile uint32_t d13AudEnableCalls,d13AudDisableCalls,d13AudSupportCalls,d13AudSupportTrue,d13AudPropsCalls,d13AudBufDisableCalls;
 volatile uint64_t d13AudEnableRet,d13AudDisableRet;
 mach_vm_address_t orgD13AudEnable,orgD13AudDisable,orgD13AudSupport,orgD13AudProps,orgD13AudBufDisable;
+// HDMI/DP audio across an unplug (-wex-hdmi-audio; opt out with -wex-aud-apple-unplug).
+// Apple's unplug path knocks the iDisp codec off the HDA link for good (XPS 17 9720: every
+// verb after the unplug times out, RIRB gets nothing, a link reset with codec wake does not
+// bring it back; a display plugged in after boot works). Two steps do it:
+//  - hwDisableAudio: AUD_CONFIG(t) = (v & 0xE00F000F) + N_PROG_ENABLE (N zeroed), 2 vblanks,
+//    then clear AUDIO_OUTPUT_ENABLE(t) in AUD_PIN_ELD_CP_VLD (0x650C0), t = path+0x3640.
+//  - hwDisableAudioBuffer: clear AUDIO_PIN_BUF_ENABLE (0x48414 bit 31) once no transcoder has
+//    OUTPUT_ENABLE. Linux sets that bit with audio power and never clears it.
+// Instead, on unplug clear only OUTPUT_ENABLE and ELD_VALID for the transcoder (as Linux
+// hsw_audio_codec_disable), leave AUD_CONFIG and the pin buffer alone, and after the next
+// hwEnableAudio write the ELD and set ELD_VALID again (as Linux hsw_audio_codec_enable).
+// WEXHDMIAudioUnplug: {version, disables replaced, buffer disables skipped, ELD rewrites,
+//  last transcoder, 0x650C0 before/after last disable, 0x650C0 after last enable}.
+volatile uint8_t *d13AudBase();
+uint32_t audUnplugRec[8] {1};
+bool audUnplugFix() {return checkKernelArgument("-wex-hdmi-audio") && !checkKernelArgument("-wex-aud-apple-unplug");}
+void audUnplugPublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDMIAudioUnplug",audUnplugRec,sizeof(audUnplugRec));}
 uint64_t wrapD13AudEnable(void *c,void *fb,void *path) {
  __atomic_add_fetch(&d13AudEnableCalls,1U,__ATOMIC_RELAXED);
- const auto r=FunctionCast(wrapD13AudEnable,orgD13AudEnable)(c,fb,path);d13AudEnableRet=r;return r;
+ const auto r=FunctionCast(wrapD13AudEnable,orgD13AudEnable)(c,fb,path);d13AudEnableRet=r;
+ auto b=audUnplugRec[1] && audUnplugFix() ? d13AudBase() : nullptr;
+ if(b) {
+  auto vld=reinterpret_cast<volatile uint32_t *>(b+0x650C0);const uint32_t v=*vld;
+  for(uint32_t t=0;v!=UINT32_MAX && t<4;t++)
+   if((v&(4U<<(4*t))) && !(v&(1U<<(4*t))) && d13AudEldWrite(b,t))audUnplugRec[3]++;
+  audUnplugRec[7]=*vld;audUnplugPublish();
+ }
+ return r;
 }
 uint64_t wrapD13AudDisable(void *c,void *fb,void *path) {
  __atomic_add_fetch(&d13AudDisableCalls,1U,__ATOMIC_RELAXED);
+ const uint32_t t=path ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(path)+0x3640) : UINT32_MAX;
+ auto b=t<=2 && audUnplugFix() ? d13AudBase() : nullptr;
+ if(b) {
+  auto vld=reinterpret_cast<volatile uint32_t *>(b+0x650C0);const uint32_t v=*vld;
+  if(v!=UINT32_MAX) {
+   *vld=v&~(5U<<(4*t));
+   audUnplugRec[1]++;audUnplugRec[4]=t;audUnplugRec[5]=v;audUnplugRec[6]=*vld;audUnplugPublish();
+   d13AudDisableRet=0;return 0;
+  }
+ }
  const auto r=FunctionCast(wrapD13AudDisable,orgD13AudDisable)(c,fb,path);d13AudDisableRet=r;return r;
 }
 bool wrapD13AudSupport(void *fb,uint8_t *edid) {
@@ -4933,6 +4969,7 @@ uint64_t wrapD13AudProps(void *fb) {
 }
 uint64_t wrapD13AudBufDisable(void *c) {
  __atomic_add_fetch(&d13AudBufDisableCalls,1U,__ATOMIC_RELAXED);
+ if(audUnplugFix()) {audUnplugRec[2]++;audUnplugPublish();return 0;}
  return FunctionCast(wrapD13AudBufDisable,orgD13AudBufDisable)(c);
 }
 } // namespace
@@ -5108,7 +5145,8 @@ static bool display13AudioSerialize(void *target,void *,OSSerialize *serializer)
 // processKernel (BAR0 own mapping), 2 = set at FB start (fallback). Single register, read-modify-write.
 // WEXDisplay13AudioWake: {version, stage, before, afterSet, afterRestore, setNs, restoreNs}.
 namespace {
-volatile uint8_t *d13AudWakeBase;uint32_t d13AudWakeOrig;uint64_t d13AudWakeRec[7] {1};uint32_t d13AudFreqRec[2] {};uint32_t hdaPinBufEarly[2] {};
+volatile uint8_t *d13AudWakeBase;volatile uint8_t *d13AudBase() {return d13AudWakeBase;}
+uint32_t d13AudWakeOrig;uint64_t d13AudWakeRec[7] {1};uint32_t d13AudFreqRec[2] {};uint32_t hdaPinBufEarly[2] {};
 thread_call_t d13AudWakeRestoreCall;
 void d13AudWakePublish(){IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13AudioWake",d13AudWakeRec,sizeof(d13AudWakeRec));}
 void d13AudWakeRestore(thread_call_param_t,thread_call_param_t) {
@@ -5599,6 +5637,17 @@ static uint32_t hdaBuildEld(uint8_t *eld,uint32_t cap,uint32_t &sads) {
  memcpy(eld+len,sadBuf,sads*3);len+=sads*3;
  eld[2]=static_cast<uint8_t>((len-4+3)/4); // baseline ELD length in dwords
  return (len+3)&~3U;
+}
+// ELD write for one transcoder (Linux hsw_audio_codec_enable order): reset the ELD write
+// address, write the ELD built from the EDID AppleHDA validated, then set ELD_VALID.
+static uint32_t d13AudEldWrite(volatile uint8_t *b,uint32_t t) {
+ uint8_t eld[84];uint32_t sads=0;const uint32_t len=hdaBuildEld(eld,sizeof(eld),sads);
+ if(!len || t>3)return 0;
+ auto reg=[&](uint32_t o)->volatile uint32_t &{return *reinterpret_cast<volatile uint32_t *>(b+o);};
+ reg(0x650B4+0x100*t)=reg(0x650B4+0x100*t)&~(0x1FU<<5);
+ for(uint32_t i=0;i<len/4;i++){uint32_t d;memcpy(&d,eld+i*4,4);reg(0x65050+0x100*t)=d;}
+ reg(0x650C0)=reg(0x650C0)|(1U<<(4*t));
+ return 1;
 }
 static void hdaWriteEld(IOService *fb) {
  if(!fb || (!checkKernelArgument("-wex-hda-eld") && !hdaHdmiAudio()))return;
